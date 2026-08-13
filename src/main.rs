@@ -67,11 +67,7 @@ async fn main() -> Result<()> {
     let server = spawn_health_server(
         &config.server.listen,
         runners.len(),
-        AdminState {
-            config: config.clone(),
-            store: store.clone(),
-            client: client.clone(),
-        },
+        AdminState::new(config.clone(), store.clone(), client.clone()),
         shutdown_rx.clone(),
     )
     .await?;

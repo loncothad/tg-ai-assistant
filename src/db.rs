@@ -199,48 +199,10 @@ impl Store {
                 changed = true;
             }
         }
-        if config.model(&settings.selected_model).is_none() {
+        if settings.selected_model.is_empty() {
             settings.selected_model.clone_from(&bot.default_model);
             changed = true;
         }
-        macro_rules! reset_removed_model {
-            ($field:ident, $models:expr, $fallback:expr) => {
-                if !$models.iter().any(|model| model.id == settings.$field) {
-                    settings.$field.clone_from($fallback);
-                    changed = true;
-                }
-            };
-        }
-        reset_removed_model!(
-            selected_image_understanding_model,
-            config.openrouter.understanding.image.models,
-            &config.openrouter.understanding.image.default_model
-        );
-        reset_removed_model!(
-            selected_video_understanding_model,
-            config.openrouter.understanding.video.models,
-            &config.openrouter.understanding.video.default_model
-        );
-        reset_removed_model!(
-            selected_image_generation_model,
-            config.openrouter.image.models,
-            &config.openrouter.image.model
-        );
-        reset_removed_model!(
-            selected_audio_generation_model,
-            config.openrouter.audio.models,
-            &config.openrouter.audio.model
-        );
-        reset_removed_model!(
-            selected_transcription_model,
-            config.openrouter.transcription.models,
-            &config.openrouter.transcription.model
-        );
-        reset_removed_model!(
-            selected_video_generation_model,
-            config.openrouter.video.models,
-            &config.openrouter.video.model
-        );
         if changed {
             self.save_settings(&bot.id, &settings).await?;
         }

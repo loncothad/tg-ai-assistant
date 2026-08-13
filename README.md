@@ -10,7 +10,7 @@ Teleforge is a production-oriented, multi-bot Telegram AI assistant written in R
 - OpenRouter server-side Web Search and Web Fetch. Fetch is a separately toggleable built-in skill that can retrieve page and PDF text, with engine, usage/content limits, and domain policy configured in YAML.
 - Real model tools named `web_search`, `generate_image`, `generate_audio`, `generate_video`, and attachment-scoped `transcribe_audio`. The AI can invoke them during an ordinary conversation; the backend executes the selected API and delivers generated media to Telegram.
 - Direct `/search`, `/image`, `/audio`, `/transcribe`, and `/video` commands. Every command also accepts the `-COMMAND` form (case-insensitive), including query and guest requests.
-- An authenticated Telegram Mini App admin panel built with HTMX for model/provider selection, per-skill switches, API-key management, custom prompt/skill import, skill-bundle export/import, and user allowlisting.
+- An authenticated Telegram Mini App admin panel built with HTMX for model/provider selection, per-skill switches, API-key management, custom prompt/skill import, skill-bundle export/import, and user allowlisting. Its responsive blue interface uses a local fuzzy-search picker instead of rendering enormous model dropdowns.
 - Native Telegram Rich Message responses and rich guest-query results with Unicode-safe chunking.
 - Bounded per-bot concurrency, timeouts, polling backoff, graceful shutdown, structured logs, and health endpoints.
 
@@ -47,9 +47,11 @@ Replace the example Telegram user IDs and bot tokens before starting. `TELEGRAM_
 
 The answer allowlist is separate and editable from the panel or with `/allow`, `/deny`, and `/allowed`. `allowed_user_ids` only seeds missing entries, so later admin changes survive restarts. `allowed_chat_ids` grants access in selected chats. `allow_everyone` should be enabled only for intentionally public bots.
 
-The model chooser is per capability: general chat, image understanding, video understanding, image generation, speech generation, transcription, and video generation each have an independent per-bot selection. Each selection also has OpenRouter routing controls: Auto uses normal OpenRouter routing (including Auto Exacto behavior for tool requests), Cheapest sorts by price, Highest throughput and Lowest latency use their corresponding provider sorts, Exacto selects the tool-quality model variant where applicable, and a provider can be pinned with `provider.only`. OpenRouter rejects a pinned provider that does not offer the chosen model. The available models are curated in YAML; the provider catalog is retrieved from OpenRouter without exposing the key to the browser.
+The model chooser is per capability: general chat, image understanding, video understanding, image generation, speech generation, transcription, and video generation each have an independent per-bot selection. Teleforge retrieves and caches OpenRouter's complete model catalog—including its dedicated image and video catalogs—and filters it by declared input/output modalities. The fuzzy picker searches every compatible model by name, ID, description, and modality while rendering only the best 60 matches, so the Web App stays responsive. It displays context/output limits, token pricing, modalities, knowledge cutoff, tokenizer, supported parameters, voices, resolutions, aspect ratios, and durations when OpenRouter publishes them.
 
-The YAML `defaults` and each chat model's `options` expose the current OpenRouter request surface, including server `tools`, `tool_choice`, parallel tool calls, cache control, image configuration, reasoning, response formats, provider policy, plugins, routing/service tier, tracing, sampling, and an `extra` map for newly introduced fields. Runtime routing is merged last so the administrator's selection is authoritative.
+Each selection also has OpenRouter routing controls: Auto uses normal OpenRouter routing (including Auto Exacto behavior for tool requests), Cheapest sorts by price, Highest throughput and Lowest latency use their corresponding provider sorts, Exacto selects the tool-quality model variant where applicable, and a provider can be pinned with `provider.only`. The provider chooser comes from OpenRouter's endpoint list for the selected model and shows provider name, tag, context, and recent uptime; it does not offer unrelated global providers. Catalog data is refreshed at most every ten minutes and a stale cached copy remains usable during transient catalog failures. Runtime selections are stored in redb and survive restarts even when a model is not present in the YAML override list.
+
+The YAML `defaults` and configured chat-model `options` expose the current OpenRouter request surface, including server `tools`, `tool_choice`, parallel tool calls, cache control, image configuration, reasoning, response formats, provider policy, plugins, routing/service tier, tracing, sampling, and an `extra` map for newly introduced fields. Model entries in YAML are defaults and optional per-model overrides; they do not restrict the live chooser. A dynamically selected model inherits `defaults`. Runtime routing is merged last so the administrator's selection is authoritative.
 
 | Command | Purpose |
 | --- | --- |
@@ -84,6 +86,52 @@ Provider environment variables are optional. If one is absent and no encrypted p
 docker compose up --build -d
 ```
 
+To update an existing Compose deployment, run this from the checkout that contains
+`compose.yaml`, `config.yaml`, and `.env`. `docker compose down` does not remove the
+named `teleforge-data` volume, but stopping first is required for a consistent redb backup:
+
+```sh
+cd /opt/teleforge/tg-ai-assistant
+umask 077
+OLD_REV="$(git rev-parse HEAD)"
+mkdir -p backups
+docker compose down
+
+DATA_VOLUME="$(docker volume ls -q --filter label=com.docker.compose.volume=teleforge-data | head -n1)"
+test -n "$DATA_VOLUME"
+STAMP="$(date -u +%Y%m%dT%H%M%SZ)"
+cp -p config.yaml "backups/config-$STAMP.yaml"
+cp -p .env "backups/env-$STAMP"
+docker run --rm -v "$DATA_VOLUME":/data:ro -v "$PWD/backups":/backup alpine:3.20 \
+  tar -czf "/backup/redb-$STAMP.tar.gz" -C /data .
+
+git fetch --prune
+git pull --ff-only
+docker compose up -d --build --remove-orphans
+
+docker compose ps
+curl --fail http://127.0.0.1:8080/healthz
+curl --fail http://127.0.0.1:8080/readyz
+docker compose logs --tail=100 teleforge
+```
+
+Keep `config.yaml`, `.env`, and the redb volume; do not replace them with the example
+files during an update. The new Docker build includes `src/`, `defaults/`, and the
+admin Web App assets. Caddy normally needs no change or reload because the upstream
+address remains `127.0.0.1:8080`. If the new version must be rolled back, stop the
+stack, return to the revision printed by the earlier `OLD_REV` command, rebuild, and
+start it again:
+
+```sh
+docker compose down
+git switch --detach "$OLD_REV"
+docker compose up -d --build --remove-orphans
+```
+
+Only restore the redb archive if a rollback explicitly requires restoring state; keep
+the master encryption key together with the database backup or encrypted credentials
+cannot be decrypted.
+
 The container runs as an unprivileged user and persists `/app/data`. Terminate any old instance before moving a Telegram token because long polling must have one active consumer per token. Put an HTTPS reverse proxy in front of port 8080 and do not expose the redb file.
 
 - Never commit real bot tokens, provider keys, the master key, or `config.yaml`.
@@ -102,4 +150,4 @@ cargo test --all-features
 cargo build --release --locked
 ```
 
-All Rust modules carry module-level documentation. Tests cover environment expansion, Rich Message chunking, option/tool composition, local database isolation/encryption, and Mini App authentication.
+All Rust modules carry module-level documentation. Tests cover catalog parsing and capability filtering, environment expansion, Rich Message chunking, option/tool composition, local database isolation/encryption, and Mini App authentication.

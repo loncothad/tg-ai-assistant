@@ -306,12 +306,7 @@ impl BotRunner {
         } else {
             ("chat", &settings.selected_model)
         };
-        let model = if model_capability == "chat" {
-            self.config.model(selected)
-        } else {
-            self.config.understanding_model(model_capability, selected)
-        }
-        .with_context(|| format!("Selected {model_capability} model is no longer configured"))?;
+        let model = self.config.resolved_model(model_capability, selected);
         let author = caller_name(&message);
         let contextual_text = format!("{author}: {text}{}", media_summary(&media));
         let mut instructions = self.store.effective_instructions(&self.bot.id).await?;
@@ -328,7 +323,7 @@ impl BotRunner {
         match self
             .openrouter
             .chat(ChatRequest {
-                model,
+                model: &model,
                 system_prompt: &instructions,
                 history: &history,
                 user_message: &contextual_text,
@@ -463,17 +458,14 @@ impl BotRunner {
                         .credential(&self.bot.id, "openrouter")
                         .await?
                         .context("OpenRouter API key is not configured")?;
-                    let model = self
-                        .config
-                        .model(&settings.selected_model)
-                        .context("Selected chat model is no longer configured")?;
+                    let model = self.config.resolved_model("chat", &settings.selected_model);
                     let routing = settings
                         .model_routing
                         .get("chat")
                         .cloned()
                         .unwrap_or_default();
                     self.openrouter
-                        .search(arguments, model, &routing, &key)
+                        .search(arguments, &model, &routing, &key)
                         .await?
                 } else {
                     let key = self

@@ -3,6 +3,7 @@ WORKDIR /build
 COPY Cargo.toml Cargo.lock ./
 COPY src ./src
 COPY defaults ./defaults
+COPY assets ./assets
 RUN cargo build --locked --release
 
 FROM debian:bookworm-slim

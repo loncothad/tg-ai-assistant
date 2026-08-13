@@ -445,8 +445,12 @@ impl Config {
     pub fn load(path: &Path) -> Result<Self> {
         let raw = fs::read_to_string(path)
             .wrap_err_with(|| format!("Failed to read {}", path.display()))?;
-        let expanded = expand_env(&raw)?;
-        let mut config: Self = serde_yaml::from_str(&expanded)
+        // Parse YAML before expanding variables so `${...}` in comments or
+        // quoted documentation cannot accidentally become required secrets.
+        let mut document: serde_yaml::Value = serde_yaml::from_str(&raw)
+            .wrap_err_with(|| format!("Invalid configuration in {}", path.display()))?;
+        expand_yaml_env(&mut document)?;
+        let mut config: Self = serde_yaml::from_value(document)
             .wrap_err_with(|| format!("Invalid configuration in {}", path.display()))?;
         config.assign_telegram_tokens()?;
         config.validate()?;
@@ -606,6 +610,15 @@ impl Config {
         let mut bot_ids = HashSet::new();
         let mut tokens = HashSet::new();
         for bot in &self.bots {
+            if bot.id.is_empty()
+                || !bot.id.chars().all(|character| {
+                    character.is_ascii_alphanumeric() || matches!(character, '-' | '_' | '.')
+                })
+            {
+                bail!(
+                    "Bot IDs may contain only ASCII letters, numbers, hyphens, underscores, and periods"
+                );
+            }
             if !bot_ids.insert(bot.id.as_str()) {
                 bail!("Duplicate bot ID: {}", bot.id);
             }
@@ -641,6 +654,20 @@ impl Config {
             _ => return None,
         };
         models.iter().find(|model| model.id == id)
+    }
+    /// Resolves a runtime-selected chat-style model while retaining any curated
+    /// per-model overrides for entries present in the deployment configuration.
+    pub fn resolved_model(&self, capability: &str, id: &str) -> ModelConfig {
+        let configured = if capability == "chat" {
+            self.model(id)
+        } else {
+            self.understanding_model(capability, id)
+        };
+        configured.cloned().unwrap_or_else(|| ModelConfig {
+            id: id.to_owned(),
+            label: None,
+            options: OpenRouterOptions::default(),
+        })
     }
     pub fn bot(&self, id: &str) -> Option<&BotConfig> {
         self.bots.iter().find(|bot| bot.enabled && bot.id == id)
@@ -724,6 +751,26 @@ fn expand_env(input: &str) -> Result<String> {
     }
     out.push_str(rest);
     Ok(out)
+}
+
+fn expand_yaml_env(value: &mut serde_yaml::Value) -> Result<()> {
+    match value {
+        serde_yaml::Value::String(text) => {
+            *text = expand_env(text)?;
+        }
+        serde_yaml::Value::Sequence(values) => {
+            for value in values {
+                expand_yaml_env(value)?;
+            }
+        }
+        serde_yaml::Value::Mapping(values) => {
+            for value in values.values_mut() {
+                expand_yaml_env(value)?;
+            }
+        }
+        _ => {}
+    }
+    Ok(())
 }
 
 fn default_listen() -> String {
@@ -814,10 +861,17 @@ mod tests {
             .replace("${TELEFORGE_PUBLIC_URL}", "https://admin.example.test")
             .replace("${TELEFORGE_MASTER_KEY}", &STANDARD.encode([7_u8; 32]))
             .replace("${TELEGRAM_BOT_TOKENS}", "1:primary-token,2:team-token");
-        let mut config: Config = serde_yaml::from_str(&expand_env(&yaml).unwrap()).unwrap();
+        let mut document: serde_yaml::Value = serde_yaml::from_str(&yaml).unwrap();
+        expand_yaml_env(&mut document).unwrap();
+        let mut config: Config = serde_yaml::from_value(document).unwrap();
         config.assign_telegram_tokens().unwrap();
         config.validate().unwrap();
         assert_eq!(config.bots.len(), 2);
         assert_eq!(config.openrouter.image.models.len(), 2);
+        let dynamic = config.resolved_model("chat", "new-vendor/live-model");
+        assert_eq!(dynamic.id, "new-vendor/live-model");
+        assert!(dynamic.options.extra.is_empty());
+        let configured = config.resolved_model("chat", "openrouter/auto");
+        assert_eq!(configured.label.as_deref(), Some("OpenRouter Auto"));
     }
 }

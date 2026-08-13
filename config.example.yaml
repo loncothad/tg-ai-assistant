@@ -1,4 +1,4 @@
-# Environment expressions use ${NAME} or ${NAME:-default}. The process does not
+# Environment expressions use a NAME placeholder or NAME:-default syntax. The process does not
 # load .env files itself; export variables or use your service manager/Compose.
 server:
   listen: "${TELEFORGE_LISTEN:-0.0.0.0:8080}"
@@ -55,7 +55,8 @@ openrouter:
     blocked_domains: []
     extra: {}
 
-  # This curated list is what administrators can select. Copy entries as needed.
+  # Startup defaults and optional per-model overrides. The admin chooser loads all
+  # compatible models from OpenRouter's live catalog, so this is not an allowlist.
   models:
     - id: "openrouter/auto"
       label: "OpenRouter Auto"
