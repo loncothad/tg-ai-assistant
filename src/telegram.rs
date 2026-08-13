@@ -402,6 +402,36 @@ impl BotRunner {
             Some(PlannedAction::GenerateVideo) => Some("video"),
             _ => None,
         };
+        let transcription_command = plan
+            .as_ref()
+            .is_some_and(|plan| plan.action == PlannedAction::Transcribe && attachment_flags.2);
+        if transcription_command {
+            drop(sender);
+            let _ = progress_task.await;
+            if let Err(error) = self
+                .command(
+                    &message,
+                    mode,
+                    user_id,
+                    "transcribe",
+                    &text,
+                    CommandOptions {
+                        guest_pending_id: guest_pending_id.as_deref(),
+                        ..CommandOptions::default()
+                    },
+                )
+                .await
+            {
+                error!(bot_id = %self.bot.id, user_id, error = %format!("{error:#}"), "planned transcription command failed");
+                if let Some(inline_id) = guest_pending_id.as_deref() {
+                    self.edit_guest_error(&message, inline_id, &error).await;
+                } else {
+                    let detail = self.process_error_output(&message, &error).await;
+                    self.respond(&message, mode, &detail, None).await?;
+                }
+            }
+            return Ok(());
+        }
         if let Some(command) = generation_command {
             let generation_prompt = plan.as_ref().map_or_else(
                 || text.trim().to_owned(),
