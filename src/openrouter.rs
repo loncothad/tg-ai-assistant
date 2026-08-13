@@ -82,7 +82,7 @@ impl RequestPlan {
             PlannedAction::GenerateImage
             | PlannedAction::GenerateAudio
             | PlannedAction::GenerateVideo => Some(self.action),
-            PlannedAction::Chat => {
+            PlannedAction::Chat | PlannedAction::GenerateCode => {
                 let generations = self
                     .skills
                     .iter()
@@ -168,6 +168,7 @@ impl AssistantResponse {
 #[serde(rename_all = "snake_case")]
 pub enum PlannedAction {
     Chat,
+    GenerateCode,
     GenerateImage,
     GenerateAudio,
     GenerateVideo,
@@ -177,6 +178,7 @@ pub enum PlannedAction {
 #[derive(Clone, Copy, Debug, Deserialize, Serialize, PartialEq, Eq)]
 #[serde(rename_all = "snake_case")]
 pub enum PlannedSkill {
+    GenerateCode,
     Search,
     WebFetch,
     ImageGeneration,
@@ -192,6 +194,7 @@ pub enum PlannedSkill {
 impl PlannedSkill {
     fn as_str(self) -> &'static str {
         match self {
+            Self::GenerateCode => "generate_code",
             Self::Search => "search",
             Self::WebFetch => "web_fetch",
             Self::ImageGeneration => "image_generation",
@@ -281,12 +284,12 @@ impl OpenRouter {
             "properties": {
                 "action": {
                     "type": "string",
-                    "enum": ["chat", "generate_image", "generate_audio", "generate_video", "refuse"],
-                    "description": "Use generate_image, generate_audio, or generate_video whenever the user explicitly asks to create that media artifact, in any language. Use chat otherwise."
+                    "enum": ["chat", "generate_code", "generate_image", "generate_audio", "generate_video", "refuse"],
+                    "description": "Use generate_code for source code, configuration, scripts, patches, or complete software artifacts. Use generate_image, generate_audio, or generate_video whenever the user explicitly asks to create that media artifact, in any language. Use chat for ordinary prose."
                 },
                 "skills": {
                     "type": "array",
-                    "items": {"type":"string", "enum": ["search", "web_fetch", "image_generation", "audio_generation", "video_generation", "image_understanding", "video_understanding", "transcription", "file_delivery", "model_upgrade"]},
+                    "items": {"type":"string", "enum": ["generate_code", "search", "web_fetch", "image_generation", "audio_generation", "video_generation", "image_understanding", "video_understanding", "transcription", "file_delivery", "model_upgrade"]},
                     "uniqueItems": true
                 },
                 "delivery": {
@@ -307,7 +310,7 @@ impl OpenRouter {
             "additionalProperties": false
         });
         let system = format!(
-            "You are a request classifier for a Telegram AI assistant. Return only the required schema. Enabled skills: {}. Attachments: image={}, video={}, audio={}. Classify the user's original text; never rewrite, expand, translate, improve, or execute it. An explicit request to draw, generate, create, synthesize, or make new image/audio/video media MUST use the corresponding generate_* action and generation skill, regardless of language. Describing or understanding existing media, transcribing, researching, opening URLs, answering, and transforming text use chat with suitable skills. Select model_upgrade only for a genuinely difficult request whose complexity, ambiguity, reasoning depth, or accuracy requirements materially benefit from the configured advanced model; do not select it for routine requests. Choose file only for a requested downloadable artifact, a complete source-code/configuration file, or output expected to be unwieldy in chat; provide a safe filename and include file_delivery when enabled. Use inline for normal prose. Never select a disabled skill. Select refuse only when fulfilling the request itself is disallowed; do not refuse merely because a skill is unavailable. For refusal, write a concise localized explanation and safe alternative. The original user text is the sole downstream request and is not a field in your output.",
+            "You are a request classifier for a Telegram AI assistant. Return only the required schema. Enabled skills: {}. Attachments: image={}, video={}, audio={}. Classify the user's original text; never rewrite, expand, translate, improve, or execute it. Use generate_code for source code, configuration, scripts, patches, and complete software artifacts; it is handled by the normal assistant pipeline. An explicit request to draw, generate, create, synthesize, or make new image/audio/video media MUST use the corresponding generate_* action and generation skill, regardless of language. Describing or understanding existing media, transcribing, researching, opening URLs, answering, and transforming text use chat with suitable skills. Select model_upgrade only for a genuinely difficult request whose complexity, ambiguity, reasoning depth, or accuracy requirements materially benefit from the configured advanced model; do not select it for routine requests. Choose file for a complete source-code/configuration artifact when file_delivery is enabled, a requested downloadable artifact, or output expected to be unwieldy in chat; provide a safe filename and include file_delivery when enabled. Use inline for normal prose. Never select a disabled skill. Select refuse only when fulfilling the request itself is disallowed; do not refuse merely because a skill is unavailable. For refusal, write a concise localized explanation and safe alternative. The original user text is the sole downstream request and is not a field in your output.",
             enabled.join(", "),
             request.has_image,
             request.has_video,
@@ -1370,6 +1373,7 @@ fn report_generation_progress(
 
 fn enabled_planner_skills(capabilities: &Capabilities) -> Vec<&'static str> {
     [
+        (true, "generate_code"),
         (capabilities.search, "search"),
         (capabilities.web_fetch, "web_fetch"),
         (capabilities.image, "image_generation"),
@@ -1391,7 +1395,7 @@ fn planned_action_enabled(action: PlannedAction, capabilities: &Capabilities) ->
         PlannedAction::GenerateImage => capabilities.image,
         PlannedAction::GenerateAudio => capabilities.audio,
         PlannedAction::GenerateVideo => capabilities.video,
-        PlannedAction::Chat | PlannedAction::Refuse => true,
+        PlannedAction::Chat | PlannedAction::GenerateCode | PlannedAction::Refuse => true,
     }
 }
 
@@ -1948,6 +1952,27 @@ mod tests {
             refusal_message: String::new(),
         };
         assert_eq!(plan.direct_generation(), Some(PlannedAction::GenerateImage));
+    }
+
+    #[test]
+    fn planner_accepts_generate_code_as_normal_assistant_work() {
+        let response = json!({
+            "choices":[{"message":{"content":json!({
+                "action":"generate_code",
+                "skills":["generate_code", "file_delivery"],
+                "delivery":"file",
+                "filename":"main.rs",
+                "refusal_message":""
+            }).to_string()},"finish_reason":"stop"}]
+        });
+        let plan = parse_planner_response(&response).unwrap();
+        assert_eq!(plan.action, PlannedAction::GenerateCode);
+        assert!(plan.skills.contains(&PlannedSkill::GenerateCode));
+        assert_eq!(plan.direct_generation(), None);
+        assert!(planned_action_enabled(
+            plan.action,
+            &Capabilities::default()
+        ));
     }
 
     #[test]
