@@ -40,8 +40,8 @@ use crate::{
     config::{BotConfig, Config, ModelProvider, SearchProvider},
     db::{ModelRouting, Store},
     openrouter::{
-        ChatRequest, MediaInput, OpenRouter, PlannedAction, PlannedSkill, PlanningRequest,
-        ProgressUpdate, RequestPlan, ToolModel, ToolModels,
+        ChatRequest, GenerationPromptContext, MediaInput, OpenRouter, PlannedAction, PlannedSkill,
+        PlanningRequest, ProgressUpdate, RequestPlan, ToolModel, ToolModels,
     },
     rich,
     search::SearchService,
@@ -623,6 +623,17 @@ impl BotRunner {
                         routing: video_routing,
                         api_key: &video_key,
                     },
+                },
+                generation_prompt: GenerationPromptContext {
+                    current_request: &text,
+                    replied_message: replied_text,
+                    telegram_quote,
+                    model: &settings.selected_planner_model,
+                    fallback_model: &settings.selected_planner_fallback_model,
+                    api_key: planner_key.as_deref(),
+                    has_image: attachment_flags.0,
+                    has_video: attachment_flags.1,
+                    has_audio: attachment_flags.2,
                 },
                 progress: Some(sender.clone()),
             })
