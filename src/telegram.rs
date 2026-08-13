@@ -72,6 +72,7 @@ enum MessageMode {
 struct CommandOptions<'a> {
     model_override: Option<&'a MessageModelOverride>,
     guest_pending_id: Option<&'a str>,
+    reply_context: Option<&'a str>,
 }
 
 impl BotRunner {
@@ -228,7 +229,11 @@ impl BotRunner {
             || message
                 .reply_to_message
                 .as_deref()
-                .is_some_and(message_has_media);
+                .is_some_and(message_has_media)
+            || message
+                .external_reply
+                .as_deref()
+                .is_some_and(external_reply_has_media);
         if raw_text.is_empty() && !has_media {
             return Ok(());
         }
@@ -245,6 +250,7 @@ impl BotRunner {
         } else {
             self.strip_address(raw_text)
         };
+        let reply_context = reply_context(&message);
         let scope = scope_id(mode, &message, user_id);
 
         let model_override = if let Some((command, arguments)) = parse_command(&text)
@@ -278,12 +284,15 @@ impl BotRunner {
                     user_id,
                     &command,
                     arguments,
-                    CommandOptions::default(),
+                    CommandOptions {
+                        reply_context: reply_context.as_deref(),
+                        ..CommandOptions::default()
+                    },
                 )
                 .await
             {
                 error!(bot_id = %self.bot.id, user_id, error = %format!("{error:#}"), "command failed");
-                self.respond(&message, mode, rich::compact_error(), None)
+                self.respond(&message, mode, &rich::detailed_error(&error), None)
                     .await?;
             }
             return Ok(());
@@ -326,16 +335,20 @@ impl BotRunner {
             })
         };
         let _ = sender.send(ProgressUpdate::step("Read request"));
+        if reply_context.is_some() {
+            let _ = sender.send(ProgressUpdate::step("Loaded replied-message context"));
+        }
         let _ = sender.send(ProgressUpdate::step("Classifying request"));
         let settings = self.store.settings(&self.bot.id).await?;
         let mut capabilities = settings.capabilities.clone();
         let attachment_flags = attachment_flags(&message);
         let planner_key = self.store.credential(&self.bot.id, "openrouter").await?;
+        let request_text = with_reply_context(&text, reply_context.as_deref());
         let plan = if let Some(key) = planner_key.as_deref() {
             match self
                 .openrouter
                 .plan_request(PlanningRequest {
-                    text: &text,
+                    text: &request_text,
                     model: &settings.selected_planner_model,
                     fallback_model: &settings.selected_planner_fallback_model,
                     capabilities: &capabilities,
@@ -389,19 +402,20 @@ impl BotRunner {
                     mode,
                     user_id,
                     command,
-                    &text,
+                    &request_text,
                     CommandOptions {
                         model_override: model_override.as_ref(),
                         guest_pending_id: guest_pending_id.as_deref(),
+                        reply_context: None,
                     },
                 )
                 .await
             {
                 error!(bot_id = %self.bot.id, user_id, error = %format!("{error:#}"), "planned generation command failed");
                 if let Some(inline_id) = guest_pending_id.as_deref() {
-                    self.edit_guest_error(inline_id).await;
+                    self.edit_guest_error(inline_id, &error).await;
                 } else {
-                    self.respond(&message, mode, rich::compact_error(), None)
+                    self.respond(&message, mode, &rich::detailed_error(&error), None)
                         .await?;
                 }
             }
@@ -438,9 +452,11 @@ impl BotRunner {
         let media = if capabilities.media
             || capabilities.transcription
             || capabilities.image
+            || capabilities.audio
+            || capabilities.music
             || capabilities.video
         {
-            self.collect_media(&message, &text).await?
+            self.collect_media(&message, &request_text).await?
         } else {
             Vec::new()
         };
@@ -542,7 +558,7 @@ impl BotRunner {
         capabilities.transcription &= !transcription_key.is_empty();
         capabilities.video &= !video_key.is_empty();
         let author = caller_name(&message);
-        let contextual_text = format!("{author}: {text}{}", media_summary(&media));
+        let contextual_text = format!("{author}: {request_text}{}", media_summary(&media));
         let mut instructions = self.store.effective_instructions(&self.bot.id).await?;
         instructions.push_str(&format!("\n\n# Current request context\nCurrent UTC date and time: {}\nBot: @{} (backend ID {})\nConversation mode: {:?}\nChat: {} (ID {})\nCaller: {} (ID {}, language {})\nTelegram message Unix time: {}\nEnabled capabilities and callable tools for this request: search={}, web_fetch={}, image_generation={}, speech_generation={}, music_generation={}, video_generation={}, media_understanding={}, transcription={}, file_delivery={}, model_upgrade={}. If a capability is true, never claim it is disabled; call its tool when the user explicitly requests that operation. Preserve the user's exact request; do not substitute a planner-written prompt. Format non-trivial responses for Telegram Rich Messages with descriptive headings, bold key terms and labels, and sparing italics for qualifications.", chrono::Utc::now().to_rfc3339(), self.username, self.bot.id, mode, message.chat.title.as_deref().unwrap_or("Private or untitled chat"), message.chat.id, author, user_id, message.guest_bot_caller_user.as_ref().or(message.from.as_ref()).and_then(|u| u.language_code.as_deref()).unwrap_or("unknown"), message.date, capabilities.search, capabilities.web_fetch, capabilities.image, capabilities.audio, capabilities.music, capabilities.video, capabilities.media, capabilities.transcription, capabilities.file, capabilities.model_upgrade));
         self.store
@@ -648,7 +664,7 @@ impl BotRunner {
                     };
                     if let Err(error) = delivery {
                         error!(bot_id = %self.bot.id, user_id, error = %format!("{error:#}"), "guest result delivery failed");
-                        self.edit_guest_error(inline_id).await;
+                        self.edit_guest_error(inline_id, &error).await;
                     }
                     if let Some(id) = answer.generation_id {
                         self.store
@@ -719,9 +735,9 @@ impl BotRunner {
             Err(error) => {
                 error!(bot_id = %self.bot.id, user_id, error = %format!("{error:#}"), "assistant request failed");
                 if let Some(inline_id) = guest_pending_id.as_deref() {
-                    self.edit_guest_error(inline_id).await;
+                    self.edit_guest_error(inline_id, &error).await;
                 } else {
-                    self.respond(&message, mode, rich::compact_error(), None)
+                    self.respond(&message, mode, &rich::detailed_error(&error), None)
                         .await?;
                 }
             }
@@ -790,6 +806,7 @@ impl BotRunner {
         let CommandOptions {
             model_override: outer_model_override,
             guest_pending_id,
+            reply_context,
         } = options;
         let mut arguments = arguments;
         let inline_model_override = if outer_model_override.is_none()
@@ -806,6 +823,10 @@ impl BotRunner {
             None
         };
         let model_override = outer_model_override.or(inline_model_override.as_ref());
+        let contextual_arguments = reply_context
+            .filter(|_| matches!(command, "search" | "image" | "music" | "video"))
+            .map(|reply| with_reply_context(arguments, Some(reply)));
+        let arguments = contextual_arguments.as_deref().unwrap_or(arguments);
         match command {
             "start" | "help" => self.respond(message, mode, HELP, None).await?,
             "new" => {
@@ -932,16 +953,19 @@ impl BotRunner {
                     let (progress, progress_task) =
                         self.begin_guest_progress(&inline_id, "Parsed image-generation request");
                     let result = async {
+                        let references = self.collect_media(message, arguments).await?;
+                        let effective_prompt = self
+                            .prepare_generation_prompt(arguments, &references, true)
+                            .await?;
                         let _ = progress.send(ProgressUpdate::generation(
                             "image",
                             generation_model,
-                            arguments,
+                            &effective_prompt,
                         ));
                         let key = self.model_api_key(routing.model_provider).await?;
-                        let references = self.collect_media(message, arguments).await?;
                         self.openrouter
                             .generate_image_with_references(
-                                arguments,
+                                &effective_prompt,
                                 &references,
                                 generation_model,
                                 &routing,
@@ -966,13 +990,19 @@ impl BotRunner {
                                 .await
                             {
                                 error!(bot_id = %self.bot.id, user_id, error = %format!("{error:#}"), "guest image delivery failed");
-                                self.edit_guest_error(&inline_id).await;
+                                self.edit_guest_error(&inline_id, &error).await;
                             }
                         }
-                        Ok(_) => self.edit_guest_error(&inline_id).await,
+                        Ok(_) => {
+                            self.edit_guest_error(
+                                &inline_id,
+                                &"OpenRouter returned no generated images",
+                            )
+                            .await
+                        }
                         Err(error) => {
                             error!(bot_id = %self.bot.id, user_id, error = %format!("{error:#}"), "guest image generation failed");
-                            self.edit_guest_error(&inline_id).await;
+                            self.edit_guest_error(&inline_id, &error).await;
                         }
                     }
                     return Ok(());
@@ -988,16 +1018,19 @@ impl BotRunner {
                 .await;
                 let _ = progress.send(ProgressUpdate::step("Read reference media"));
                 let references = self.collect_media(message, arguments).await?;
+                let effective_prompt = self
+                    .prepare_generation_prompt(arguments, &references, true)
+                    .await?;
                 let key = self.model_api_key(routing.model_provider).await?;
                 let _ = progress.send(ProgressUpdate::generation(
                     "image",
                     generation_model,
-                    arguments,
+                    &effective_prompt,
                 ));
                 let result = self
                     .openrouter
                     .generate_image_with_references(
-                        arguments,
+                        &effective_prompt,
                         &references,
                         generation_model,
                         &routing,
@@ -1027,7 +1060,7 @@ impl BotRunner {
                     }
                     Err(error) => {
                         error!(bot_id = %self.bot.id, user_id, error = %format!("{error:#}"), "image generation failed");
-                        self.respond(message, mode, rich::compact_error(), None)
+                        self.respond(message, mode, &rich::detailed_error(&error), None)
                             .await?;
                     }
                 }
@@ -1103,19 +1136,38 @@ impl BotRunner {
                         },
                     );
                     let result = async {
+                        let references = self.collect_media(message, arguments).await?;
+                        let effective_prompt = if is_music {
+                            self.prepare_generation_prompt(arguments, &references, false)
+                                .await?
+                        } else {
+                            arguments.to_owned()
+                        };
                         let _ = progress.send(ProgressUpdate::generation(
                             if is_music { "music" } else { "speech" },
                             generation_model,
-                            arguments,
+                            &effective_prompt,
                         ));
                         let key = self.model_api_key(routing.model_provider).await?;
                         if is_music {
                             self.openrouter
-                                .generate_music(arguments, generation_model, &routing, &key)
+                                .generate_music_with_references(
+                                    &effective_prompt,
+                                    &references,
+                                    generation_model,
+                                    &routing,
+                                    &key,
+                                )
                                 .await
                         } else {
                             self.openrouter
-                                .generate_speech(arguments, generation_model, &routing, &key)
+                                .generate_speech_with_references(
+                                    &effective_prompt,
+                                    &references,
+                                    generation_model,
+                                    &routing,
+                                    &key,
+                                )
                                 .await
                         }
                     }
@@ -1135,12 +1187,12 @@ impl BotRunner {
                                 .await
                             {
                                 error!(bot_id = %self.bot.id, user_id, error = %format!("{error:#}"), "guest audio delivery failed");
-                                self.edit_guest_error(&inline_id).await;
+                                self.edit_guest_error(&inline_id, &error).await;
                             }
                         }
                         Err(error) => {
                             error!(bot_id = %self.bot.id, user_id, error = %format!("{error:#}"), "guest audio generation failed");
-                            self.edit_guest_error(&inline_id).await;
+                            self.edit_guest_error(&inline_id, &error).await;
                         }
                     }
                     return Ok(());
@@ -1161,19 +1213,38 @@ impl BotRunner {
                     ChatAction::UploadVoice,
                 )
                 .await;
+                let references = self.collect_media(message, arguments).await?;
+                let effective_prompt = if is_music {
+                    self.prepare_generation_prompt(arguments, &references, false)
+                        .await?
+                } else {
+                    arguments.to_owned()
+                };
                 let key = self.model_api_key(routing.model_provider).await?;
                 let _ = progress.send(ProgressUpdate::generation(
                     if is_music { "music" } else { "speech" },
                     generation_model,
-                    arguments,
+                    &effective_prompt,
                 ));
                 let result = if is_music {
                     self.openrouter
-                        .generate_music(arguments, generation_model, &routing, &key)
+                        .generate_music_with_references(
+                            &effective_prompt,
+                            &references,
+                            generation_model,
+                            &routing,
+                            &key,
+                        )
                         .await
                 } else {
                     self.openrouter
-                        .generate_speech(arguments, generation_model, &routing, &key)
+                        .generate_speech_with_references(
+                            &effective_prompt,
+                            &references,
+                            generation_model,
+                            &routing,
+                            &key,
+                        )
                         .await
                 };
                 let _ = progress.send(ProgressUpdate::step(if result.is_ok() {
@@ -1205,57 +1276,55 @@ impl BotRunner {
                     }
                     Err(error) => {
                         error!(bot_id = %self.bot.id, user_id, error = %format!("{error:#}"), "audio generation failed");
-                        self.respond(message, mode, rich::compact_error(), None)
+                        self.respond(message, mode, &rich::detailed_error(&error), None)
                             .await?;
                     }
                 }
             }
             "transcribe" => {
-                if mode == MessageMode::Guest {
-                    self.respond(
-                        message,
-                        mode,
-                        "Transcription is enabled, but Telegram guest queries cannot upload or return the required media. Open this bot in a private chat or normal group.",
-                        None,
-                    )
-                    .await?;
-                    return Ok(());
-                }
                 let settings = self.store.settings(&self.bot.id).await?;
                 if !settings.capabilities.transcription {
                     bail!("Transcription is disabled by an administrator");
                 }
-                let media = self.collect_media(message, arguments).await?;
-                let mut transcripts = Vec::new();
-                let routing = settings
-                    .model_routing
-                    .get("transcription")
-                    .cloned()
-                    .unwrap_or_default();
-                let key = self.model_api_key(routing.model_provider).await?;
-                for input in &media {
-                    if let MediaInput::Audio { data, format } = input {
-                        transcripts.push(
-                            self.openrouter
-                                .transcribe_audio(
-                                    data,
-                                    format,
-                                    None,
-                                    &settings.selected_transcription_model,
-                                    &routing,
-                                    &key,
-                                )
-                                .await?,
-                        );
+                if mode == MessageMode::Guest {
+                    let inline_id = match guest_pending_id {
+                        Some(id) => id.to_owned(),
+                        None => {
+                            self.answer_guest_pending(message, "Reading the audio")
+                                .await?
+                        }
+                    };
+                    let (progress, progress_task) =
+                        self.begin_guest_progress(&inline_id, "Reading attached audio");
+                    let result = async {
+                        let media = self.collect_media(message, arguments).await?;
+                        let _ = progress.send(ProgressUpdate::step("Transcribing audio"));
+                        self.transcribe_media_inputs(&media).await
                     }
+                    .await;
+                    drop(progress);
+                    let _ = progress_task.await;
+                    match result {
+                        Ok(transcript) => {
+                            self.edit_guest_text(
+                                &inline_id,
+                                &format!("# Transcript\n\n{transcript}"),
+                            )
+                            .await?;
+                        }
+                        Err(error) => {
+                            error!(bot_id = %self.bot.id, user_id, error = %format!("{error:#}"), "guest transcription failed");
+                            self.edit_guest_error(&inline_id, &error).await;
+                        }
+                    }
+                    return Ok(());
                 }
-                if transcripts.is_empty() {
-                    bail!("Reply to or attach a Telegram voice note or audio file");
-                }
+                let media = self.collect_media(message, arguments).await?;
+                let transcript = self.transcribe_media_inputs(&media).await?;
                 self.respond(
                     message,
                     mode,
-                    &format!("# Transcript\n\n{}", transcripts.join("\n\n")),
+                    &format!("# Transcript\n\n{transcript}"),
                     None,
                 )
                 .await?;
@@ -1321,12 +1390,12 @@ impl BotRunner {
                                 .await
                             {
                                 error!(bot_id = %self.bot.id, user_id, error = %format!("{error:#}"), "guest video delivery failed");
-                                self.edit_guest_error(&inline_id).await;
+                                self.edit_guest_error(&inline_id, &error).await;
                             }
                         }
                         Err(error) => {
                             error!(bot_id = %self.bot.id, user_id, error = %format!("{error:#}"), "guest video generation failed");
-                            self.edit_guest_error(&inline_id).await;
+                            self.edit_guest_error(&inline_id, &error).await;
                         }
                     }
                     return Ok(());
@@ -1378,7 +1447,7 @@ impl BotRunner {
                     }
                     Err(error) => {
                         error!(bot_id = %self.bot.id, user_id, error = %format!("{error:#}"), "video generation failed");
-                        self.respond(message, mode, rich::compact_error(), None)
+                        self.respond(message, mode, &rich::detailed_error(&error), None)
                             .await?;
                     }
                 }
@@ -1784,9 +1853,18 @@ impl BotRunner {
         Ok(())
     }
 
-    async fn edit_guest_error(&self, inline_message_id: &str) {
+    async fn edit_guest_error(
+        &self,
+        inline_message_id: &str,
+        error: &(dyn std::fmt::Display + Sync),
+    ) {
+        let detail = rich::detailed_error(error);
+        let mut bounded = detail.chars().take(3_750).collect::<String>();
+        if detail.chars().count() > 3_750 {
+            bounded.push_str("\n…\n```");
+        }
         let rich_message = InputRichMessage::builder()
-            .markdown(rich::to_telegram_markdown(rich::compact_error()))
+            .markdown(rich::to_telegram_markdown(&bounded))
             .build();
         let params = EditMessageTextParams::builder()
             .inline_message_id(inline_message_id)
@@ -2228,10 +2306,195 @@ impl BotRunner {
                 }
             }
         }
+        if let Some(source) = message.external_reply.as_deref() {
+            if let Some(photo) = source.photo.as_ref().and_then(|items| {
+                items.iter().max_by_key(|item| {
+                    item.file_size
+                        .unwrap_or(u64::from(item.width) * u64::from(item.height))
+                })
+            }) {
+                let data = self.download_telegram_file(&photo.file_id).await?;
+                inputs.push(MediaInput::Image {
+                    url: data_url("image/jpeg", &data),
+                });
+            }
+            if let Some(video) = &source.video {
+                let data = self.download_telegram_file(&video.file_id).await?;
+                inputs.push(MediaInput::Video {
+                    url: data_url(video.mime_type.as_deref().unwrap_or("video/mp4"), &data),
+                });
+            }
+            if let Some(video) = &source.video_note {
+                let data = self.download_telegram_file(&video.file_id).await?;
+                inputs.push(MediaInput::Video {
+                    url: data_url("video/mp4", &data),
+                });
+            }
+            if let Some(voice) = &source.voice {
+                let data = self.download_telegram_file(&voice.file_id).await?;
+                inputs.push(MediaInput::Audio {
+                    data: STANDARD.encode(data),
+                    format: audio_format(voice.mime_type.as_deref(), None).into(),
+                });
+            }
+            if let Some(audio) = &source.audio {
+                let data = self.download_telegram_file(&audio.file_id).await?;
+                inputs.push(MediaInput::Audio {
+                    data: STANDARD.encode(data),
+                    format: audio_format(audio.mime_type.as_deref(), audio.file_name.as_deref())
+                        .into(),
+                });
+            }
+            if let Some(document) = &source.document {
+                let mime = document.mime_type.as_deref().unwrap_or_default();
+                if mime.starts_with("image/")
+                    || mime.starts_with("video/")
+                    || mime.starts_with("audio/")
+                {
+                    let data = self.download_telegram_file(&document.file_id).await?;
+                    if mime.starts_with("image/") {
+                        inputs.push(MediaInput::Image {
+                            url: data_url(mime, &data),
+                        });
+                    } else if mime.starts_with("video/") {
+                        inputs.push(MediaInput::Video {
+                            url: data_url(mime, &data),
+                        });
+                    } else {
+                        inputs.push(MediaInput::Audio {
+                            data: STANDARD.encode(data),
+                            format: audio_format(Some(mime), document.file_name.as_deref()).into(),
+                        });
+                    }
+                }
+            }
+        }
         if let Some(url) = youtube_url(text) {
             inputs.push(MediaInput::Video { url });
         }
         Ok(inputs)
+    }
+
+    async fn prepare_generation_prompt(
+        &self,
+        prompt: &str,
+        media: &[MediaInput],
+        require_non_image_description: bool,
+    ) -> Result<String> {
+        let settings = self.store.settings(&self.bot.id).await?;
+        let mut supplements = Vec::new();
+        let videos = media
+            .iter()
+            .filter(|item| matches!(item, MediaInput::Video { .. }))
+            .cloned()
+            .collect::<Vec<_>>();
+        if !videos.is_empty() {
+            if !settings.capabilities.media {
+                if require_non_image_description {
+                    bail!(
+                        "Video understanding is disabled; it is required for video-to-image transformation"
+                    );
+                }
+            } else {
+                let routing = settings
+                    .model_routing
+                    .get("video_understanding")
+                    .cloned()
+                    .unwrap_or_default();
+                let model_id = &settings.selected_video_understanding_model;
+                let model = match routing.model_provider {
+                    ModelProvider::Openrouter => {
+                        self.config.resolved_model("video_understanding", model_id)
+                    }
+                    ModelProvider::Aihub => self.config.resolved_aihub_model(model_id),
+                };
+                let key = self.model_api_key(routing.model_provider).await?;
+                let description = self
+                    .openrouter
+                    .describe_generation_media(&model, &videos, &routing, &key)
+                    .await?;
+                supplements.push(format!("Reference video description:\n{description}"));
+            }
+        }
+
+        let audio = media
+            .iter()
+            .filter_map(|item| match item {
+                MediaInput::Audio { data, format } => Some((data, format)),
+                _ => None,
+            })
+            .collect::<Vec<_>>();
+        if !audio.is_empty() {
+            if !settings.capabilities.transcription {
+                if require_non_image_description {
+                    bail!(
+                        "Transcription is disabled; it is required for audio-to-image transformation"
+                    );
+                }
+            } else {
+                let routing = settings
+                    .model_routing
+                    .get("transcription")
+                    .cloned()
+                    .unwrap_or_default();
+                let key = self.model_api_key(routing.model_provider).await?;
+                for (index, (data, format)) in audio.into_iter().enumerate() {
+                    let transcript = self
+                        .openrouter
+                        .transcribe_audio(
+                            data,
+                            format,
+                            None,
+                            &settings.selected_transcription_model,
+                            &routing,
+                            &key,
+                        )
+                        .await?;
+                    supplements.push(format!(
+                        "Reference audio {} transcript:\n{transcript}",
+                        index + 1
+                    ));
+                }
+            }
+        }
+        if supplements.is_empty() {
+            return Ok(prompt.to_owned());
+        }
+        Ok(format!(
+            "Original user instruction (preserve exactly):\n{prompt}\n\n{}",
+            supplements.join("\n\n")
+        ))
+    }
+
+    async fn transcribe_media_inputs(&self, media: &[MediaInput]) -> Result<String> {
+        let settings = self.store.settings(&self.bot.id).await?;
+        let routing = settings
+            .model_routing
+            .get("transcription")
+            .cloned()
+            .unwrap_or_default();
+        let key = self.model_api_key(routing.model_provider).await?;
+        let mut transcripts = Vec::new();
+        for input in media {
+            if let MediaInput::Audio { data, format } = input {
+                transcripts.push(
+                    self.openrouter
+                        .transcribe_audio(
+                            data,
+                            format,
+                            None,
+                            &settings.selected_transcription_model,
+                            &routing,
+                            &key,
+                        )
+                        .await?,
+                );
+            }
+        }
+        if transcripts.is_empty() {
+            bail!("Reply to or attach a Telegram voice note or audio file");
+        }
+        Ok(transcripts.join("\n\n"))
     }
 
     async fn download_telegram_file(&self, file_id: &str) -> Result<Vec<u8>> {
@@ -2530,6 +2793,135 @@ fn caller_name(message: &Message) -> String {
     }
 }
 
+fn reply_context(message: &Message) -> Option<String> {
+    let replied = message.reply_to_message.as_deref();
+    let quoted = message
+        .quote
+        .as_deref()
+        .map(|quote| quote.text.trim())
+        .filter(|text| !text.is_empty());
+    if replied.is_none() && quoted.is_none() && message.external_reply.is_none() {
+        return None;
+    }
+
+    let mut context = String::from("[Replied message context]");
+    if let Some(replied) = replied {
+        context.push_str("\nAuthor: ");
+        context.push_str(&caller_name(replied));
+        if let Some(content) = replied
+            .text
+            .as_deref()
+            .or(replied.caption.as_deref())
+            .map(str::trim)
+            .filter(|content| !content.is_empty())
+        {
+            context.push_str("\nContent:\n");
+            context.push_str(content);
+        }
+        let media = message_media_labels(replied);
+        if !media.is_empty() {
+            context.push_str("\nAttachments: ");
+            context.push_str(&media.join(", "));
+        }
+    } else {
+        context.push_str("\nAuthor: unavailable from Telegram");
+    }
+    if let Some(quoted) = quoted {
+        let duplicate = replied.is_some_and(|replied| {
+            replied.text.as_deref() == Some(quoted) || replied.caption.as_deref() == Some(quoted)
+        });
+        if !duplicate {
+            if message
+                .quote
+                .as_deref()
+                .and_then(|quote| quote.is_manual)
+                .unwrap_or(false)
+            {
+                context.push_str("\nQuoted excerpt selected by the caller (primary focus):\n");
+            } else {
+                context.push_str("\nTelegram quoted excerpt (primary focus):\n");
+            }
+            context.push_str(quoted);
+        }
+    }
+    if replied.is_none()
+        && let Some(external) = message.external_reply.as_deref()
+    {
+        let media = external_reply_media_labels(external);
+        if !media.is_empty() {
+            context.push_str("\nAttachments: ");
+            context.push_str(&media.join(", "));
+        } else if quoted.is_none() {
+            context.push_str("\nContent: Telegram supplied only external-reply metadata.");
+        }
+    }
+    Some(context)
+}
+
+fn with_reply_context(text: &str, reply: Option<&str>) -> String {
+    reply.map_or_else(|| text.to_owned(), |reply| format!("{text}\n\n{reply}"))
+}
+
+fn message_media_labels(message: &Message) -> Vec<&'static str> {
+    let mut labels = Vec::new();
+    if message.photo.is_some() {
+        labels.push("image");
+    }
+    if message.video.is_some() || message.video_note.is_some() {
+        labels.push("video");
+    }
+    if message.voice.is_some() || message.audio.is_some() {
+        labels.push("audio");
+    }
+    if let Some(mime) = message
+        .document
+        .as_ref()
+        .and_then(|document| document.mime_type.as_deref())
+    {
+        if mime.starts_with("image/") {
+            labels.push("image document");
+        } else if mime.starts_with("video/") {
+            labels.push("video document");
+        } else if mime.starts_with("audio/") {
+            labels.push("audio document");
+        } else {
+            labels.push("document");
+        }
+    }
+    labels
+}
+
+fn external_reply_media_labels(
+    reply: &frankenstein::types::ExternalReplyInfo,
+) -> Vec<&'static str> {
+    let mut labels = Vec::new();
+    if reply.photo.is_some() {
+        labels.push("image");
+    }
+    if reply.video.is_some() || reply.video_note.is_some() {
+        labels.push("video");
+    }
+    if reply.voice.is_some() || reply.audio.is_some() {
+        labels.push("audio");
+    }
+    if let Some(mime) = reply
+        .document
+        .as_ref()
+        .and_then(|document| document.mime_type.as_deref())
+    {
+        if mime.starts_with("image/") {
+            labels.push("image document");
+        } else if mime.starts_with("video/") {
+            labels.push("video document");
+        } else if mime.starts_with("audio/") {
+            labels.push("audio document");
+        } else {
+            labels.push("document");
+        }
+    }
+    labels
+}
+
 fn message_has_media(message: &Message) -> bool {
     message.photo.is_some()
         || message.video.is_some()
@@ -2545,9 +2937,33 @@ fn message_has_media(message: &Message) -> bool {
         })
 }
 
+fn external_reply_has_media(reply: &frankenstein::types::ExternalReplyInfo) -> bool {
+    reply.photo.is_some()
+        || reply.video.is_some()
+        || reply.video_note.is_some()
+        || reply.voice.is_some()
+        || reply.audio.is_some()
+        || reply.document.as_ref().is_some_and(|document| {
+            document.mime_type.as_deref().is_some_and(|mime| {
+                mime.starts_with("image/")
+                    || mime.starts_with("video/")
+                    || mime.starts_with("audio/")
+            })
+        })
+}
+
 fn attachment_flags(message: &Message) -> (bool, bool, bool) {
     let sources = [Some(message), message.reply_to_message.as_deref()];
+    let external = message.external_reply.as_deref();
     let image = sources.iter().flatten().any(|item| {
+        item.photo.is_some()
+            || item.document.as_ref().is_some_and(|document| {
+                document
+                    .mime_type
+                    .as_deref()
+                    .is_some_and(|mime| mime.starts_with("image/"))
+            })
+    }) || external.is_some_and(|item| {
         item.photo.is_some()
             || item.document.as_ref().is_some_and(|document| {
                 document
@@ -2565,8 +2981,26 @@ fn attachment_flags(message: &Message) -> (bool, bool, bool) {
                     .as_deref()
                     .is_some_and(|mime| mime.starts_with("video/"))
             })
+    }) || external.is_some_and(|item| {
+        item.video.is_some()
+            || item.video_note.is_some()
+            || item.document.as_ref().is_some_and(|document| {
+                document
+                    .mime_type
+                    .as_deref()
+                    .is_some_and(|mime| mime.starts_with("video/"))
+            })
     });
     let audio = sources.iter().flatten().any(|item| {
+        item.voice.is_some()
+            || item.audio.is_some()
+            || item.document.as_ref().is_some_and(|document| {
+                document
+                    .mime_type
+                    .as_deref()
+                    .is_some_and(|mime| mime.starts_with("audio/"))
+            })
+    }) || external.is_some_and(|item| {
         item.voice.is_some()
             || item.audio.is_some()
             || item.document.as_ref().is_some_and(|document| {
@@ -2589,6 +3023,15 @@ fn default_media_prompt(message: &Message) -> &'static str {
                 .as_ref()
                 .and_then(|document| document.mime_type.as_deref())
                 .is_some_and(|mime| mime.starts_with("audio/"))
+    }) || message.external_reply.as_deref().is_some_and(|item| {
+        item.voice.is_some()
+            || item.audio.is_some()
+            || item.document.as_ref().is_some_and(|document| {
+                document
+                    .mime_type
+                    .as_deref()
+                    .is_some_and(|mime| mime.starts_with("audio/"))
+            })
     }) {
         "Transcribe and summarize the attached audio."
     } else {
@@ -2691,5 +3134,80 @@ mod tests {
         assert_eq!(override_.model_provider, ModelProvider::Openrouter);
         assert_eq!(override_.model, "openai/gpt-5.4:free");
         assert_eq!(prompt, "write code");
+    }
+
+    #[test]
+    fn quote_only_guest_replies_are_added_to_request_context() {
+        let message: Message = serde_json::from_value(serde_json::json!({
+            "message_id": 2,
+            "date": 1,
+            "chat": {"id": -100, "type": "supergroup"},
+            "guest_bot_caller_user": {
+                "id": 42,
+                "is_bot": false,
+                "first_name": "Caller"
+            },
+            "text": "What does the replied message say?",
+            "quote": {"text": "The exact replied text", "position": 0}
+        }))
+        .unwrap();
+        let context = reply_context(&message).unwrap();
+        assert!(context.contains("The exact replied text"));
+        assert!(
+            with_reply_context("Question", Some(&context)).contains("[Replied message context]")
+        );
+    }
+
+    #[test]
+    fn full_replies_include_author_text_and_media_labels() {
+        let message: Message = serde_json::from_value(serde_json::json!({
+            "message_id": 2,
+            "date": 1,
+            "chat": {"id": 10, "type": "private"},
+            "from": {"id": 42, "is_bot": false, "first_name": "Caller"},
+            "text": "Transform it",
+            "reply_to_message": {
+                "message_id": 1,
+                "date": 1,
+                "chat": {"id": 10, "type": "private"},
+                "from": {"id": 7, "is_bot": false, "first_name": "Alice", "username": "alice"},
+                "caption": "Reference caption",
+                "photo": [{"file_id":"id", "file_unique_id":"unique", "width":64, "height":64}]
+            }
+        }))
+        .unwrap();
+        let context = reply_context(&message).unwrap();
+        assert!(context.contains("Alice (@alice)"));
+        assert!(context.contains("Reference caption"));
+        assert!(context.contains("Attachments: image"));
+    }
+
+    #[test]
+    fn partial_reply_quotes_are_distinguished_from_the_full_message() {
+        let message: Message = serde_json::from_value(serde_json::json!({
+            "message_id": 2,
+            "date": 1,
+            "chat": {"id": 10, "type": "private"},
+            "from": {"id": 42, "is_bot": false, "first_name": "Caller"},
+            "text": "Explain this part",
+            "quote": {
+                "text": "selected middle sentence",
+                "position": 18,
+                "is_manual": true
+            },
+            "reply_to_message": {
+                "message_id": 1,
+                "date": 1,
+                "chat": {"id": 10, "type": "private"},
+                "from": {"id": 7, "is_bot": false, "first_name": "Alice"},
+                "text": "Opening sentence. selected middle sentence. Closing sentence."
+            }
+        }))
+        .unwrap();
+        let context = reply_context(&message).unwrap();
+        assert!(context.contains("Opening sentence"));
+        assert!(context.contains(
+            "Quoted excerpt selected by the caller (primary focus):\nselected middle sentence"
+        ));
     }
 }

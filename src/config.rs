@@ -410,6 +410,12 @@ pub struct AudioModelConfig {
 pub struct MusicModelConfig {
     pub model: String,
     pub models: Vec<ModelChoice>,
+    /// Requested encoded audio format for chat-completion audio output.
+    #[serde(default = "default_audio_format")]
+    pub format: String,
+    /// Optional provider voice. OpenAI audio models default to `alloy` when omitted.
+    #[serde(default)]
+    pub voice: Option<String>,
     #[serde(default)]
     pub extra: serde_json::Map<String, Value>,
 }
@@ -419,6 +425,8 @@ impl Default for MusicModelConfig {
         Self {
             model: "google/lyria-3-clip-preview".into(),
             models: Vec::new(),
+            format: default_audio_format(),
+            voice: None,
             extra: serde_json::Map::new(),
         }
     }

@@ -223,6 +223,106 @@ pub fn compact_error() -> &'static str {
     "I couldn’t complete that request. Please try again in a moment. If it keeps failing, ask an administrator to check the service logs."
 }
 
+/// Formats a detailed provider error for users after removing fields that can
+/// identify users, bots, requests, credentials, or internal logging targets.
+pub fn detailed_error(error: &dyn std::fmt::Display) -> String {
+    let sanitized = sanitize_error_text(&format!("{error:#}")).replace("```", "` ` `");
+    format!("# Request failed\n\n```text\n{sanitized}\n```")
+}
+
+fn sanitize_error_text(input: &str) -> String {
+    let Some(start) = input.find('{') else {
+        return redact_inline_secrets(input);
+    };
+    let Ok(mut value) = serde_json::from_str::<serde_json::Value>(&input[start..]) else {
+        return redact_inline_secrets(input);
+    };
+    sanitize_json(&mut value);
+    let json = serde_json::to_string_pretty(&value).unwrap_or_else(|_| "[Redacted]".into());
+    format!("{}{}", redact_inline_secrets(&input[..start]), json)
+}
+
+fn sanitize_json(value: &mut serde_json::Value) {
+    match value {
+        serde_json::Value::Object(object) => {
+            object.retain(|key, _| !sensitive_error_key(key));
+            for value in object.values_mut() {
+                sanitize_json(value);
+            }
+        }
+        serde_json::Value::Array(values) => values.iter_mut().for_each(sanitize_json),
+        serde_json::Value::String(text) => {
+            *text = redact_inline_secrets(text);
+            if let Ok(mut nested) = serde_json::from_str::<serde_json::Value>(text) {
+                sanitize_json(&mut nested);
+                *text =
+                    serde_json::to_string_pretty(&nested).unwrap_or_else(|_| "[Redacted]".into());
+            }
+        }
+        _ => {}
+    }
+}
+
+fn sensitive_error_key(key: &str) -> bool {
+    matches!(
+        key.to_ascii_lowercase().as_str(),
+        "target"
+            | "user_id"
+            | "bot_id"
+            | "chat_id"
+            | "message_id"
+            | "inline_message_id"
+            | "authorization"
+            | "proxy_authorization"
+            | "api_key"
+            | "apikey"
+            | "token"
+            | "access_token"
+            | "refresh_token"
+            | "secret"
+            | "password"
+            | "cookie"
+            | "set-cookie"
+            | "headers"
+    )
+}
+
+fn redact_inline_secrets(input: &str) -> String {
+    let mut redact_next = false;
+    input
+        .split_whitespace()
+        .map(|part| {
+            if redact_next {
+                redact_next = false;
+                return "[Redacted]";
+            }
+            let normalized = part.trim_matches(|character: char| {
+                matches!(character, '"' | '\'' | ',' | ';' | '(' | ')' | '[' | ']')
+            });
+            if normalized.eq_ignore_ascii_case("bearer") {
+                redact_next = true;
+                "Bearer"
+            } else if normalized.contains("sk-") || looks_like_telegram_token(normalized) {
+                "[Redacted]"
+            } else {
+                part
+            }
+        })
+        .collect::<Vec<_>>()
+        .join(" ")
+}
+
+fn looks_like_telegram_token(value: &str) -> bool {
+    value.split_once(':').is_some_and(|(id, token)| {
+        (8..=12).contains(&id.len())
+            && id.chars().all(|character| character.is_ascii_digit())
+            && token.len() >= 30
+            && token.chars().all(|character| {
+                character.is_ascii_alphanumeric() || matches!(character, '_' | '-')
+            })
+    })
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -259,5 +359,25 @@ mod tests {
         assert!(pieces.len() > 1);
         assert!(pieces.iter().all(|piece| piece.starts_with("```text")));
         assert!(pieces.iter().all(|piece| piece.trim_end().ends_with("```")));
+    }
+
+    #[test]
+    fn detailed_errors_remove_sensitive_structured_fields_and_tokens() {
+        let error = r#"OpenRouter returned 400: {"error":{"message":"Bad request","user_id":"user-1","metadata":{"target":"internal","api_key":"sk-secret","provider":"OpenAI"}}}"#;
+        let detail = detailed_error(&error);
+        assert!(detail.contains("Bad request"));
+        assert!(detail.contains("OpenAI"));
+        assert!(!detail.contains("user-1"));
+        assert!(!detail.contains("target"));
+        assert!(!detail.contains("sk-secret"));
+    }
+
+    #[test]
+    fn detailed_errors_redact_bearer_and_telegram_tokens() {
+        let detail = detailed_error(
+            &"Authorization: Bearer secret-value bot 123456789:abcdefghijklmnopqrstuvwxyz_ABCDE123456",
+        );
+        assert!(!detail.contains("secret-value"));
+        assert!(!detail.contains("abcdefghijklmnopqrstuvwxyz"));
     }
 }

@@ -216,6 +216,15 @@ openrouter:
       - id: "google/lyria-3-pro-preview"
         label: "Google Lyria 3 Pro Preview"
         extra: {}
+      - id: "openai/gpt-audio-mini"
+        label: "OpenAI GPT Audio Mini"
+        extra:
+          audio:
+            voice: "alloy"
+            format: "mp3"
+    format: "mp3"
+    # Used for providers that accept a named voice. OpenAI defaults to alloy.
+    voice: null
     extra: {}
 
   transcription:

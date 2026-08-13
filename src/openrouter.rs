@@ -288,6 +288,53 @@ impl OpenRouter {
         }
     }
 
+    /// Produces a faithful textual description of reference images/videos so a
+    /// target endpoint that cannot accept that media type can still transform it.
+    pub async fn describe_generation_media(
+        &self,
+        model: &ModelConfig,
+        media: &[MediaInput],
+        routing: &ModelRouting,
+        api_key: &str,
+    ) -> Result<String> {
+        let mut body = Map::new();
+        apply_options(&mut body, &self.config.defaults);
+        apply_options(&mut body, &model.options);
+        let routed_model = apply_routing(&mut body, &model.id, routing, true);
+        body.insert("model".into(), json!(routed_model));
+        body.insert(
+            "messages".into(),
+            json!([
+                {
+                    "role":"system",
+                    "content":"Describe the supplied reference media faithfully and concretely for a downstream media-generation model. Preserve subjects, actions, composition, colors, camera motion, timing, and style. Do not invent details or alter the user's intent."
+                },
+                {
+                    "role":"user",
+                    "content":generation_user_content("Describe this reference media.", media)
+                }
+            ]),
+        );
+        body.remove("tools");
+        body.remove("tool_choice");
+        let value = self
+            .post_json_for(
+                routing.model_provider,
+                "chat/completions",
+                Value::Object(body),
+                api_key,
+            )
+            .await?;
+        let message = value
+            .pointer("/choices/0/message")
+            .context("Reference-understanding model returned no message")?;
+        let (description, _) = extract_content(message);
+        if description.trim().is_empty() {
+            bail!("Reference-understanding model returned an empty description");
+        }
+        Ok(description)
+    }
+
     /// Classifies a natural-language request through OpenRouter Structured
     /// Outputs. Callers should fall back to ordinary chat if this bounded call
     /// fails, since planning is an optimization rather than a dependency.
@@ -615,8 +662,9 @@ impl OpenRouter {
                             input,
                         );
                         match self
-                            .generate_speech(
+                            .generate_speech_with_references(
                                 input,
+                                media,
                                 tool_models.audio_generation.model,
                                 tool_models.audio_generation.routing,
                                 tool_models.audio_generation.api_key,
@@ -642,8 +690,9 @@ impl OpenRouter {
                             prompt,
                         );
                         match self
-                            .generate_music(
+                            .generate_music_with_references(
                                 prompt,
+                                media,
                                 tool_models.music_generation.model,
                                 tool_models.music_generation.routing,
                                 tool_models.music_generation.api_key,
@@ -915,6 +964,20 @@ impl OpenRouter {
         routing: &ModelRouting,
         api_key: &str,
     ) -> Result<GeneratedImage> {
+        self.generate_speech_with_references(input, &[], model, routing, api_key)
+            .await
+    }
+
+    /// Generates speech and optionally supplies a replied audio sample for
+    /// models/endpoints that support stateless voice cloning.
+    pub async fn generate_speech_with_references(
+        &self,
+        input: &str,
+        media: &[MediaInput],
+        model: &str,
+        routing: &ModelRouting,
+        api_key: &str,
+    ) -> Result<GeneratedImage> {
         let mut body = self.config.audio.extra.clone();
         body.insert(
             "response_format".into(),
@@ -948,6 +1011,21 @@ impl OpenRouter {
         };
         body.insert("model".into(), json!(routed_model));
         body.insert("input".into(), json!(input));
+        let input_references = media
+            .iter()
+            .filter_map(|item| match item {
+                MediaInput::Audio { data, format } => Some(json!({
+                    "type": "input_audio",
+                    "input_audio": {
+                        "data": format!("data:{};base64,{data}", audio_media_type(format))
+                    }
+                })),
+                _ => None,
+            })
+            .collect::<Vec<_>>();
+        if !input_references.is_empty() {
+            body.insert("input_references".into(), Value::Array(input_references));
+        }
         let response = self
             .request_for(
                 routing.model_provider,
@@ -996,16 +1074,30 @@ impl OpenRouter {
         routing: &ModelRouting,
         api_key: &str,
     ) -> Result<GeneratedImage> {
+        self.generate_music_with_references(prompt, &[], model, routing, api_key)
+            .await
+    }
+
+    /// Generates music from text plus any compatible replied/current media.
+    pub async fn generate_music_with_references(
+        &self,
+        prompt: &str,
+        media: &[MediaInput],
+        model: &str,
+        routing: &ModelRouting,
+        api_key: &str,
+    ) -> Result<GeneratedImage> {
         if routing.model_provider != ModelProvider::Openrouter {
             bail!("Music generation currently requires OpenRouter");
         }
-        self.generate_general_audio(prompt, model, routing, api_key)
+        self.generate_general_audio(prompt, media, model, routing, api_key)
             .await
     }
 
     async fn generate_general_audio(
         &self,
         prompt: &str,
+        media: &[MediaInput],
         model: &str,
         routing: &ModelRouting,
         api_key: &str,
@@ -1020,11 +1112,17 @@ impl OpenRouter {
         {
             body.extend(choice.extra.clone());
         }
+        configure_audio_output(
+            &mut body,
+            model,
+            &self.config.music.format,
+            self.config.music.voice.as_deref(),
+        );
         let routed_model = apply_routing(&mut body, model, routing, false);
         body.insert("model".into(), json!(routed_model));
         body.insert(
             "messages".into(),
-            json!([{"role":"user", "content":prompt}]),
+            json!([{"role":"user", "content":generation_user_content(prompt, media)}]),
         );
         body.insert("modalities".into(), json!(["text", "audio"]));
         body.insert("stream".into(), json!(true));
@@ -1052,7 +1150,8 @@ impl OpenRouter {
                 payload.chars().take(2_000).collect::<String>()
             );
         }
-        let (encoded, media_type) = collect_streamed_audio(&payload)?;
+        let (encoded, media_type) =
+            collect_streamed_audio(&payload, audio_media_type(&self.config.music.format))?;
         Ok(GeneratedImage {
             bytes: STANDARD
                 .decode(&encoded)
@@ -1201,14 +1300,7 @@ impl OpenRouter {
         let routed_model = apply_routing(&mut body, model, routing, false);
         body.insert("model".into(), json!(routed_model));
         body.insert("prompt".into(), json!(prompt));
-        let references = media
-            .iter()
-            .filter_map(|item| match item {
-                MediaInput::Image { url } => Some(reference("image_url", url)),
-                MediaInput::Video { url } => Some(reference("video_url", url)),
-                MediaInput::Audio { .. } => None,
-            })
-            .collect::<Vec<_>>();
+        let references = video_input_references(media);
         if !references.is_empty() {
             body.insert("input_references".into(), Value::Array(references));
         }
@@ -1547,10 +1639,44 @@ fn report_progress(progress: &Option<UnboundedSender<ProgressUpdate>>, status: &
     }
 }
 
+fn configure_audio_output(
+    body: &mut Map<String, Value>,
+    model: &str,
+    default_format: &str,
+    configured_voice: Option<&str>,
+) {
+    let mut audio = body
+        .remove("audio")
+        .and_then(|value| value.as_object().cloned())
+        .unwrap_or_default();
+    audio
+        .entry("format")
+        .or_insert_with(|| json!(default_format));
+    let voice = configured_voice
+        .filter(|voice| !voice.trim().is_empty())
+        .or_else(|| model.starts_with("openai/").then_some("alloy"));
+    if let Some(voice) = voice {
+        audio.entry("voice").or_insert_with(|| json!(voice));
+    }
+    body.insert("audio".into(), Value::Object(audio));
+}
+
+fn audio_media_type(format: &str) -> &'static str {
+    match format.trim_start_matches("audio/") {
+        "mp3" | "mpeg" => "audio/mpeg",
+        "wav" => "audio/wav",
+        "flac" => "audio/flac",
+        "opus" | "ogg" => "audio/ogg",
+        "aac" => "audio/aac",
+        "pcm" | "pcm16" | "pcm24" => "audio/L16",
+        _ => "application/octet-stream",
+    }
+}
+
 /// Collects base64 audio chunks from an OpenRouter SSE response.
-fn collect_streamed_audio(payload: &str) -> Result<(String, String)> {
+fn collect_streamed_audio(payload: &str, default_media_type: &str) -> Result<(String, String)> {
     let mut encoded = String::new();
-    let mut media_type = "audio/mpeg".to_owned();
+    let mut media_type = default_media_type.to_owned();
     let mut values = Vec::new();
     for line in payload.lines() {
         let Some(data) = line.trim().strip_prefix("data:") else {
@@ -1572,25 +1698,43 @@ fn collect_streamed_audio(payload: &str) -> Result<(String, String)> {
         );
     }
     for value in values {
-        let audio = value
-            .pointer("/choices/0/delta/audio")
-            .or_else(|| value.pointer("/choices/0/message/audio"));
-        let Some(audio) = audio else { continue };
-        if let Some(format) = audio.get("format").and_then(Value::as_str) {
-            media_type = match format {
-                "mp3" | "mpeg" => "audio/mpeg".into(),
-                "wav" => "audio/wav".into(),
-                "opus" => "audio/ogg".into(),
-                other if other.starts_with("audio/") => other.to_owned(),
-                _ => media_type,
-            };
+        if let Some(error) = value.get("error") {
+            let code = error.get("code").and_then(Value::as_i64);
+            let message = error
+                .get("message")
+                .and_then(Value::as_str)
+                .unwrap_or("Unknown streaming error");
+            if let Some(code) = code {
+                bail!("OpenRouter audio stream failed ({code}): {message}");
+            }
+            bail!("OpenRouter audio stream failed: {message}");
         }
-        if let Some(chunk) = audio.get("data").and_then(Value::as_str) {
-            let chunk = chunk
-                .split_once(',')
-                .filter(|(prefix, _)| prefix.starts_with("data:"))
-                .map_or(chunk, |(_, data)| data);
-            encoded.push_str(chunk);
+        let Some(choices) = value.get("choices").and_then(Value::as_array) else {
+            continue;
+        };
+        for choice in choices {
+            let audio = choice
+                .pointer("/delta/audio")
+                .or_else(|| choice.pointer("/message/audio"));
+            let Some(audio) = audio else { continue };
+            if let Some(format) = audio
+                .get("mime_type")
+                .or_else(|| audio.get("format"))
+                .and_then(Value::as_str)
+            {
+                media_type = if format.starts_with("audio/") {
+                    format.to_owned()
+                } else {
+                    audio_media_type(format).to_owned()
+                };
+            }
+            if let Some(chunk) = audio.get("data").and_then(Value::as_str) {
+                let chunk = chunk
+                    .split_once(',')
+                    .filter(|(prefix, _)| prefix.starts_with("data:"))
+                    .map_or(chunk, |(_, data)| data);
+                encoded.push_str(chunk);
+            }
         }
     }
     if encoded.is_empty() {
@@ -1825,11 +1969,49 @@ fn user_content(text: &str, media: &[MediaInput], media_enabled: bool) -> Value 
     Value::Array(content)
 }
 
+fn generation_user_content(text: &str, media: &[MediaInput]) -> Value {
+    if media.is_empty() {
+        return Value::String(text.to_owned());
+    }
+    let mut content = vec![json!({"type":"text", "text":text})];
+    for item in media {
+        match item {
+            MediaInput::Image { url } => {
+                content.push(json!({"type":"image_url", "image_url":{"url":url}}));
+            }
+            MediaInput::Video { url } => {
+                content.push(json!({"type":"video_url", "video_url":{"url":url}}));
+            }
+            MediaInput::Audio { data, format } => {
+                content.push(json!({
+                    "type":"input_audio",
+                    "input_audio":{"data":data, "format":format}
+                }));
+            }
+        }
+    }
+    Value::Array(content)
+}
+
 fn reference(kind: &str, url: &str) -> Value {
     let mut value = Map::new();
     value.insert("type".into(), Value::String(kind.to_owned()));
     value.insert(kind.into(), json!({"url":url}));
     Value::Object(value)
+}
+
+fn video_input_references(media: &[MediaInput]) -> Vec<Value> {
+    media
+        .iter()
+        .map(|item| match item {
+            MediaInput::Image { url } => reference("image_url", url),
+            MediaInput::Video { url } => reference("video_url", url),
+            MediaInput::Audio { data, format } => reference(
+                "audio_url",
+                &format!("data:{};base64,{data}", audio_media_type(format)),
+            ),
+        })
+        .collect()
 }
 
 fn extract_content(message: &Value) -> (String, Vec<String>) {
@@ -2236,10 +2418,60 @@ mod tests {
             "data: {\"choices\":[{\"delta\":{\"audio\":{\"data\":\"bG8=\"}}}]}\n\n",
             "data: [DONE]\n"
         );
-        let (encoded, media_type) = collect_streamed_audio(payload).unwrap();
+        let (encoded, media_type) = collect_streamed_audio(payload, "audio/mpeg").unwrap();
         assert_eq!(encoded, "SGVsbG8=");
         assert_eq!(media_type, "audio/mpeg");
         assert_eq!(STANDARD.decode(encoded).unwrap(), b"Hello");
+    }
+
+    #[test]
+    fn openai_music_requests_receive_required_audio_configuration() {
+        let mut openai = Map::new();
+        configure_audio_output(&mut openai, "openai/gpt-audio-mini", "mp3", None);
+        assert_eq!(openai["audio"]["format"], "mp3");
+        assert_eq!(openai["audio"]["voice"], "alloy");
+
+        let mut lyria = Map::new();
+        configure_audio_output(&mut lyria, "google/lyria-3-pro-preview", "mp3", None);
+        assert_eq!(lyria["audio"]["format"], "mp3");
+        assert!(lyria["audio"].get("voice").is_none());
+    }
+
+    #[test]
+    fn generation_media_preserves_image_video_and_audio_references() {
+        let media = vec![
+            MediaInput::Image {
+                url: "data:image/png;base64,AA==".into(),
+            },
+            MediaInput::Video {
+                url: "data:video/mp4;base64,AA==".into(),
+            },
+            MediaInput::Audio {
+                data: "AA==".into(),
+                format: "mp3".into(),
+            },
+        ];
+        let content = generation_user_content("transform these", &media);
+        let parts = content.as_array().unwrap();
+        assert_eq!(parts[1]["type"], "image_url");
+        assert_eq!(parts[2]["type"], "video_url");
+        assert_eq!(parts[3]["type"], "input_audio");
+
+        let references = video_input_references(&media);
+        assert_eq!(references[0]["type"], "image_url");
+        assert_eq!(references[1]["type"], "video_url");
+        assert_eq!(references[2]["type"], "audio_url");
+        assert_eq!(
+            references[2]["audio_url"]["url"],
+            "data:audio/mpeg;base64,AA=="
+        );
+    }
+
+    #[test]
+    fn streamed_audio_surfaces_midstream_provider_errors() {
+        let payload = "data: {\"error\":{\"code\":400,\"message\":\"Provider rejected audio\"},\"choices\":[]}\n\ndata: [DONE]\n";
+        let error = collect_streamed_audio(payload, "audio/mpeg").unwrap_err();
+        assert!(error.to_string().contains("Provider rejected audio"));
     }
 
     #[test]
