@@ -166,6 +166,9 @@ pub struct OpenRouterConfig {
 pub struct PlannerConfig {
     #[serde(default = "default_planner_model")]
     pub model: String,
+    /// Very-cheap fallback used when the free router returns no final content.
+    #[serde(default = "default_planner_fallback_model")]
+    pub fallback_model: String,
     #[serde(default = "default_planner_tokens")]
     pub max_tokens: u64,
     #[serde(default = "default_planner_timeout")]
@@ -176,6 +179,7 @@ impl Default for PlannerConfig {
     fn default() -> Self {
         Self {
             model: default_planner_model(),
+            fallback_model: default_planner_fallback_model(),
             max_tokens: default_planner_tokens(),
             timeout_seconds: default_planner_timeout(),
         }
@@ -589,6 +593,7 @@ impl Config {
             bail!("OpenRouter models cannot be empty");
         }
         if self.openrouter.planner.model.trim().is_empty()
+            || self.openrouter.planner.fallback_model.trim().is_empty()
             || !(64..=4096).contains(&self.openrouter.planner.max_tokens)
             || !(1..=120).contains(&self.openrouter.planner.timeout_seconds)
         {
@@ -953,8 +958,11 @@ fn default_app_name() -> String {
 fn default_planner_model() -> String {
     "openrouter/free".into()
 }
+fn default_planner_fallback_model() -> String {
+    "google/gemini-2.5-flash-lite".into()
+}
 fn default_planner_tokens() -> u64 {
-    600
+    1_200
 }
 fn default_planner_timeout() -> u64 {
     20

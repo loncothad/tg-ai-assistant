@@ -30,11 +30,35 @@ static MEDIA: LazyLock<RwLock<HashMap<String, HostedMedia>>> =
 struct HostedMedia {
     bytes: Arc<Vec<u8>>,
     content_type: String,
+    filename: Option<String>,
     expires: Instant,
 }
 
 /// Publishes bytes at a cryptographically unguessable token and returns it.
 pub fn publish(bytes: Vec<u8>, content_type: impl Into<String>) -> Result<String> {
+    publish_inner(bytes, content_type.into(), None)
+}
+
+/// Publishes a generated document while preserving a safe download filename.
+pub fn publish_named(
+    bytes: Vec<u8>,
+    content_type: impl Into<String>,
+    filename: &str,
+) -> Result<String> {
+    let filename = filename
+        .chars()
+        .map(|character| {
+            if character.is_ascii_alphanumeric() || matches!(character, '.' | '-' | '_') {
+                character
+            } else {
+                '_'
+            }
+        })
+        .collect::<String>();
+    publish_inner(bytes, content_type.into(), Some(filename))
+}
+
+fn publish_inner(bytes: Vec<u8>, content_type: String, filename: Option<String>) -> Result<String> {
     if bytes.is_empty() || bytes.len() > MAX_ITEM_BYTES {
         bail!("Generated guest media must be between 1 byte and 50 MiB");
     }
@@ -58,7 +82,8 @@ pub fn publish(bytes: Vec<u8>, content_type: impl Into<String>) -> Result<String
         token.clone(),
         HostedMedia {
             bytes: Arc::new(bytes),
-            content_type: content_type.into(),
+            content_type,
+            filename,
             expires: Instant::now() + TTL,
         },
     );
@@ -72,8 +97,14 @@ pub async fn serve(Path(token): Path<String>) -> Response<Body> {
         .expect("ephemeral media lock poisoned")
         .get(&token)
         .filter(|item| item.expires > Instant::now())
-        .map(|item| (item.bytes.clone(), item.content_type.clone()));
-    let Some((bytes, content_type)) = item else {
+        .map(|item| {
+            (
+                item.bytes.clone(),
+                item.content_type.clone(),
+                item.filename.clone(),
+            )
+        });
+    let Some((bytes, content_type, filename)) = item else {
         return Response::builder()
             .status(StatusCode::NOT_FOUND)
             .body(Body::empty())
@@ -85,6 +116,13 @@ pub async fn serve(Path(token): Path<String>) -> Response<Body> {
         HeaderValue::from_str(&content_type)
             .unwrap_or_else(|_| HeaderValue::from_static("application/octet-stream")),
     );
+    if let Some(filename) = filename
+        && let Ok(value) = HeaderValue::from_str(&format!("attachment; filename=\"{filename}\""))
+    {
+        response
+            .headers_mut()
+            .insert(header::CONTENT_DISPOSITION, value);
+    }
     response.headers_mut().insert(
         header::CACHE_CONTROL,
         HeaderValue::from_static("private, max-age=600"),

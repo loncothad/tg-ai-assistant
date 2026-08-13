@@ -36,7 +36,7 @@ pub struct AssistantResponse {
     pub usage: Option<Value>,
     pub generated_images: Vec<GeneratedImage>,
     pub generated_audio: Vec<GeneratedImage>,
-    pub generated_videos: Vec<String>,
+    pub generated_videos: Vec<GeneratedVideo>,
     pub generated_files: Vec<GeneratedFile>,
 }
 
@@ -44,6 +44,16 @@ pub struct AssistantResponse {
 pub struct GeneratedImage {
     pub bytes: Vec<u8>,
     pub media_type: String,
+    pub model: String,
+    pub prompt: String,
+}
+
+/// A generated video URL with the exact model and prompt used to create it.
+#[derive(Clone, Debug)]
+pub struct GeneratedVideo {
+    pub url: String,
+    pub model: String,
+    pub prompt: String,
 }
 
 /// A UTF-8 file requested by the model for delivery through Telegram.
@@ -59,6 +69,8 @@ pub struct RequestPlan {
     pub action: PlannedAction,
     pub instructions: String,
     pub skills: Vec<PlannedSkill>,
+    pub delivery: PlannedDelivery,
+    pub filename: String,
     pub refusal_message: String,
 }
 
@@ -72,10 +84,83 @@ impl RequestPlan {
             .collect::<Vec<_>>()
             .join(", ");
         format!(
-            "Request planner recommendation: use skills [{}]. Execution instructions: {}. This is routing guidance only; preserve the user's exact intent and use only enabled tools.",
+            "Request planner recommendation: use skills [{}]. Delivery: {}{}. Execution instructions: {}. This is routing guidance only; preserve the user's exact intent and use only enabled tools.",
             skills,
+            self.delivery.as_str(),
+            if self.filename.trim().is_empty() {
+                String::new()
+            } else {
+                format!(" as {}", self.filename.trim())
+            },
             self.instructions.trim()
         )
+    }
+
+    /// Resolves a direct media action from either the primary action field or
+    /// the planner's selected generation skill. This tolerates inexpensive
+    /// models that emit a correct skill but leave `action` set to `chat`.
+    pub fn direct_generation(&self) -> Option<PlannedAction> {
+        match self.action {
+            PlannedAction::GenerateImage
+            | PlannedAction::GenerateAudio
+            | PlannedAction::GenerateVideo => Some(self.action),
+            PlannedAction::Chat => {
+                let generations = self
+                    .skills
+                    .iter()
+                    .filter_map(|skill| match skill {
+                        PlannedSkill::ImageGeneration => Some(PlannedAction::GenerateImage),
+                        PlannedSkill::AudioGeneration => Some(PlannedAction::GenerateAudio),
+                        PlannedSkill::VideoGeneration => Some(PlannedAction::GenerateVideo),
+                        _ => None,
+                    })
+                    .collect::<Vec<_>>();
+                (generations.len() == 1).then_some(generations[0])
+            }
+            PlannedAction::Refuse => None,
+        }
+    }
+}
+
+#[derive(Clone, Copy, Debug, Default, Deserialize, Serialize, PartialEq, Eq)]
+#[serde(rename_all = "snake_case")]
+pub enum PlannedDelivery {
+    #[default]
+    Inline,
+    File,
+}
+
+impl PlannedDelivery {
+    fn as_str(self) -> &'static str {
+        match self {
+            Self::Inline => "inline Telegram text",
+            Self::File => "Telegram file",
+        }
+    }
+}
+
+impl AssistantResponse {
+    /// Enforces the intent planner's requested delivery when the model did not
+    /// call `send_file` itself. Size and fenced-code safeguards run separately.
+    pub fn apply_planned_delivery(&mut self, plan: &RequestPlan, file_enabled: bool) {
+        if !file_enabled
+            || plan.delivery != PlannedDelivery::File
+            || !self.generated_files.is_empty()
+            || self.text.trim().is_empty()
+        {
+            return;
+        }
+        let filename = safe_filename(if plan.filename.trim().is_empty() {
+            "answer.md"
+        } else {
+            plan.filename.trim()
+        })
+        .unwrap_or_else(|| "answer.md".to_owned());
+        self.generated_files.push(GeneratedFile {
+            filename: filename.clone(),
+            bytes: self.text.as_bytes().to_vec(),
+        });
+        self.text = format!("The requested output is attached as `{filename}`.");
     }
 }
 
@@ -123,6 +208,8 @@ impl PlannedSkill {
 /// included in the classification request.
 pub struct PlanningRequest<'a> {
     pub text: &'a str,
+    pub model: &'a str,
+    pub fallback_model: &'a str,
     pub capabilities: &'a Capabilities,
     pub has_image: bool,
     pub has_video: bool,
@@ -193,7 +280,7 @@ impl OpenRouter {
                 "action": {
                     "type": "string",
                     "enum": ["chat", "generate_image", "generate_audio", "generate_video", "refuse"],
-                    "description": "Direct generation only when the user explicitly requests a new artifact; otherwise chat."
+                    "description": "Use generate_image, generate_audio, or generate_video whenever the user explicitly asks to create that media artifact, in any language. Use chat otherwise."
                 },
                 "instructions": {
                     "type": "string",
@@ -204,73 +291,98 @@ impl OpenRouter {
                     "items": {"type":"string", "enum": ["search", "web_fetch", "image_generation", "audio_generation", "video_generation", "image_understanding", "video_understanding", "transcription", "file_delivery"]},
                     "uniqueItems": true
                 },
+                "delivery": {
+                    "type": "string",
+                    "enum": ["inline", "file"],
+                    "description": "Choose file when the user requests a downloadable file, a complete code/configuration artifact, or an answer expected to be too large for convenient chat reading. Otherwise choose inline."
+                },
+                "filename": {
+                    "type": "string",
+                    "description": "Safe filename with extension when delivery is file; empty when delivery is inline."
+                },
                 "refusal_message": {
                     "type": "string",
                     "description": "Empty unless action is refuse; then a concise, respectful response in the user's language."
                 }
             },
-            "required": ["action", "instructions", "skills", "refusal_message"],
+            "required": ["action", "instructions", "skills", "delivery", "filename", "refusal_message"],
             "additionalProperties": false
         });
         let system = format!(
-            "You are a request router for a Telegram AI assistant. Return only the required schema. Enabled skills: {}. Attachments: image={}, video={}, audio={}. Choose direct generation only for an explicit request to CREATE new image/audio/video content. Describing, editing, transcribing, researching, opening URLs, answering, and transforming text are chat actions with suitable skills. Never select a disabled skill. Select refuse only when fulfilling the request itself is disallowed; do not refuse merely because a skill is unavailable. For refusal, write a useful localized explanation and a safe alternative. Do not execute the request.",
+            "You are a request router for a Telegram AI assistant. Return only the required schema. Enabled skills: {}. Attachments: image={}, video={}, audio={}. An explicit request to draw, generate, create, synthesize, or make new image/audio/video media MUST use the corresponding generate_* action and generation skill, regardless of the user's language. Describing or understanding existing media, transcribing, researching, opening URLs, answering, and transforming text use chat with suitable skills. Decide delivery in this same plan: use file for a requested downloadable artifact, a complete source-code/configuration file, or output expected to be unwieldy in chat; provide a safe filename and include file_delivery when enabled. Use inline for normal prose. Never select a disabled skill. Select refuse only when fulfilling the request itself is disallowed; do not refuse merely because a skill is unavailable. For refusal, write a useful localized explanation and a safe alternative. Do not execute the request.",
             enabled.join(", "),
             request.has_image,
             request.has_video,
             request.has_audio
         );
-        let body = json!({
-            "model": self.config.planner.model,
-            "messages": [
-                {"role":"system", "content":system},
-                {"role":"user", "content":request.text}
-            ],
-            "temperature": 0,
-            "max_tokens": self.config.planner.max_tokens,
-            "provider": {
-                "require_parameters": true,
-                "allow_fallbacks": true,
-                "data_collection": "allow",
-                "zdr": false
-            },
-            "response_format": {
-                "type": "json_schema",
-                "json_schema": {
-                    "name": "telegram_request_plan",
-                    "strict": true,
-                    "schema": schema
-                }
+        let models = [request.model, request.fallback_model];
+        let primary_model = models[0];
+        let mut failures = Vec::new();
+        let mut parsed = None;
+        for (attempt, model) in models.into_iter().enumerate() {
+            if attempt == 1 && model == primary_model {
+                continue;
             }
-        });
-        let value = tokio::time::timeout(
-            Duration::from_secs(self.config.planner.timeout_seconds),
-            self.post_json_for(
-                ModelProvider::Openrouter,
-                "chat/completions",
-                body,
-                request.api_key,
-            ),
-        )
-        .await
-        .wrap_err("OpenRouter request planner timed out")?
-        .wrap_err("OpenRouter request planner failed")?;
-        let message = value
-            .pointer("/choices/0/message")
-            .context("OpenRouter request planner returned no message")?;
-        if let Some(refusal) = extract_refusal(message) {
-            return Ok(RequestPlan {
-                action: PlannedAction::Refuse,
-                instructions: String::new(),
-                skills: Vec::new(),
-                refusal_message: refusal,
+            let body = json!({
+                "model": model,
+                "messages": [
+                    {"role":"system", "content":system},
+                    {"role":"user", "content":request.text}
+                ],
+                "temperature": 0,
+                "max_tokens": self.config.planner.max_tokens,
+                "reasoning": {"effort":"none", "exclude":true},
+                "plugins": [{"id":"response-healing"}],
+                "provider": {
+                    "require_parameters": true,
+                    "allow_fallbacks": true,
+                    "data_collection": "allow",
+                    "zdr": false
+                },
+                "response_format": {
+                    "type": "json_schema",
+                    "json_schema": {
+                        "name": "telegram_request_plan",
+                        "strict": true,
+                        "schema": schema
+                    }
+                }
             });
+            let result = tokio::time::timeout(
+                Duration::from_secs(self.config.planner.timeout_seconds),
+                self.post_json_for(
+                    ModelProvider::Openrouter,
+                    "chat/completions",
+                    body,
+                    request.api_key,
+                ),
+            )
+            .await;
+            let value = match result {
+                Ok(Ok(value)) => value,
+                Ok(Err(error)) => {
+                    failures.push(format!("{model}: {error:#}"));
+                    continue;
+                }
+                Err(_) => {
+                    failures.push(format!("{model}: Timed out"));
+                    continue;
+                }
+            };
+            match parse_planner_response(&value) {
+                Ok(plan) => {
+                    parsed = Some(plan);
+                    break;
+                }
+                Err(error) => failures.push(format!("{model}: {error:#}")),
+            }
         }
-        let content = message
-            .get("content")
-            .and_then(Value::as_str)
-            .context("OpenRouter request planner returned no structured content")?;
-        let mut plan: RequestPlan = serde_json::from_str(content)
-            .wrap_err("OpenRouter request planner returned invalid structured content")?;
+        let mut plan = parsed.wrap_err_with(|| {
+            format!(
+                "OpenRouter request planner exhausted its models: {}",
+                failures.join("; ")
+            )
+        })?;
         plan.instructions.truncate(2_000);
         plan.refusal_message.truncate(2_000);
         plan.skills
@@ -381,15 +493,7 @@ impl OpenRouter {
                         provider_name(model_provider)
                     );
                 }
-                let text = if text.chars().count() > 12_000 && capabilities.file {
-                    generated_files.push(GeneratedFile {
-                        filename: "answer.md".to_owned(),
-                        bytes: text.as_bytes().to_vec(),
-                    });
-                    "The complete answer was too large for a convenient chat message, so I attached it as `answer.md`.".to_owned()
-                } else {
-                    text
-                };
+                let text = materialize_file_answer(text, capabilities.file, &mut generated_files);
                 return Ok(AssistantResponse {
                     text,
                     media_urls,
@@ -520,7 +624,11 @@ impl OpenRouter {
                             .await
                         {
                             Ok(value) => {
-                                generated_videos.push(value);
+                                generated_videos.push(GeneratedVideo {
+                                    url: value,
+                                    model: tool_models.video_generation.model.to_owned(),
+                                    prompt: prompt.to_owned(),
+                                });
                                 json!({"status":"completed","videos":1}).to_string()
                             }
                             Err(error) => json!({"error":error.to_string()}).to_string(),
@@ -706,6 +814,8 @@ impl OpenRouter {
                         .and_then(Value::as_str)
                         .unwrap_or("image/png")
                         .to_owned(),
+                    model: model.to_owned(),
+                    prompt: prompt.to_owned(),
                 });
             } else if let Some(url) = item.get("url").and_then(Value::as_str) {
                 let response = self
@@ -732,6 +842,8 @@ impl OpenRouter {
                         .context("Failed to read generated image")?
                         .to_vec(),
                     media_type,
+                    model: model.to_owned(),
+                    prompt: prompt.to_owned(),
                 });
             }
         }
@@ -805,6 +917,8 @@ impl OpenRouter {
         Ok(GeneratedImage {
             bytes: bytes.to_vec(),
             media_type,
+            model: model.to_owned(),
+            prompt: input.to_owned(),
         })
     }
 
@@ -1264,6 +1378,20 @@ fn file_from_arguments(arguments: &Value) -> Result<GeneratedFile> {
         .get("filename")
         .and_then(Value::as_str)
         .context("File tool requires a filename")?;
+    let filename = safe_filename(raw_name).context("File name must contain safe characters")?;
+    let bytes = arguments
+        .get("content")
+        .and_then(Value::as_str)
+        .context("File tool requires content")?
+        .as_bytes()
+        .to_vec();
+    if bytes.is_empty() || bytes.len() > MAX_FILE_BYTES {
+        bail!("File content must be between 1 byte and 20 MiB");
+    }
+    Ok(GeneratedFile { filename, bytes })
+}
+
+fn safe_filename(raw_name: &str) -> Option<String> {
     let filename = raw_name
         .chars()
         .map(|character| {
@@ -1276,19 +1404,78 @@ fn file_from_arguments(arguments: &Value) -> Result<GeneratedFile> {
         .collect::<String>()
         .trim_matches('.')
         .to_owned();
-    if filename.is_empty() || filename.len() > 128 {
-        bail!("File name must contain 1 to 128 safe characters");
+    (!filename.is_empty() && filename.len() <= 128).then_some(filename)
+}
+
+fn materialize_file_answer(
+    text: String,
+    file_enabled: bool,
+    generated_files: &mut Vec<GeneratedFile>,
+) -> String {
+    const LARGE_ANSWER_CHARS: usize = 8_000;
+    const CODE_FILE_CHARS: usize = 512;
+    if !file_enabled || !generated_files.is_empty() {
+        return text;
     }
-    let bytes = arguments
-        .get("content")
-        .and_then(Value::as_str)
-        .context("File tool requires content")?
-        .as_bytes()
-        .to_vec();
-    if bytes.is_empty() || bytes.len() > MAX_FILE_BYTES {
-        bail!("File content must be between 1 byte and 20 MiB");
+    if text.chars().count() > LARGE_ANSWER_CHARS {
+        generated_files.push(GeneratedFile {
+            filename: "answer.md".to_owned(),
+            bytes: text.as_bytes().to_vec(),
+        });
+        return "The complete answer is attached as `answer.md`.".to_owned();
     }
-    Ok(GeneratedFile { filename, bytes })
+    let Some((language, code)) = largest_fenced_code(&text) else {
+        return text;
+    };
+    if code.chars().count() < CODE_FILE_CHARS {
+        return text;
+    }
+    let extension = match language.to_ascii_lowercase().as_str() {
+        "html" | "htm" => "html",
+        "css" => "css",
+        "javascript" | "js" => "js",
+        "typescript" | "ts" => "ts",
+        "rust" | "rs" => "rs",
+        "python" | "py" => "py",
+        "bash" | "sh" | "shell" => "sh",
+        "json" => "json",
+        "yaml" | "yml" => "yaml",
+        "toml" => "toml",
+        "sql" => "sql",
+        "markdown" | "md" => "md",
+        _ => "txt",
+    };
+    let filename = format!("answer.{extension}");
+    generated_files.push(GeneratedFile {
+        filename: filename.clone(),
+        bytes: code.into_bytes(),
+    });
+    format!("The generated code is attached as `{filename}`.")
+}
+
+fn largest_fenced_code(text: &str) -> Option<(String, String)> {
+    let mut current: Option<(String, String)> = None;
+    let mut largest: Option<(String, String)> = None;
+    for line in text.lines() {
+        if let Some((language, code)) = current.as_mut() {
+            if line.trim() == "```" {
+                let completed = current.take().expect("current fence exists");
+                if largest
+                    .as_ref()
+                    .is_none_or(|(_, largest_code)| completed.1.len() > largest_code.len())
+                {
+                    largest = Some(completed);
+                }
+            } else {
+                code.push_str(line);
+                code.push('\n');
+                let _ = language;
+            }
+        } else if let Some(language) = line.trim_start().strip_prefix("```") {
+            current = Some((language.trim().to_owned(), String::new()));
+        }
+    }
+    largest
 }
 
 fn openrouter_web_search_tool(config: &crate::config::OpenRouterWebSearchConfig) -> Value {
@@ -1450,6 +1637,96 @@ fn extract_refusal(message: &Value) -> Option<String> {
         })
 }
 
+fn parse_planner_response(value: &Value) -> Result<RequestPlan> {
+    let message = value
+        .pointer("/choices/0/message")
+        .context("OpenRouter request planner returned no message")?;
+    if let Some(refusal) = extract_refusal(message) {
+        return Ok(RequestPlan {
+            action: PlannedAction::Refuse,
+            instructions: String::new(),
+            skills: Vec::new(),
+            delivery: PlannedDelivery::Inline,
+            filename: String::new(),
+            refusal_message: refusal,
+        });
+    }
+
+    for field in ["parsed", "structured_output"] {
+        if let Some(document @ Value::Object(_)) = message.get(field) {
+            return serde_json::from_value(document.clone()).wrap_err_with(|| {
+                format!("OpenRouter request planner returned invalid {field} content")
+            });
+        }
+    }
+
+    let content = message.get("content").unwrap_or(&Value::Null);
+    if let Value::Object(document) = content {
+        return serde_json::from_value(Value::Object(document.clone()))
+            .wrap_err("OpenRouter request planner returned invalid object content");
+    }
+    let text = match content {
+        Value::String(text) => text.clone(),
+        Value::Array(_) => extract_content(message).0,
+        _ => String::new(),
+    };
+    if text.trim().is_empty() {
+        let finish_reason = value
+            .pointer("/choices/0/finish_reason")
+            .and_then(Value::as_str)
+            .unwrap_or("unknown");
+        let model = value
+            .get("model")
+            .and_then(Value::as_str)
+            .unwrap_or("unknown");
+        let reasoning_present = message
+            .get("reasoning")
+            .is_some_and(|reasoning| !reasoning.is_null());
+        bail!(
+            "OpenRouter request planner returned no structured content (response_model={model}, finish_reason={finish_reason}, content_type={}, reasoning_present={reasoning_present})",
+            json_type(content)
+        );
+    }
+    parse_plan_json(&text)
+}
+
+fn parse_plan_json(text: &str) -> Result<RequestPlan> {
+    let trimmed = text.trim();
+    if let Ok(plan) = serde_json::from_str(trimmed) {
+        return Ok(plan);
+    }
+    let unwrapped = trimmed
+        .strip_prefix("```json")
+        .or_else(|| trimmed.strip_prefix("```JSON"))
+        .or_else(|| trimmed.strip_prefix("```"))
+        .and_then(|body| body.strip_suffix("```"))
+        .map(str::trim);
+    if let Some(document) = unwrapped {
+        if let Ok(plan) = serde_json::from_str(document) {
+            return Ok(plan);
+        }
+    }
+    let document = trimmed
+        .find('{')
+        .zip(trimmed.rfind('}'))
+        .filter(|(start, end)| start < end)
+        .map(|(start, end)| &trimmed[start..=end])
+        .context("OpenRouter request planner returned no JSON object")?;
+    serde_json::from_str(document)
+        .wrap_err("OpenRouter request planner returned invalid structured content")
+}
+
+fn json_type(value: &Value) -> &'static str {
+    match value {
+        Value::Null => "null",
+        Value::Bool(_) => "boolean",
+        Value::Number(_) => "number",
+        Value::String(_) => "string",
+        Value::Array(_) => "array",
+        Value::Object(_) => "object",
+    }
+}
+
 async fn checked_json(response: reqwest::Response, provider: &str) -> Result<Value> {
     let status = response.status();
     let bytes = response
@@ -1587,6 +1864,66 @@ mod tests {
     }
 
     #[test]
+    fn planner_accepts_string_array_object_and_fenced_responses() {
+        let document = json!({
+            "action":"generate_image",
+            "instructions":"Generate the requested image.",
+            "skills":["image_generation"],
+            "delivery":"inline",
+            "filename":"",
+            "refusal_message":""
+        });
+        let string_response = json!({
+            "choices":[{"message":{"content":document.to_string()},"finish_reason":"stop"}]
+        });
+        let array_response = json!({
+            "choices":[{"message":{"content":[{"type":"output_text","text":document.to_string()}]},"finish_reason":"stop"}]
+        });
+        let object_response = json!({
+            "choices":[{"message":{"parsed":document},"finish_reason":"stop"}]
+        });
+        let fenced_response = json!({
+            "choices":[{"message":{"content":format!("```json\n{}\n```", document)},"finish_reason":"stop"}]
+        });
+        for response in [
+            string_response,
+            array_response,
+            object_response,
+            fenced_response,
+        ] {
+            assert_eq!(
+                parse_planner_response(&response).unwrap().action,
+                PlannedAction::GenerateImage
+            );
+        }
+    }
+
+    #[test]
+    fn planner_empty_content_error_has_safe_shape_diagnostics() {
+        let response = json!({
+            "model":"free-model",
+            "choices":[{"message":{"content":null,"reasoning":"hidden"},"finish_reason":"length"}]
+        });
+        let error = parse_planner_response(&response).unwrap_err().to_string();
+        assert!(error.contains("finish_reason=length"));
+        assert!(error.contains("content_type=null"));
+        assert!(!error.contains("hidden"));
+    }
+
+    #[test]
+    fn planner_generation_skill_recovers_a_chat_action() {
+        let plan = RequestPlan {
+            action: PlannedAction::Chat,
+            instructions: "Generate it".to_owned(),
+            skills: vec![PlannedSkill::ImageGeneration],
+            delivery: PlannedDelivery::Inline,
+            filename: String::new(),
+            refusal_message: String::new(),
+        };
+        assert_eq!(plan.direct_generation(), Some(PlannedAction::GenerateImage));
+    }
+
+    #[test]
     fn file_tool_sanitizes_names_and_limits_content() {
         let file = file_from_arguments(&json!({
             "filename": "../answer file.rs",
@@ -1595,5 +1932,24 @@ mod tests {
         .unwrap();
         assert_eq!(file.filename, "_answer_file.rs");
         assert_eq!(file.bytes, b"fn main() {}");
+    }
+
+    #[test]
+    fn substantial_code_answers_are_materialized_as_files() {
+        let code = format!("<!doctype html>\n{}", "<main>content</main>\n".repeat(40));
+        let answer = format!("Here is the page:\n\n```html\n{code}```");
+        let mut files = Vec::new();
+        let summary = materialize_file_answer(answer, true, &mut files);
+        assert_eq!(summary, "The generated code is attached as `answer.html`.");
+        assert_eq!(files[0].filename, "answer.html");
+        assert_eq!(files[0].bytes, code.as_bytes());
+    }
+
+    #[test]
+    fn large_answers_are_materialized_as_markdown_files() {
+        let mut files = Vec::new();
+        let summary = materialize_file_answer("x".repeat(8_001), true, &mut files);
+        assert_eq!(summary, "The complete answer is attached as `answer.md`.");
+        assert_eq!(files[0].filename, "answer.md");
     }
 }

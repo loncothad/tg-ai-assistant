@@ -317,6 +317,16 @@ async fn set_model(
         Ok(auth) => auth,
         Err(e) => return auth_error(e),
     };
+    if matches!(
+        form.capability.as_str(),
+        "intent_planning" | "intent_planning_fallback"
+    ) && form.model_provider != ModelProvider::Openrouter
+    {
+        return message(
+            StatusCode::BAD_REQUEST,
+            "Intent processing currently requires an OpenRouter model",
+        );
+    }
     let allowed = catalog_for(&state, &bot, form.model_provider)
         .await
         .map(|models| {
@@ -790,6 +800,22 @@ async fn render_html(state: &AdminState, bot: &str) -> Result<String> {
     };
     let model_forms = [
         model_form(
+            "Intent processing",
+            "intent_planning",
+            &settings.selected_planner_model,
+            &route("intent_planning"),
+            &configured,
+            openrouter_ready,
+        ),
+        model_form(
+            "Intent processing fallback",
+            "intent_planning_fallback",
+            &settings.selected_planner_fallback_model,
+            &route("intent_planning_fallback"),
+            &configured,
+            openrouter_ready,
+        ),
+        model_form(
             "General chat",
             "chat",
             &settings.selected_model,
@@ -1002,6 +1028,8 @@ fn model_provider_for_skill(settings: &crate::db::BotSettings, skill: &str) -> M
 fn model_allowed_fallback(config: &Config, capability: &str, id: &str) -> bool {
     match capability {
         "chat" => config.openrouter.models.iter().any(|model| model.id == id),
+        "intent_planning" => config.openrouter.planner.model == id,
+        "intent_planning_fallback" => config.openrouter.planner.fallback_model == id,
         "image_understanding" => config
             .openrouter
             .understanding

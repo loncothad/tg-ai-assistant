@@ -25,6 +25,7 @@ let originalModelProvider = 'openrouter';
 const providerCache = new Map();
 const capabilityNames = {
   chat: 'General chat', image_understanding: 'Image understanding', video_understanding: 'Video understanding',
+  intent_planning: 'Intent processing', intent_planning_fallback: 'Intent processing fallback',
   image_generation: 'Image generation', audio_generation: 'Speech generation', transcription: 'Transcription',
   video_generation: 'Video generation'
 };
@@ -44,6 +45,11 @@ const supports = (model, cap) => {
   const input = model.input_modalities || [];
   const output = model.output_modalities || [];
   if (cap === 'chat') return input.includes('text') && output.includes('text');
+  if (cap === 'intent_planning' || cap === 'intent_planning_fallback') {
+    const parameters = model.supported_parameters || [];
+    return input.includes('text') && output.includes('text') &&
+      (parameters.includes('response_format') || parameters.includes('structured_outputs'));
+  }
   if (cap === 'image_understanding') return input.includes('image') && output.includes('text');
   if (cap === 'video_understanding') return input.includes('video') && output.includes('text');
   if (cap === 'image_generation') return output.includes('image');

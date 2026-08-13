@@ -6,7 +6,9 @@ services:
     environment:
       TELEFORGE_CONFIG: /app/config.yaml
     volumes:
-      - ./config.yaml:/app/config.yaml:ro
+      # Z gives the bind-mounted file a private SELinux container label on
+      # enforcing RHEL-family hosts such as AlmaLinux.
+      - ./config.yaml:/app/config.yaml:ro,Z
       - teleforge-data:/app/data
     ports:
       - "127.0.0.1:8080:8080"

@@ -129,7 +129,9 @@ openrouter:
   # filters its zero-cost pool for structured-output support automatically.
   planner:
     model: "openrouter/free"
-    max_tokens: 600
+    # Used only if the free router produces no valid final structured output.
+    fallback_model: "google/gemini-2.5-flash-lite"
+    max_tokens: 1200
     timeout_seconds: 20
 
   defaults:

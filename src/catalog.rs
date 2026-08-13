@@ -51,6 +51,13 @@ impl CatalogModel {
         let output = |value: &str| self.output_modalities.iter().any(|item| item == value);
         match capability {
             "chat" => input("text") && output("text"),
+            "intent_planning" | "intent_planning_fallback" => {
+                input("text")
+                    && output("text")
+                    && self.supported_parameters.iter().any(|parameter| {
+                        matches!(parameter.as_str(), "response_format" | "structured_outputs")
+                    })
+            }
             "image_understanding" => input("image") && output("text"),
             "video_understanding" => input("video") && output("text"),
             "image_generation" => output("image"),
@@ -171,13 +178,30 @@ async fn fetch_openrouter_catalog(
 
     let mut models = BTreeMap::<String, CatalogModel>::new();
     merge_values(&mut models, general);
-    // Dedicated media catalogs expose SKU pricing and generation constraints
-    // that the general catalog may omit. They enrich only user-visible models.
-    for endpoint in ["images/models", "videos/models"] {
+    // `/models/user` currently defaults to text-output models even when an
+    // `output_modalities=all` query is supplied. Pull the non-text catalogs
+    // explicitly so media-only models are not silently omitted from the
+    // capability chooser.
+    for modality in ["speech", "transcription"] {
+        if let Ok(values) = fetch_data(
+            client,
+            &format!("{base}/models?sort=newest&output_modalities={modality}"),
+            api_key,
+            "OpenRouter",
+        )
+        .await
+        {
+            merge_values(&mut models, values);
+        }
+    }
+    // Dedicated media catalogs expose generation constraints and SKU pricing.
+    // Their entries must be inserted as well as enriched: media-only IDs are
+    // commonly absent from `/models/user`.
+    for (endpoint, output_modality) in [("images/models", "image"), ("videos/models", "video")] {
         if let Ok(values) =
             fetch_data(client, &format!("{base}/{endpoint}"), api_key, "OpenRouter").await
         {
-            enrich_values(&mut models, values);
+            merge_media_values(&mut models, values, output_modality);
         }
     }
     if models.is_empty() {
@@ -272,12 +296,26 @@ fn merge_values(models: &mut BTreeMap<String, CatalogModel>, values: Vec<Value>)
     }
 }
 
-fn enrich_values(models: &mut BTreeMap<String, CatalogModel>, values: Vec<Value>) {
+fn merge_media_values(
+    models: &mut BTreeMap<String, CatalogModel>,
+    values: Vec<Value>,
+    output_modality: &str,
+) {
     for value in values {
-        if let Some(incoming) = parse_model(&value)
-            && let Some(current) = models.get_mut(&incoming.id)
-        {
-            merge_model(current, incoming);
+        if let Some(mut incoming) = parse_model(&value) {
+            append_unique(
+                &mut incoming.output_modalities,
+                vec![output_modality.to_owned()],
+            );
+            if incoming.input_modalities.is_empty() {
+                incoming.input_modalities.push("text".to_owned());
+            }
+            match models.entry(incoming.id.clone()) {
+                Entry::Vacant(entry) => {
+                    entry.insert(incoming);
+                }
+                Entry::Occupied(mut entry) => merge_model(entry.get_mut(), incoming),
+            }
         }
     }
 }
@@ -491,6 +529,11 @@ mod tests {
         assert!(model(&["text"], &["speech"]).supports("audio_generation"));
         assert!(model(&["text", "video"], &["text"]).supports("video_understanding"));
         assert!(model(&["text", "image"], &["video"]).supports("video_generation"));
+        let mut planner = model(&["text"], &["text"]);
+        planner
+            .supported_parameters
+            .push("response_format".to_owned());
+        assert!(planner.supports("intent_planning"));
     }
 
     #[test]
@@ -555,5 +598,22 @@ mod tests {
             "required_attestation_types": ["organization"]
         });
         assert!(parse_model(&value).is_none());
+    }
+
+    #[test]
+    fn dedicated_media_catalogs_insert_models_without_architecture() {
+        let mut models = BTreeMap::new();
+        merge_media_values(
+            &mut models,
+            vec![serde_json::json!({
+                "id": "vendor/video",
+                "name": "Video model",
+                "supported_durations": [5, 10]
+            })],
+            "video",
+        );
+        let model = &models["vendor/video"];
+        assert!(model.supports("video_generation"));
+        assert_eq!(model.input_modalities, ["text"]);
     }
 }

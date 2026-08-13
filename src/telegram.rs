@@ -11,11 +11,13 @@ use frankenstein::{
         InlineQueryResult, InlineQueryResultArticle, InputMessageContent, InputRichMessageContent,
     },
     input_file::FileUpload,
-    input_media::{InputMedia, InputMediaAudio, InputMediaPhoto, InputMediaVideo},
+    input_media::{
+        InputMedia, InputMediaAudio, InputMediaDocument, InputMediaPhoto, InputMediaVideo,
+    },
     methods::{
         AnswerGuestQueryParams, EditMessageMediaParams, EditMessageTextParams, GetFileParams,
         GetUpdatesParams, SendAudioParams, SendChatActionParams, SendDocumentParams,
-        SendPhotoParams, SendRichMessageDraftParams, SendRichMessageParams, SendVideoParams,
+        SendPhotoParams, SendRichMessageParams, SendVideoParams,
     },
     rich_message::InputRichMessage,
     types::{
@@ -231,16 +233,39 @@ impl BotRunner {
         {
             return Ok(());
         }
-        let text = if raw_text.is_empty() {
+        let mut text = if raw_text.is_empty() {
             default_media_prompt(&message).to_owned()
         } else {
             self.strip_address(raw_text)
         };
         let scope = scope_id(mode, &message, user_id);
 
-        if let Some((command, arguments)) = parse_command(&text) {
+        let model_override = if let Some((command, arguments)) = parse_command(&text)
+            && command == "model"
+            && !arguments.is_empty()
+        {
+            if !self.is_admin(user_id) {
+                self.respond(
+                    &message,
+                    mode,
+                    "Administrator access is required for per-message model overrides.",
+                    None,
+                )
+                .await?;
+                return Ok(());
+            }
+            let (model_override, prompt) = parse_model_override(arguments)?;
+            text = prompt.to_owned();
+            Some(model_override)
+        } else {
+            None
+        };
+
+        if model_override.is_none()
+            && let Some((command, arguments)) = parse_command(&text)
+        {
             if let Err(error) = self
-                .command(&message, mode, user_id, &scope, &command, arguments)
+                .command(&message, mode, user_id, &command, arguments, None)
                 .await
             {
                 error!(bot_id = %self.bot.id, user_id, error = %format!("{error:#}"), "command failed");
@@ -270,6 +295,8 @@ impl BotRunner {
                 .openrouter
                 .plan_request(PlanningRequest {
                     text: &text,
+                    model: &settings.selected_planner_model,
+                    fallback_model: &settings.selected_planner_fallback_model,
                     capabilities: &capabilities,
                     has_image: attachment_flags.0,
                     has_video: attachment_flags.1,
@@ -288,15 +315,22 @@ impl BotRunner {
             None
         };
         if let Some(plan) = plan.as_ref() {
-            let generation_command = match plan.action {
-                PlannedAction::GenerateImage => Some("image"),
-                PlannedAction::GenerateAudio => Some("audio"),
-                PlannedAction::GenerateVideo => Some("video"),
-                PlannedAction::Chat | PlannedAction::Refuse => None,
+            let generation_command = match plan.direct_generation() {
+                Some(PlannedAction::GenerateImage) => Some("image"),
+                Some(PlannedAction::GenerateAudio) => Some("audio"),
+                Some(PlannedAction::GenerateVideo) => Some("video"),
+                _ => None,
             };
             if let Some(command) = generation_command {
                 if let Err(error) = self
-                    .command(&message, mode, user_id, &scope, command, &text)
+                    .command(
+                        &message,
+                        mode,
+                        user_id,
+                        command,
+                        &text,
+                        model_override.as_ref(),
+                    )
                     .await
                 {
                     error!(bot_id = %self.bot.id, user_id, error = %format!("{error:#}"), "planned generation command failed");
@@ -310,14 +344,6 @@ impl BotRunner {
                     .await?;
                 return Ok(());
             }
-        }
-        if mode == MessageMode::Guest {
-            capabilities.image = false;
-            capabilities.audio = false;
-            capabilities.video = false;
-            capabilities.media = false;
-            capabilities.transcription = false;
-            capabilities.file = false;
         }
         let provider = self.search_provider().await?;
         let search_key = if capabilities.search {
@@ -364,10 +390,19 @@ impl BotRunner {
             ("chat", &settings.selected_model)
         };
         let default_routing = ModelRouting::default();
-        let routing = settings
-            .model_routing
-            .get(model_capability)
-            .unwrap_or(&default_routing);
+        let override_routing = model_override.as_ref().map(|override_| ModelRouting {
+            model_provider: override_.model_provider,
+            ..ModelRouting::default()
+        });
+        let routing = override_routing.as_ref().unwrap_or_else(|| {
+            settings
+                .model_routing
+                .get(model_capability)
+                .unwrap_or(&default_routing)
+        });
+        let selected = model_override
+            .as_ref()
+            .map_or(selected.as_str(), |override_| override_.model.as_str());
         let model = match routing.model_provider {
             ModelProvider::Openrouter => self.config.resolved_model(model_capability, selected),
             ModelProvider::Aihub => self.config.resolved_aihub_model(selected),
@@ -423,23 +458,33 @@ impl BotRunner {
             .append_message(&self.bot.id, &scope, "user", &contextual_text)
             .await?;
         let session_id = format!("{}:{scope}", self.bot.id);
-        let (progress, progress_task) = if mode == MessageMode::Guest {
-            (None, None)
+        let guest_pending_id = if mode == MessageMode::Guest {
+            Some(
+                self.answer_guest_pending(&message, "Processing the request")
+                    .await?,
+            )
         } else {
-            let (sender, receiver) = mpsc::unbounded_channel();
-            let runner = self.clone();
-            let chat_id = message.chat.id;
-            let thread_id = message.message_thread_id;
-            let draft_id = i64::from(message.message_id);
-            let task = tokio::spawn(async move {
-                runner
-                    .update_progress_draft(chat_id, thread_id, draft_id, receiver)
-                    .await;
-            });
-            let _ = sender.send("Reading your request".to_owned());
-            (Some(sender), Some(task))
+            None
         };
-        let result = self
+        let (sender, receiver) = mpsc::unbounded_channel();
+        let runner = self.clone();
+        let progress_task = if let Some(inline_id) = guest_pending_id.clone() {
+            tokio::spawn(async move {
+                runner.update_guest_progress(inline_id, receiver).await;
+            })
+        } else {
+            let progress_message_id = self
+                .send_progress_message(&message, "Reading the request")
+                .await?;
+            let chat_id = message.chat.id;
+            tokio::spawn(async move {
+                runner
+                    .update_progress_message(chat_id, progress_message_id, receiver)
+                    .await;
+            })
+        };
+        let _ = sender.send("Preparing conversation context".to_owned());
+        let mut result = self
             .openrouter
             .chat(ChatRequest {
                 model: &model,
@@ -477,60 +522,118 @@ impl BotRunner {
                         api_key: &video_key,
                     },
                 },
-                progress,
+                progress: Some(sender.clone()),
             })
             .await;
-        if let Some(task) = progress_task {
-            let _ = task.await;
+        if let (Ok(answer), Some(plan)) = (&mut result, plan.as_ref()) {
+            answer.apply_planned_delivery(plan, capabilities.file);
         }
+        let _ = sender.send(if result.is_ok() {
+            "Request completed".to_owned()
+        } else {
+            "Request failed".to_owned()
+        });
+        drop(sender);
+        let _ = progress_task.await;
         match result {
             Ok(answer) => {
                 self.store
                     .append_message(&self.bot.id, &scope, "assistant", &answer.text)
                     .await?;
-                self.respond(&message, mode, &answer.text, None).await?;
-                if mode != MessageMode::Guest {
-                    for image in answer.generated_images {
-                        self.send_photo_bytes(
-                            message.chat.id,
-                            message.message_thread_id,
-                            &image.bytes,
+                if mode == MessageMode::Guest {
+                    let inline_id = guest_pending_id
+                        .as_deref()
+                        .context("Guest request has no pending result")?;
+                    let delivery = if let Some(image) = answer.generated_images.into_iter().next() {
+                        self.edit_guest_image(
+                            inline_id,
+                            image.bytes,
                             &image.media_type,
-                            Some("Generated by Teleforge"),
+                            &image.model,
+                            &image.prompt,
                         )
-                        .await?;
-                    }
-                    for audio in answer.generated_audio {
-                        self.send_audio_bytes(
-                            message.chat.id,
-                            message.message_thread_id,
-                            &audio.bytes,
+                        .await
+                    } else if let Some(audio) = answer.generated_audio.into_iter().next() {
+                        self.edit_guest_audio(
+                            inline_id,
+                            audio.bytes,
                             &audio.media_type,
+                            &audio.model,
+                            &audio.prompt,
                         )
-                        .await?;
+                        .await
+                    } else if let Some(video) = answer.generated_videos.first() {
+                        self.edit_guest_video(inline_id, &video.url, &video.model, &video.prompt)
+                            .await
+                    } else if let Some(file) = answer.generated_files.first() {
+                        self.edit_guest_document(inline_id, file.bytes.clone(), &file.filename)
+                            .await
+                    } else {
+                        self.edit_guest_text(inline_id, &answer.text).await
+                    };
+                    if let Err(error) = delivery {
+                        error!(bot_id = %self.bot.id, user_id, error = %format!("{error:#}"), "guest result delivery failed");
+                        self.edit_guest_error(inline_id).await;
                     }
-                    for video in answer.generated_videos {
-                        self.send_video_url(
-                            message.chat.id,
-                            message.message_thread_id,
-                            &video,
-                            Some("Generated by Teleforge"),
-                        )
-                        .await?;
-                    }
-                    for file in answer.generated_files {
-                        self.send_document_bytes(
-                            message.chat.id,
-                            message.message_thread_id,
-                            &file.filename,
-                            &file.bytes,
-                        )
-                        .await?;
-                    }
-                    for url in answer.media_urls {
-                        self.send_photo_url(message.chat.id, message.message_thread_id, &url, None)
+                    if let Some(id) = answer.generation_id {
+                        self.store
+                            .audit(&self.bot.id, Some(user_id), "chat.complete", Some(&id))
                             .await?;
                     }
+                    return Ok(());
+                }
+                self.respond(&message, mode, &answer.text, None).await?;
+                for image in answer.generated_images {
+                    self.send_photo_bytes(
+                        message.chat.id,
+                        message.message_thread_id,
+                        &image.bytes,
+                        &image.media_type,
+                        Some(&generation_caption(&image.model, &image.prompt)),
+                        Some(message.message_id),
+                    )
+                    .await?;
+                }
+                for audio in answer.generated_audio {
+                    self.send_audio_bytes(
+                        message.chat.id,
+                        message.message_thread_id,
+                        &audio.bytes,
+                        &audio.media_type,
+                        Some(&generation_caption(&audio.model, &audio.prompt)),
+                        Some(message.message_id),
+                    )
+                    .await?;
+                }
+                for video in answer.generated_videos {
+                    self.send_video_url(
+                        message.chat.id,
+                        message.message_thread_id,
+                        &video.url,
+                        Some(&generation_caption(&video.model, &video.prompt)),
+                        Some(message.message_id),
+                    )
+                    .await?;
+                }
+                for file in answer.generated_files {
+                    self.send_document_bytes(
+                        message.chat.id,
+                        message.message_thread_id,
+                        &file.filename,
+                        &file.bytes,
+                        Some(message.message_id),
+                    )
+                    .await?;
+                }
+                for url in answer.media_urls {
+                    self.send_photo_url(
+                        message.chat.id,
+                        message.message_thread_id,
+                        &url,
+                        None,
+                        Some(message.message_id),
+                    )
+                    .await?;
                 }
                 if let Some(id) = answer.generation_id {
                     self.store
@@ -540,8 +643,12 @@ impl BotRunner {
             }
             Err(error) => {
                 error!(bot_id = %self.bot.id, user_id, error = %format!("{error:#}"), "assistant request failed");
-                self.respond(&message, mode, rich::compact_error(), None)
-                    .await?;
+                if let Some(inline_id) = guest_pending_id.as_deref() {
+                    self.edit_guest_error(inline_id).await;
+                } else {
+                    self.respond(&message, mode, rich::compact_error(), None)
+                        .await?;
+                }
             }
         }
         Ok(())
@@ -552,14 +659,15 @@ impl BotRunner {
         message: &Message,
         mode: MessageMode,
         user_id: u64,
-        scope: &str,
         command: &str,
         arguments: &str,
+        model_override: Option<&MessageModelOverride>,
     ) -> Result<()> {
         match command {
             "start" | "help" => self.respond(message, mode, HELP, None).await?,
             "new" => {
-                self.store.clear_history(&self.bot.id, scope).await?;
+                let scope = scope_id(mode, message, user_id);
+                self.store.clear_history(&self.bot.id, &scope).await?;
                 self.respond(message, mode, "Conversation history cleared.", None)
                     .await?;
             }
@@ -653,34 +761,58 @@ impl BotRunner {
                     bail!("Image generation is disabled by an administrator");
                 }
                 require_arguments(arguments, "/image <prompt>")?;
+                let generation_model = model_override.map_or(
+                    settings.selected_image_generation_model.as_str(),
+                    |override_| override_.model.as_str(),
+                );
+                let routing = model_override.map_or_else(
+                    || {
+                        settings
+                            .model_routing
+                            .get("image_generation")
+                            .cloned()
+                            .unwrap_or_default()
+                    },
+                    |override_| ModelRouting {
+                        model_provider: override_.model_provider,
+                        ..ModelRouting::default()
+                    },
+                );
                 if mode == MessageMode::Guest {
                     let inline_id = self
                         .answer_guest_pending(message, "Generating the requested image")
                         .await?;
-                    let routing = settings
-                        .model_routing
-                        .get("image_generation")
-                        .cloned()
-                        .unwrap_or_default();
+                    let (progress, progress_task) =
+                        self.begin_guest_progress(&inline_id, "Preparing image generation");
                     let result = async {
+                        let _ = progress
+                            .send(format!("Generating the image with {}", generation_model));
                         let key = self.model_api_key(routing.model_provider).await?;
                         let references = self.collect_media(message, arguments).await?;
                         self.openrouter
                             .generate_image_with_references(
                                 arguments,
                                 &references,
-                                &settings.selected_image_generation_model,
+                                generation_model,
                                 &routing,
                                 &key,
                             )
                             .await
                     }
                     .await;
+                    drop(progress);
+                    let _ = progress_task.await;
                     match result {
                         Ok(mut images) if !images.is_empty() => {
                             let image = images.remove(0);
                             if let Err(error) = self
-                                .edit_guest_image(&inline_id, image.bytes, &image.media_type)
+                                .edit_guest_image(
+                                    &inline_id,
+                                    image.bytes,
+                                    &image.media_type,
+                                    &image.model,
+                                    &image.prompt,
+                                )
                                 .await
                             {
                                 error!(bot_id = %self.bot.id, user_id, error = %format!("{error:#}"), "guest image delivery failed");
@@ -695,29 +827,36 @@ impl BotRunner {
                     }
                     return Ok(());
                 }
+                let (progress, progress_task) = self
+                    .begin_chat_progress(message, "Preparing image generation")
+                    .await?;
                 self.send_action(
                     message.chat.id,
                     message.message_thread_id,
                     ChatAction::UploadPhoto,
                 )
                 .await;
+                let _ = progress.send("Reading reference media".to_owned());
                 let references = self.collect_media(message, arguments).await?;
-                let routing = settings
-                    .model_routing
-                    .get("image_generation")
-                    .cloned()
-                    .unwrap_or_default();
                 let key = self.model_api_key(routing.model_provider).await?;
+                let _ = progress.send(format!("Generating the image with {}", generation_model));
                 let result = self
                     .openrouter
                     .generate_image_with_references(
                         arguments,
                         &references,
-                        &settings.selected_image_generation_model,
+                        generation_model,
                         &routing,
                         &key,
                     )
                     .await;
+                let _ = progress.send(if result.is_ok() {
+                    "Image generation completed".to_owned()
+                } else {
+                    "Image generation failed".to_owned()
+                });
+                drop(progress);
+                let _ = progress_task.await;
                 match result {
                     Ok(images) => {
                         for image in images {
@@ -726,7 +865,8 @@ impl BotRunner {
                                 message.message_thread_id,
                                 &image.bytes,
                                 &image.media_type,
-                                Some("Generated by Teleforge"),
+                                Some(&generation_caption(&image.model, &image.prompt)),
+                                Some(message.message_id),
                             )
                             .await?;
                         }
@@ -744,31 +884,50 @@ impl BotRunner {
                     bail!("Audio generation is disabled by an administrator");
                 }
                 require_arguments(arguments, "/audio <text>")?;
+                let generation_model = model_override.map_or(
+                    settings.selected_audio_generation_model.as_str(),
+                    |override_| override_.model.as_str(),
+                );
+                let routing = model_override.map_or_else(
+                    || {
+                        settings
+                            .model_routing
+                            .get("audio_generation")
+                            .cloned()
+                            .unwrap_or_default()
+                    },
+                    |override_| ModelRouting {
+                        model_provider: override_.model_provider,
+                        ..ModelRouting::default()
+                    },
+                );
                 if mode == MessageMode::Guest {
                     let inline_id = self
                         .answer_guest_pending(message, "Generating the requested audio")
                         .await?;
-                    let routing = settings
-                        .model_routing
-                        .get("audio_generation")
-                        .cloned()
-                        .unwrap_or_default();
+                    let (progress, progress_task) =
+                        self.begin_guest_progress(&inline_id, "Preparing speech generation");
                     let result = async {
+                        let _ =
+                            progress.send(format!("Generating speech with {}", generation_model));
                         let key = self.model_api_key(routing.model_provider).await?;
                         self.openrouter
-                            .generate_audio(
-                                arguments,
-                                &settings.selected_audio_generation_model,
-                                &routing,
-                                &key,
-                            )
+                            .generate_audio(arguments, generation_model, &routing, &key)
                             .await
                     }
                     .await;
+                    drop(progress);
+                    let _ = progress_task.await;
                     match result {
                         Ok(audio) => {
                             if let Err(error) = self
-                                .edit_guest_audio(&inline_id, audio.bytes, &audio.media_type)
+                                .edit_guest_audio(
+                                    &inline_id,
+                                    audio.bytes,
+                                    &audio.media_type,
+                                    &audio.model,
+                                    &audio.prompt,
+                                )
                                 .await
                             {
                                 error!(bot_id = %self.bot.id, user_id, error = %format!("{error:#}"), "guest audio delivery failed");
@@ -782,27 +941,28 @@ impl BotRunner {
                     }
                     return Ok(());
                 }
+                let (progress, progress_task) = self
+                    .begin_chat_progress(message, "Preparing speech generation")
+                    .await?;
                 self.send_action(
                     message.chat.id,
                     message.message_thread_id,
                     ChatAction::UploadVoice,
                 )
                 .await;
-                let routing = settings
-                    .model_routing
-                    .get("audio_generation")
-                    .cloned()
-                    .unwrap_or_default();
                 let key = self.model_api_key(routing.model_provider).await?;
+                let _ = progress.send(format!("Generating speech with {}", generation_model));
                 let result = self
                     .openrouter
-                    .generate_audio(
-                        arguments,
-                        &settings.selected_audio_generation_model,
-                        &routing,
-                        &key,
-                    )
+                    .generate_audio(arguments, generation_model, &routing, &key)
                     .await;
+                let _ = progress.send(if result.is_ok() {
+                    "Speech generation completed".to_owned()
+                } else {
+                    "Speech generation failed".to_owned()
+                });
+                drop(progress);
+                let _ = progress_task.await;
                 match result {
                     Ok(audio) => {
                         self.send_audio_bytes(
@@ -810,6 +970,8 @@ impl BotRunner {
                             message.message_thread_id,
                             &audio.bytes,
                             &audio.media_type,
+                            Some(&generation_caption(&audio.model, &audio.prompt)),
+                            Some(message.message_id),
                         )
                         .await?
                     }
@@ -876,32 +1038,53 @@ impl BotRunner {
                     bail!("Video generation is disabled by an administrator");
                 }
                 require_arguments(arguments, "/video <prompt>")?;
+                let generation_model = model_override.map_or(
+                    settings.selected_video_generation_model.as_str(),
+                    |override_| override_.model.as_str(),
+                );
+                let routing = model_override.map_or_else(
+                    || {
+                        settings
+                            .model_routing
+                            .get("video_generation")
+                            .cloned()
+                            .unwrap_or_default()
+                    },
+                    |override_| ModelRouting {
+                        model_provider: override_.model_provider,
+                        ..ModelRouting::default()
+                    },
+                );
                 if mode == MessageMode::Guest {
                     let inline_id = self
                         .answer_guest_pending(message, "Generating the requested video")
                         .await?;
-                    let routing = settings
-                        .model_routing
-                        .get("video_generation")
-                        .cloned()
-                        .unwrap_or_default();
+                    let (progress, progress_task) =
+                        self.begin_guest_progress(&inline_id, "Preparing video generation");
                     let result = async {
+                        let _ = progress
+                            .send(format!("Generating the video with {}", generation_model));
                         let key = self.model_api_key(routing.model_provider).await?;
                         let references = self.collect_media(message, arguments).await?;
                         self.openrouter
                             .generate_video_with_references(
                                 arguments,
                                 &references,
-                                &settings.selected_video_generation_model,
+                                generation_model,
                                 &routing,
                                 &key,
                             )
                             .await
                     }
                     .await;
+                    drop(progress);
+                    let _ = progress_task.await;
                     match result {
                         Ok(url) => {
-                            if let Err(error) = self.edit_guest_video(&inline_id, &url).await {
+                            if let Err(error) = self
+                                .edit_guest_video(&inline_id, &url, generation_model, arguments)
+                                .await
+                            {
                                 error!(bot_id = %self.bot.id, user_id, error = %format!("{error:#}"), "guest video delivery failed");
                                 self.edit_guest_error(&inline_id).await;
                             }
@@ -913,36 +1096,44 @@ impl BotRunner {
                     }
                     return Ok(());
                 }
+                let (progress, progress_task) = self
+                    .begin_chat_progress(message, "Preparing video generation")
+                    .await?;
                 self.send_action(
                     message.chat.id,
                     message.message_thread_id,
                     ChatAction::UploadVideo,
                 )
                 .await;
+                let _ = progress.send("Reading reference media".to_owned());
                 let references = self.collect_media(message, arguments).await?;
-                let routing = settings
-                    .model_routing
-                    .get("video_generation")
-                    .cloned()
-                    .unwrap_or_default();
                 let key = self.model_api_key(routing.model_provider).await?;
+                let _ = progress.send(format!("Generating the video with {}", generation_model));
                 let result = self
                     .openrouter
                     .generate_video_with_references(
                         arguments,
                         &references,
-                        &settings.selected_video_generation_model,
+                        generation_model,
                         &routing,
                         &key,
                     )
                     .await;
+                let _ = progress.send(if result.is_ok() {
+                    "Video generation completed".to_owned()
+                } else {
+                    "Video generation failed".to_owned()
+                });
+                drop(progress);
+                let _ = progress_task.await;
                 match result {
                     Ok(url) => {
                         self.send_video_url(
                             message.chat.id,
                             message.message_thread_id,
                             &url,
-                            Some("Generated by Teleforge"),
+                            Some(&generation_caption(generation_model, arguments)),
+                            Some(message.message_id),
                         )
                         .await?
                     }
@@ -1123,6 +1314,8 @@ impl BotRunner {
         inline_message_id: &str,
         bytes: Vec<u8>,
         media_type: &str,
+        model: &str,
+        prompt: &str,
     ) -> Result<()> {
         let token = crate::ephemeral_media::publish(bytes, media_type)?;
         let url = format!(
@@ -1131,7 +1324,7 @@ impl BotRunner {
         );
         let media = InputMediaPhoto::builder()
             .media(FileUpload::from(url))
-            .caption("✅ Generation completed")
+            .caption(generation_caption(model, prompt))
             .build();
         let params = EditMessageMediaParams::builder()
             .inline_message_id(inline_message_id)
@@ -1146,6 +1339,8 @@ impl BotRunner {
         inline_message_id: &str,
         bytes: Vec<u8>,
         media_type: &str,
+        model: &str,
+        prompt: &str,
     ) -> Result<()> {
         let token = crate::ephemeral_media::publish(bytes, media_type)?;
         let url = format!(
@@ -1154,7 +1349,7 @@ impl BotRunner {
         );
         let media = InputMediaAudio::builder()
             .media(FileUpload::from(url))
-            .caption("✅ Generation completed")
+            .caption(generation_caption(model, prompt))
             .build();
         let params = EditMessageMediaParams::builder()
             .inline_message_id(inline_message_id)
@@ -1164,10 +1359,16 @@ impl BotRunner {
         Ok(())
     }
 
-    async fn edit_guest_video(&self, inline_message_id: &str, url: &str) -> Result<()> {
+    async fn edit_guest_video(
+        &self,
+        inline_message_id: &str,
+        url: &str,
+        model: &str,
+        prompt: &str,
+    ) -> Result<()> {
         let media = InputMediaVideo::builder()
             .media(FileUpload::from(url.to_owned()))
-            .caption("✅ Generation completed")
+            .caption(generation_caption(model, prompt))
             .supports_streaming(true)
             .build();
         let params = EditMessageMediaParams::builder()
@@ -1175,6 +1376,44 @@ impl BotRunner {
             .media(InputMedia::Video(media))
             .build();
         self.telegram.edit_message_media(&params).await?;
+        Ok(())
+    }
+
+    async fn edit_guest_document(
+        &self,
+        inline_message_id: &str,
+        bytes: Vec<u8>,
+        filename: &str,
+    ) -> Result<()> {
+        let token =
+            crate::ephemeral_media::publish_named(bytes, "application/octet-stream", filename)?;
+        let url = format!(
+            "{}/generated/{token}",
+            self.config.server.public_url.trim_end_matches('/')
+        );
+        let media = InputMediaDocument::builder()
+            .media(FileUpload::from(url))
+            .caption(format!("Generated file: {filename}"))
+            .build();
+        let params = EditMessageMediaParams::builder()
+            .inline_message_id(inline_message_id)
+            .media(InputMedia::Document(media))
+            .build();
+        self.telegram.edit_message_media(&params).await?;
+        Ok(())
+    }
+
+    async fn edit_guest_text(&self, inline_message_id: &str, markdown: &str) -> Result<()> {
+        let content = rich::chunks(markdown)
+            .into_iter()
+            .next()
+            .unwrap_or_default();
+        let rich_message = InputRichMessage::builder().markdown(content).build();
+        let params = EditMessageTextParams::builder()
+            .inline_message_id(inline_message_id)
+            .rich_message(rich_message)
+            .build();
+        self.telegram.edit_message_text(&params).await?;
         Ok(())
     }
 
@@ -1217,17 +1456,70 @@ impl BotRunner {
         Ok(())
     }
 
-    async fn update_progress_draft(
+    async fn send_progress_message(&self, message: &Message, status: &str) -> Result<i32> {
+        let rich_message = progress_rich_message(status, 0);
+        let mut params = SendRichMessageParams::builder()
+            .chat_id(message.chat.id)
+            .rich_message(rich_message)
+            .build();
+        params.message_thread_id = message.message_thread_id;
+        params.reply_parameters = Some(
+            ReplyParameters::builder()
+                .message_id(message.message_id)
+                .build(),
+        );
+        Ok(self
+            .telegram
+            .send_rich_message(&params)
+            .await?
+            .result
+            .message_id)
+    }
+
+    async fn begin_chat_progress(
+        &self,
+        message: &Message,
+        status: &str,
+    ) -> Result<(mpsc::UnboundedSender<String>, tokio::task::JoinHandle<()>)> {
+        let message_id = self.send_progress_message(message, status).await?;
+        let (sender, receiver) = mpsc::unbounded_channel();
+        let runner = self.clone();
+        let chat_id = message.chat.id;
+        let task = tokio::spawn(async move {
+            runner
+                .update_progress_message(chat_id, message_id, receiver)
+                .await;
+        });
+        let _ = sender.send(status.to_owned());
+        Ok((sender, task))
+    }
+
+    fn begin_guest_progress(
+        &self,
+        inline_message_id: &str,
+        status: &str,
+    ) -> (mpsc::UnboundedSender<String>, tokio::task::JoinHandle<()>) {
+        let (sender, receiver) = mpsc::unbounded_channel();
+        let runner = self.clone();
+        let inline_message_id = inline_message_id.to_owned();
+        let task = tokio::spawn(async move {
+            runner
+                .update_guest_progress(inline_message_id, receiver)
+                .await;
+        });
+        let _ = sender.send(status.to_owned());
+        (sender, task)
+    }
+
+    async fn update_progress_message(
         &self,
         chat_id: i64,
-        thread_id: Option<i32>,
-        draft_id: i64,
+        message_id: i32,
         mut updates: mpsc::UnboundedReceiver<String>,
     ) {
         let started = tokio::time::Instant::now();
         let mut status = "Starting".to_owned();
-        let mut drafts_enabled = true;
-        let mut ticker = tokio::time::interval(Duration::from_secs(3));
+        let mut ticker = tokio::time::interval(Duration::from_secs(2));
         ticker.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
         loop {
             tokio::select! {
@@ -1235,20 +1527,52 @@ impl BotRunner {
                     Some(update) => status = update,
                     None => break,
                 },
-                _ = ticker.tick(), if drafts_enabled => {
-                    let markdown = format!("⏳ **{status}…**\n\nElapsed: {}s", started.elapsed().as_secs());
-                    let rich_message = InputRichMessage::builder()
-                        .markdown(rich::to_telegram_markdown(&markdown))
-                        .build();
-                    let mut params = SendRichMessageDraftParams::builder()
+                _ = ticker.tick() => {
+                    let params = EditMessageTextParams::builder()
                         .chat_id(chat_id)
-                        .draft_id(draft_id)
-                        .rich_message(rich_message)
+                        .message_id(message_id)
+                        .rich_message(progress_rich_message(&status, started.elapsed().as_secs()))
                         .build();
-                    params.message_thread_id = thread_id;
-                    if let Err(error) = self.telegram.send_rich_message_draft(&params).await {
-                        warn!(bot_id = %self.bot.id, %error, "failed to update progress draft");
-                        drafts_enabled = false;
+                    if let Err(error) = self.telegram.edit_message_text(&params).await {
+                        warn!(bot_id = %self.bot.id, %error, "failed to update progress message");
+                        break;
+                    }
+                }
+            }
+        }
+        let params = EditMessageTextParams::builder()
+            .chat_id(chat_id)
+            .message_id(message_id)
+            .rich_message(progress_rich_message(&status, started.elapsed().as_secs()))
+            .build();
+        if let Err(error) = self.telegram.edit_message_text(&params).await {
+            warn!(bot_id = %self.bot.id, %error, "failed to complete progress message");
+        }
+    }
+
+    async fn update_guest_progress(
+        &self,
+        inline_message_id: String,
+        mut updates: mpsc::UnboundedReceiver<String>,
+    ) {
+        let started = tokio::time::Instant::now();
+        let mut status = "Starting".to_owned();
+        let mut ticker = tokio::time::interval(Duration::from_secs(2));
+        ticker.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
+        loop {
+            tokio::select! {
+                update = updates.recv() => match update {
+                    Some(update) => status = update,
+                    None => break,
+                },
+                _ = ticker.tick() => {
+                    let params = EditMessageTextParams::builder()
+                        .inline_message_id(inline_message_id.clone())
+                        .rich_message(progress_rich_message(&status, started.elapsed().as_secs()))
+                        .build();
+                    if let Err(error) = self.telegram.edit_message_text(&params).await {
+                        warn!(bot_id = %self.bot.id, %error, "failed to update guest progress message");
+                        break;
                     }
                 }
             }
@@ -1273,6 +1597,7 @@ impl BotRunner {
         bytes: &[u8],
         media_type: &str,
         caption: Option<&str>,
+        reply_to: Option<i32>,
     ) -> Result<()> {
         let suffix = if media_type.contains("jpeg") {
             ".jpg"
@@ -1295,6 +1620,8 @@ impl BotRunner {
                 .build();
             params.message_thread_id = thread_id;
             params.caption = caption.map(str::to_owned);
+            params.reply_parameters = reply_to
+                .map(|message_id| ReplyParameters::builder().message_id(message_id).build());
             self.telegram.send_document(&params).await?;
             return Ok(());
         }
@@ -1304,6 +1631,8 @@ impl BotRunner {
             .build();
         params.message_thread_id = thread_id;
         params.caption = caption.map(str::to_owned);
+        params.reply_parameters =
+            reply_to.map(|message_id| ReplyParameters::builder().message_id(message_id).build());
         self.telegram.send_photo(&params).await?;
         Ok(())
     }
@@ -1314,6 +1643,7 @@ impl BotRunner {
         thread_id: Option<i32>,
         filename: &str,
         bytes: &[u8],
+        reply_to: Option<i32>,
     ) -> Result<()> {
         let directory = tempfile::tempdir()?;
         let path = directory.path().join(filename);
@@ -1324,6 +1654,8 @@ impl BotRunner {
             .caption(format!("Generated file · {filename}"))
             .build();
         params.message_thread_id = thread_id;
+        params.reply_parameters =
+            reply_to.map(|message_id| ReplyParameters::builder().message_id(message_id).build());
         self.telegram.send_document(&params).await?;
         Ok(())
     }
@@ -1334,6 +1666,7 @@ impl BotRunner {
         thread_id: Option<i32>,
         url: &str,
         caption: Option<&str>,
+        reply_to: Option<i32>,
     ) -> Result<()> {
         if url.starts_with("data:") {
             warn!(bot_id = %self.bot.id, "skipping data-URL image from chat completion; use /image for generated files");
@@ -1345,6 +1678,8 @@ impl BotRunner {
             .build();
         params.message_thread_id = thread_id;
         params.caption = caption.map(str::to_owned);
+        params.reply_parameters =
+            reply_to.map(|message_id| ReplyParameters::builder().message_id(message_id).build());
         self.telegram.send_photo(&params).await?;
         Ok(())
     }
@@ -1355,6 +1690,8 @@ impl BotRunner {
         thread_id: Option<i32>,
         bytes: &[u8],
         media_type: &str,
+        caption: Option<&str>,
+        reply_to: Option<i32>,
     ) -> Result<()> {
         let suffix = if media_type.contains("wav") {
             ".wav"
@@ -1371,9 +1708,11 @@ impl BotRunner {
         let mut params = SendAudioParams::builder()
             .chat_id(chat_id)
             .audio(FileUpload::from(file.path().to_path_buf()))
-            .caption("Generated by Teleforge")
             .build();
         params.message_thread_id = thread_id;
+        params.caption = caption.map(str::to_owned);
+        params.reply_parameters =
+            reply_to.map(|message_id| ReplyParameters::builder().message_id(message_id).build());
         self.telegram.send_audio(&params).await?;
         Ok(())
     }
@@ -1384,6 +1723,7 @@ impl BotRunner {
         thread_id: Option<i32>,
         url: &str,
         caption: Option<&str>,
+        reply_to: Option<i32>,
     ) -> Result<()> {
         let mut params = SendVideoParams::builder()
             .chat_id(chat_id)
@@ -1392,6 +1732,8 @@ impl BotRunner {
         params.message_thread_id = thread_id;
         params.caption = caption.map(str::to_owned);
         params.supports_streaming = Some(true);
+        params.reply_parameters =
+            reply_to.map(|message_id| ReplyParameters::builder().message_id(message_id).build());
         self.telegram.send_video(&params).await?;
         Ok(())
     }
@@ -1595,6 +1937,65 @@ fn parse_command(text: &str) -> Option<(String, &str)> {
     ))
 }
 
+#[derive(Clone, Debug, PartialEq, Eq)]
+struct MessageModelOverride {
+    model_provider: ModelProvider,
+    model: String,
+}
+
+fn parse_model_override(arguments: &str) -> Result<(MessageModelOverride, &str)> {
+    let (specification, prompt) = arguments
+        .split_once(char::is_whitespace)
+        .context("Expected `-model [openrouter:|aihub:]<model-id> <request>`")?;
+    let prompt = prompt.trim();
+    if prompt.is_empty() {
+        bail!("Expected a request after the model ID");
+    }
+    let (model_provider, model) = if let Some(model) = specification.strip_prefix("openrouter:") {
+        (ModelProvider::Openrouter, model)
+    } else if let Some(model) = specification.strip_prefix("aihub:") {
+        (ModelProvider::Aihub, model)
+    } else {
+        (ModelProvider::Openrouter, specification)
+    };
+    if model.is_empty()
+        || model.len() > 200
+        || !model.chars().all(|character| {
+            character.is_ascii_alphanumeric()
+                || matches!(character, '/' | ':' | '.' | '-' | '_' | '~')
+        })
+    {
+        bail!("Invalid model ID");
+    }
+    Ok((
+        MessageModelOverride {
+            model_provider,
+            model: model.to_owned(),
+        },
+        prompt,
+    ))
+}
+
+fn generation_caption(model: &str, prompt: &str) -> String {
+    const MAX_PROMPT_CHARS: usize = 850;
+    let mut prompt = prompt
+        .trim()
+        .chars()
+        .take(MAX_PROMPT_CHARS)
+        .collect::<String>();
+    if prompt.chars().count() == MAX_PROMPT_CHARS {
+        prompt.push('…');
+    }
+    format!("Model: {model}\nPrompt: {prompt}")
+}
+
+fn progress_rich_message(status: &str, elapsed_seconds: u64) -> InputRichMessage {
+    let markdown = format!("**{status}…**\n\nElapsed: {elapsed_seconds}s");
+    InputRichMessage::builder()
+        .markdown(rich::to_telegram_markdown(&markdown))
+        .build()
+}
+
 fn parse_user_id(value: &str) -> Result<u64> {
     value
         .trim()
@@ -1760,6 +2161,7 @@ Ask me a question directly. I can use live web search when the selected model de
 
 - `/new` — clear this conversation
 - `/model` — show the active model
+- `-model [openrouter:|aihub:]<model-id> <request>` — use a model for one request (administrators only)
 - `/search <query>` — force a live web search
 - `/searchprovider` — show the active search provider
 - `/image <prompt>` — generate an image
@@ -1783,5 +2185,18 @@ mod tests {
             parse_command("-SEARCH current news"),
             Some(("search".to_owned(), "current news"))
         );
+    }
+
+    #[test]
+    fn parses_admin_message_model_override() {
+        let (override_, prompt) = parse_model_override("aihub:gpt-5.4-mini explain this").unwrap();
+        assert_eq!(override_.model_provider, ModelProvider::Aihub);
+        assert_eq!(override_.model, "gpt-5.4-mini");
+        assert_eq!(prompt, "explain this");
+
+        let (override_, prompt) = parse_model_override("openai/gpt-5.4:free write code").unwrap();
+        assert_eq!(override_.model_provider, ModelProvider::Openrouter);
+        assert_eq!(override_.model, "openai/gpt-5.4:free");
+        assert_eq!(prompt, "write code");
     }
 }

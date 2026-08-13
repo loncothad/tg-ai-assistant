@@ -70,6 +70,10 @@ impl Default for Capabilities {
 pub struct BotSettings {
     pub selected_model: String,
     #[serde(default)]
+    pub selected_planner_model: String,
+    #[serde(default)]
+    pub selected_planner_fallback_model: String,
+    #[serde(default)]
     pub selected_image_understanding_model: String,
     #[serde(default)]
     pub selected_video_understanding_model: String,
@@ -145,6 +149,12 @@ impl Store {
                 &settings_key(&bot.id),
                 &BotSettings {
                     selected_model: bot.default_model.clone(),
+                    selected_planner_model: config.openrouter.planner.model.clone(),
+                    selected_planner_fallback_model: config
+                        .openrouter
+                        .planner
+                        .fallback_model
+                        .clone(),
                     selected_image_understanding_model: config
                         .openrouter
                         .understanding
@@ -175,6 +185,14 @@ impl Store {
         let mut settings = self.settings(&bot.id).await?;
         let mut changed = false;
         for (value, fallback) in [
+            (
+                &mut settings.selected_planner_model,
+                &config.openrouter.planner.model,
+            ),
+            (
+                &mut settings.selected_planner_fallback_model,
+                &config.openrouter.planner.fallback_model,
+            ),
             (
                 &mut settings.selected_image_understanding_model,
                 &config.openrouter.understanding.image.default_model,
@@ -261,6 +279,8 @@ impl Store {
         let mut settings = self.settings(bot_id).await?;
         match capability {
             "chat" => settings.selected_model = model.into(),
+            "intent_planning" => settings.selected_planner_model = model.into(),
+            "intent_planning_fallback" => settings.selected_planner_fallback_model = model.into(),
             "image_understanding" => settings.selected_image_understanding_model = model.into(),
             "video_understanding" => settings.selected_video_understanding_model = model.into(),
             "image_generation" => settings.selected_image_generation_model = model.into(),
@@ -604,6 +624,8 @@ mod tests {
                     &settings_key(bot),
                     &BotSettings {
                         selected_model: "chat".into(),
+                        selected_planner_model: "planner".into(),
+                        selected_planner_fallback_model: "planner-fallback".into(),
                         selected_image_understanding_model: "vision".into(),
                         selected_video_understanding_model: "video-vision".into(),
                         selected_image_generation_model: "image".into(),
