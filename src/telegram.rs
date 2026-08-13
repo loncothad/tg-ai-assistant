@@ -1560,14 +1560,37 @@ impl BotRunner {
         if parsed.host_str().is_none_or(generated_media_host_blocked) {
             bail!("Generated media URL has an invalid host");
         }
-        let mut response = self
-            .client
-            .get(parsed)
+        let openrouter_host = url::Url::parse(&self.config.openrouter.base_url)
+            .ok()
+            .and_then(|url| url.host_str().map(str::to_owned));
+        let is_openrouter_content = parsed.host_str() == openrouter_host.as_deref();
+        let mut request = self.client.get(parsed);
+        if is_openrouter_content {
+            let api_key = self
+                .store
+                .credential(&self.bot.id, "openrouter")
+                .await?
+                .context("OpenRouter API key is required to download generated video content")?;
+            request = request
+                .bearer_auth(api_key)
+                .header("X-OpenRouter-Title", &self.config.openrouter.app_name)
+                .header("X-OpenRouter-Metadata", "enabled");
+            if let Some(site_url) = &self.config.openrouter.site_url {
+                request = request.header("HTTP-Referer", site_url);
+            }
+        }
+        let mut response = request
             .send()
             .await
             .context("Failed to download generated media")?
             .error_for_status()
-            .context("Generated media download returned an error status")?;
+            .wrap_err_with(|| {
+                if is_openrouter_content {
+                    "Authenticated OpenRouter media download returned an error status"
+                } else {
+                    "Generated media download returned an error status"
+                }
+            })?;
         if response
             .content_length()
             .is_some_and(|length| length > MAX_BYTES as u64)
