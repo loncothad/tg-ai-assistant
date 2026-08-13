@@ -251,6 +251,8 @@ impl BotRunner {
             self.strip_address(raw_text)
         };
         let reply_context = reply_context(&message);
+        let replied_text = replied_message_text(&message);
+        let telegram_quote = telegram_quote_text(&message);
         let scope = scope_id(mode, &message, user_id);
 
         let model_override = if let Some((command, arguments)) = parse_command(&text)
@@ -285,7 +287,10 @@ impl BotRunner {
                     &command,
                     arguments,
                     CommandOptions {
-                        reply_context: reply_context.as_deref(),
+                        // Explicit commands bypass the natural-language
+                        // planner. Pass only Telegram's selected quote (or the
+                        // raw replied text), never the verbose context wrapper.
+                        reply_context: telegram_quote.or(replied_text),
                         ..CommandOptions::default()
                     },
                 )
@@ -348,7 +353,9 @@ impl BotRunner {
             match self
                 .openrouter
                 .plan_request(PlanningRequest {
-                    text: &request_text,
+                    text: &text,
+                    replied_message: replied_text,
+                    telegram_quote,
                     model: &settings.selected_planner_model,
                     fallback_model: &settings.selected_planner_fallback_model,
                     capabilities: &capabilities,
@@ -394,6 +401,10 @@ impl BotRunner {
             _ => None,
         };
         if let Some(command) = generation_command {
+            let generation_prompt = plan.as_ref().map_or_else(
+                || text.trim().to_owned(),
+                |plan| plan.effective_generation_prompt(&text, replied_text, telegram_quote),
+            );
             drop(sender);
             let _ = progress_task.await;
             if let Err(error) = self
@@ -402,7 +413,7 @@ impl BotRunner {
                     mode,
                     user_id,
                     command,
-                    &request_text,
+                    &generation_prompt,
                     CommandOptions {
                         model_override: model_override.as_ref(),
                         guest_pending_id: guest_pending_id.as_deref(),
@@ -2856,6 +2867,23 @@ fn reply_context(message: &Message) -> Option<String> {
         }
     }
     Some(context)
+}
+
+fn replied_message_text(message: &Message) -> Option<&str> {
+    message
+        .reply_to_message
+        .as_deref()
+        .and_then(|reply| reply.text.as_deref().or(reply.caption.as_deref()))
+        .map(str::trim)
+        .filter(|text| !text.is_empty())
+}
+
+fn telegram_quote_text(message: &Message) -> Option<&str> {
+    message
+        .quote
+        .as_deref()
+        .map(|quote| quote.text.trim())
+        .filter(|text| !text.is_empty())
 }
 
 fn with_reply_context(text: &str, reply: Option<&str>) -> String {
