@@ -1,0 +1,105 @@
+# Teleforge
+
+Teleforge is a production-oriented, multi-bot Telegram AI assistant written in Rust with [`frankenstein`](https://crates.io/crates/frankenstein). It sends Telegram Rich Messages, uses OpenRouter for chat and media, supports Brave Search, Exa, and Google results through SerpAPI, and stores all runtime state in a local redb database.
+
+## Capabilities
+
+- Any number of Telegram bot tokens in one process. Each configured bot ID has isolated settings, encrypted API credentials, history, access rules, audit records, and update offsets.
+- Private-message, group/thread, and Telegram guest-bot modes. Group handling can require a mention or reply.
+- OpenRouter chat options including fallback model lists, provider routing, server tools, plugins, transforms, reasoning, structured responses, modalities, sampling controls, usage, and forward-compatible fields under `extra`.
+- OpenRouter server-side Web Search and Web Fetch. Fetch is a separately toggleable built-in skill that can retrieve page and PDF text, with engine, usage/content limits, and domain policy configured in YAML.
+- Real model tools named `web_search`, `generate_image`, `generate_audio`, `generate_video`, and attachment-scoped `transcribe_audio`. The AI can invoke them during an ordinary conversation; the backend executes the selected API and delivers generated media to Telegram.
+- Direct `/search`, `/image`, `/audio`, `/transcribe`, and `/video` commands. Every command also accepts the `-COMMAND` form (case-insensitive), including query and guest requests.
+- An authenticated Telegram Mini App admin panel built with HTMX for model/provider selection, per-skill switches, API-key management, custom prompt/skill import, skill-bundle export/import, and user allowlisting.
+- Native Telegram Rich Message responses and rich guest-query results with Unicode-safe chunking.
+- Bounded per-bot concurrency, timeouts, polling backoff, graceful shutdown, structured logs, and health endpoints.
+
+## Build-time defaults and runtime customization
+
+The normal repository files [`defaults/system.md`](defaults/system.md) and [`defaults/skills/`](defaults/skills/) are embedded into the binary with `include_str!`. Each built-in skill has its own file and a Rust-side description. Edit those files and rebuild to change the shipped defaults.
+
+Built-in skills are enabled by default. Disabling one in the admin panel removes its instructions and, where applicable, its callable tool schema from subsequent AI requests. Media understanding and transcription have independent switches from media generation. Runtime custom prompts and skill instructions live only in redb, can be enabled/disabled/reset independently, and never alter the embedded defaults. Imported custom skills may direct the model to the enabled built-in tool names; importing arbitrary executable code or arbitrary HTTP endpoints is deliberately unsupported.
+
+Skill export produces a versioned JSON bundle containing the built-in descriptions/instructions, enabled states, and custom skill text. Uploading that JSON in the skill import form restores the toggles and custom text. Built-in instruction text remains build-time immutable; edit the files and rebuild to replace it.
+
+## Quick start
+
+Requirements: Rust 1.85+, one or more BotFather tokens, an HTTPS public origin for the Telegram Mini App, and an OpenRouter key. Search keys are optional.
+
+```sh
+cp config.example.yaml config.yaml
+cp .env.example .env
+openssl rand -base64 32  # place this once in TELEFORGE_MASTER_KEY
+set -a
+. ./.env
+set +a
+cargo test
+cargo run --release -- --config config.yaml
+```
+
+Replace the example Telegram user IDs and bot tokens before starting. `TELEGRAM_BOT_TOKENS` is one comma-separated value; tokens map in order to enabled `bots` entries, while disabled entries consume no token. The application does not parse `.env` itself. [`config.example.yaml`](config.example.yaml) is exhaustive and supports `${NAME}` and `${NAME:-default}` expansion.
+
+`server.public_url` must be an HTTPS origin routed to the HTTP listener. `GET /healthz` is liveness; `GET /readyz` reports readiness. Open `/admin` in the bot's private chat to launch its Mini App.
+
+## Administration and access
+
+`admin_user_ids` in YAML is the immutable administrator boundary for each bot. The server validates Telegram Mini App `initData` on every HTMX request using that bot's token, enforces a short authentication age, and checks the authenticated user against this list. It does not trust IDs supplied by the browser.
+
+The answer allowlist is separate and editable from the panel or with `/allow`, `/deny`, and `/allowed`. `allowed_user_ids` only seeds missing entries, so later admin changes survive restarts. `allowed_chat_ids` grants access in selected chats. `allow_everyone` should be enabled only for intentionally public bots.
+
+The model chooser is per capability: general chat, image understanding, video understanding, image generation, speech generation, transcription, and video generation each have an independent per-bot selection. Each selection also has OpenRouter routing controls: Auto uses normal OpenRouter routing (including Auto Exacto behavior for tool requests), Cheapest sorts by price, Highest throughput and Lowest latency use their corresponding provider sorts, Exacto selects the tool-quality model variant where applicable, and a provider can be pinned with `provider.only`. OpenRouter rejects a pinned provider that does not offer the chosen model. The available models are curated in YAML; the provider catalog is retrieved from OpenRouter without exposing the key to the browser.
+
+The YAML `defaults` and each chat model's `options` expose the current OpenRouter request surface, including server `tools`, `tool_choice`, parallel tool calls, cache control, image configuration, reasoning, response formats, provider policy, plugins, routing/service tier, tracing, sampling, and an `extra` map for newly introduced fields. Runtime routing is merged last so the administrator's selection is authoritative.
+
+| Command | Purpose |
+| --- | --- |
+| `/help`, `/start` | Show usage |
+| `/new` | Clear the current isolated conversation |
+| `/model`, `/searchprovider` | Show current selections |
+| `/search <query>` | Force live web search |
+| `/image <prompt>` | Generate and upload an image |
+| `/audio <text>` | Generate and upload spoken audio |
+| `/transcribe` | Transcribe attached or replied-to voice/audio |
+| `/video <prompt>` | Generate and send a video |
+| `/admin` | Open the Mini App (immutable administrators only) |
+| `/allow <id>`, `/deny <id>`, `/allowed` | Manage this bot's answer allowlist |
+
+Commands can start with either `/` or `-`, and command names are case-insensitive—for example, `-SEARCH current Istanbul transit news`. In groups, a dash command is recognized without requiring a bot mention. Guest replies remain a single Rich Message result, so text commands and OpenRouter Web Search/Web Fetch work there, while media-producing and attachment commands remain unavailable.
+
+Conversation requests include the stored context plus current UTC time, Telegram message time, caller/display name and ID, language, bot identity, chat/title/thread scope, access mode, and effective capabilities.
+
+Photos, videos, video notes, voice notes, audio files, and matching Telegram documents can be supplied directly or by replying to the media message. Private Telegram media is size-checked and encoded only for the current OpenRouter request. Images and videos can guide image/video generation. YouTube URLs are sent as video inputs, subject to the selected model/provider's video support.
+
+## Local persistence and secrets
+
+redb writes to `database.path`; there is no remote database mode. Only one Teleforge process should open a database file. Back up the file before deployments or schema-affecting upgrades.
+
+API keys entered through the panel are write-only in the UI and encrypted at rest with ChaCha20-Poly1305 using `database.encryption_key`. Bootstrap keys from the environment are copied into each bot's isolated encrypted state only when that provider is not yet configured. Protect the master key separately from the database backup: losing it makes credentials unrecoverable, while disclosure of both defeats at-rest protection.
+
+Provider environment variables are optional. If one is absent and no encrypted per-bot key has been saved, its provider options and dependent capability controls are disabled; the panel explicitly names the missing key. Saving a key activates those controls on the next HTMX refresh. Removing it makes them unavailable again without silently falling back to a different credential.
+
+## Deployment and security
+
+```sh
+docker compose up --build -d
+```
+
+The container runs as an unprivileged user and persists `/app/data`. Terminate any old instance before moving a Telegram token because long polling must have one active consumer per token. Put an HTTPS reverse proxy in front of port 8080 and do not expose the redb file.
+
+- Never commit real bot tokens, provider keys, the master key, or `config.yaml`.
+- Keep immutable admin IDs restrictive. Every admin mutation is re-authenticated server-side; credentials are never rendered back to the browser.
+- The Mini App response uses a nonce-based Content Security Policy, pinned HTMX integrity metadata, no-store caching, and a short Telegram authentication TTL.
+- Search output is treated as untrusted content by the embedded prompt. User-facing provider failures are generic while details stay in service logs.
+- Generated media can spend meaningful credits. Review models, limits, OpenRouter routing/data-retention options, and access lists before enabling a public bot.
+- This backend uses long polling. If adding webhooks, retain per-token authenticated routes and bot-scoped persistence.
+
+## Development
+
+```sh
+cargo fmt --check
+cargo clippy --all-targets --all-features -- -D warnings
+cargo test --all-features
+cargo build --release --locked
+```
+
+All Rust modules carry module-level documentation. Tests cover environment expansion, Rich Message chunking, option/tool composition, local database isolation/encryption, and Mini App authentication.

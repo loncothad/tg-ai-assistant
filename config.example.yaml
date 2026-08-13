@@ -1,0 +1,258 @@
+# Environment expressions use ${NAME} or ${NAME:-default}. The process does not
+# load .env files itself; export variables or use your service manager/Compose.
+server:
+  listen: "${TELEFORGE_LISTEN:-0.0.0.0:8080}"
+  # Public HTTPS origin used by Telegram to open the authenticated Mini App.
+  public_url: "${TELEFORGE_PUBLIC_URL}"
+  request_timeout_seconds: 180
+  max_concurrent_requests_per_bot: 8
+  admin_init_data_ttl_seconds: 900
+  max_input_media_bytes: 20971520
+  json_logs: true
+
+database:
+  # Local filesystem only. Back up this file and never share it between processes.
+  path: "${TELEFORGE_DATABASE_PATH:-data/teleforge.redb}"
+  # Generate once with: openssl rand -base64 32
+  encryption_key: "${TELEFORGE_MASTER_KEY}"
+  history_limit: 30
+
+telegram:
+  # Tokens are assigned to enabled bot entries below in the same order.
+  tokens: "${TELEGRAM_BOT_TOKENS}"
+
+openrouter:
+  # Optional bootstrap value. On first start it is encrypted separately for every
+  # bot; administrators can then replace/remove it in the Mini App.
+  bootstrap_api_key: "${OPENROUTER_API_KEY:-}"
+  base_url: "https://openrouter.ai/api/v1"
+  site_url: "${OPENROUTER_SITE_URL:-https://example.com}"
+  app_name: "Teleforge Telegram Assistant"
+
+  # Current OpenRouter server-tool search (not the deprecated web plugin/:online).
+  web_search:
+    engine: "auto" # auto, native, exa, firecrawl, parallel, or perplexity
+    # Exa: instant/fast/auto/deep-lite/deep/deep-reasoning;
+    # Parallel: turbo/basic/advanced. Omit for the engine default.
+    mode: null
+    max_results: 5
+    max_uses: 5
+    max_total_results: 15
+    search_context_size: "medium" # low, medium, or high
+    max_characters: null
+    # Native-provider location bias; all fields are optional.
+    user_location: null # {type: approximate, city: Istanbul, country: TR, timezone: Europe/Istanbul}
+    allowed_domains: []
+    excluded_domains: []
+    extra: {}
+
+  # Model-callable URL/PDF retrieval. This is independently toggleable per bot.
+  web_fetch:
+    engine: "auto" # auto, native, exa, openrouter, firecrawl, or parallel
+    max_uses: 5
+    max_content_tokens: 50000
+    allowed_domains: []
+    blocked_domains: []
+    extra: {}
+
+  # This curated list is what administrators can select. Copy entries as needed.
+  models:
+    - id: "openrouter/auto"
+      label: "OpenRouter Auto"
+      options:
+        models: []
+        provider:
+          allow_fallbacks: true
+          data_collection: "deny"
+          require_parameters: true
+        plugins: []
+        transforms: []
+        reasoning:
+          effort: "medium"
+        response_format: null
+        modalities: ["text"]
+        temperature: 0.4
+        top_p: 0.95
+        top_k: null
+        max_tokens: 4096
+        frequency_penalty: 0.0
+        presence_penalty: 0.0
+        seed: null
+        stop: null
+        logprobs: false
+        top_logprobs: null
+        user: null
+        # Forward-compatible OpenRouter request fields are merged unchanged.
+        extra:
+          usage:
+            include: true
+    - id: "anthropic/claude-sonnet-4.5"
+      label: "Claude Sonnet"
+      options:
+        provider:
+          allow_fallbacks: true
+          data_collection: "deny"
+
+  understanding:
+    image:
+      default_model: "google/gemini-2.5-flash"
+      models:
+        - id: "google/gemini-2.5-flash"
+          label: "Gemini 2.5 Flash Vision"
+          options:
+            max_tokens: 4096
+    video:
+      default_model: "google/gemini-2.5-flash"
+      models:
+        - id: "google/gemini-2.5-flash"
+          label: "Gemini 2.5 Flash Video"
+          options:
+            max_tokens: 4096
+
+  # Applied first; the selected model's options override these fields.
+  defaults:
+    models: []
+    provider:
+      allow_fallbacks: true
+      require_parameters: true
+      data_collection: "deny"
+      zdr: true
+      # Also supported: order, only, ignore, quantizations, sort,
+      # enforce_distillable_text, preferred_min_throughput,
+      # preferred_max_latency, and max_price. Runtime panel routing is merged last.
+    plugins: []
+    transforms: []
+    reasoning: null
+    reasoning_effort: null
+    response_format: null
+    tools: [] # OpenRouter server tools may be listed here; local tools are appended.
+    tool_choice: null
+    parallel_tool_calls: true
+    cache_control: null
+    image_config: null
+    logit_bias: null
+    max_completion_tokens: null
+    max_tool_calls: 12 # Shared budget across OpenRouter server tools; maximum 30.
+    metadata: null
+    min_p: null
+    repetition_penalty: null
+    route: null
+    service_tier: null
+    stop_server_tools_when: null
+    top_a: null
+    trace: null
+    modalities: ["text"]
+    temperature: null
+    top_p: null
+    top_k: null
+    max_tokens: 4096
+    frequency_penalty: null
+    presence_penalty: null
+    seed: null
+    stop: null
+    logprobs: null
+    top_logprobs: null
+    user: null
+    extra: {}
+
+  image:
+    model: "bytedance-seed/seedream-4.5"
+    models:
+      - id: "bytedance-seed/seedream-4.5"
+        label: "Seedream 4.5"
+        extra: {}
+      - id: "openai/gpt-image-1"
+        label: "GPT Image 1"
+        extra:
+          quality: "high"
+    size: "1024x1024"
+    extra:
+      n: 1
+
+  audio:
+    model: "openai/gpt-4o-mini-tts-2025-12-15"
+    models:
+      - id: "openai/gpt-4o-mini-tts-2025-12-15"
+        label: "GPT-4o Mini TTS"
+        extra: {}
+    voice: "nova"
+    response_format: "mp3"
+    speed: 1.0
+    extra: {}
+
+  transcription:
+    model: "openai/whisper-large-v3"
+    models:
+      - id: "openai/whisper-large-v3"
+        label: "Whisper Large v3"
+        extra: {}
+    language: null
+    temperature: null
+    extra: {}
+
+  video:
+    model: "google/veo-3.1"
+    models:
+      - id: "google/veo-3.1"
+        label: "Veo 3.1"
+        extra: {}
+    duration: 8
+    aspect_ratio: "16:9"
+    resolution: "720p"
+    poll_interval_seconds: 15
+    timeout_seconds: 600
+    generate_audio: false
+    extra: {}
+
+search:
+  default_provider: openrouter
+  max_results: 8
+  brave:
+    bootstrap_api_key: "${BRAVE_SEARCH_API_KEY:-}"
+    base_url: "https://api.search.brave.com/res/v1/web/search"
+    options:
+      safesearch: "moderate"
+  exa:
+    bootstrap_api_key: "${EXA_API_KEY:-}"
+    base_url: "https://api.exa.ai/search"
+    options:
+      type: "auto"
+  serpapi:
+    bootstrap_api_key: "${SERPAPI_API_KEY:-}"
+    base_url: "https://serpapi.com/search.json"
+    options:
+      hl: "en"
+      safe: "active"
+
+# This is an arbitrary-length list, not a fixed pair. Add one block per token in
+# TELEGRAM_BOT_TOKENS, keeping the same order. Disabled entries consume no token.
+# Every bot ID has independent settings, credentials, history, allowlist, and offset.
+bots:
+  - id: "primary"
+    enabled: true
+    default_model: "openrouter/auto"
+    # Immutable administrators; the Web App rejects everyone else server-side.
+    admin_user_ids: [123456789]
+    # Initial mutable answer allowlist. Later admin edits survive restarts.
+    allowed_user_ids: [123456789]
+    allowed_chat_ids: []
+    access:
+      private_messages: true
+      group_chats: true
+      guest_messages: true
+      require_mention_in_groups: true
+      allow_everyone: false
+
+  # Duplicate this block for a second, third, or hundredth independent bot.
+  - id: "team"
+    enabled: true
+    default_model: "anthropic/claude-sonnet-4.5"
+    admin_user_ids: [123456789]
+    allowed_user_ids: []
+    allowed_chat_ids: [-1001234567890]
+    access:
+      private_messages: true
+      group_chats: true
+      guest_messages: false
+      require_mention_in_groups: true
+      allow_everyone: false
