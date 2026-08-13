@@ -45,6 +45,7 @@ impl AdminState {
 pub fn router(state: AdminState) -> Router {
     Router::new()
         .route("/admin/{bot_id}", get(shell))
+        .route("/admin/{bot_id}/", get(shell))
         .route("/admin/{bot_id}/panel", get(panel))
         .route("/admin/{bot_id}/models", get(models))
         .route("/admin/{bot_id}/model-providers", get(model_providers))
@@ -112,14 +113,11 @@ async fn models(
     State(state): State<AdminState>,
     headers: HeaderMap,
 ) -> Response {
-    if let Err(error) = authorize(&state, &bot, &headers) {
-        return auth_error(error);
-    }
-    match state
-        .catalog
-        .get(&state.client, &state.config.openrouter.base_url)
-        .await
-    {
+    let (_, bot) = match authorize(&state, &bot, &headers) {
+        Ok(auth) => auth,
+        Err(error) => return auth_error(error),
+    };
+    match catalog_for(&state, &bot).await {
         Ok(models) => {
             no_store(Json(serde_json::json!({ "models": models.as_ref() })).into_response())
         }
@@ -138,14 +136,11 @@ async fn model_providers(
     headers: HeaderMap,
     Query(query): Query<ModelProvidersQuery>,
 ) -> Response {
-    if let Err(error) = authorize(&state, &bot, &headers) {
-        return auth_error(error);
-    }
-    let catalog = match state
-        .catalog
-        .get(&state.client, &state.config.openrouter.base_url)
-        .await
-    {
+    let (_, bot) = match authorize(&state, &bot, &headers) {
+        Ok(auth) => auth,
+        Err(error) => return auth_error(error),
+    };
+    let catalog = match catalog_for(&state, &bot).await {
         Ok(catalog) => catalog,
         Err(error) => return internal(error),
     };
@@ -159,6 +154,10 @@ async fn model_providers(
     let response = match state
         .client
         .get(endpoint_url)
+        .bearer_auth(match openrouter_key(&state, &bot).await {
+            Ok(key) => key,
+            Err(error) => return internal(error),
+        })
         .timeout(std::time::Duration::from_secs(10))
         .send()
         .await
@@ -218,6 +217,25 @@ fn model_endpoints_url(base_url: &str, model: &str) -> Result<url::Url> {
     Ok(url)
 }
 
+async fn openrouter_key(state: &AdminState, bot: &str) -> Result<String> {
+    state
+        .store
+        .credential(bot, "openrouter")
+        .await?
+        .context("OpenRouter API key is not configured")
+}
+
+async fn catalog_for(
+    state: &AdminState,
+    bot: &str,
+) -> Result<Arc<Vec<crate::catalog::CatalogModel>>> {
+    let key = openrouter_key(state, bot).await?;
+    state
+        .catalog
+        .get(&state.client, &state.config.openrouter.base_url, bot, &key)
+        .await
+}
+
 #[derive(Deserialize)]
 struct ModelForm {
     capability: String,
@@ -231,13 +249,11 @@ async fn set_model(
     headers: HeaderMap,
     Form(form): Form<ModelForm>,
 ) -> Response {
-    let user = match authorize(&state, &bot, &headers) {
-        Ok(v) => v,
+    let (user, bot) = match authorize(&state, &bot, &headers) {
+        Ok(auth) => auth,
         Err(e) => return auth_error(e),
     };
-    let allowed = state
-        .catalog
-        .get(&state.client, &state.config.openrouter.base_url)
+    let allowed = catalog_for(&state, &bot)
         .await
         .map(|models| {
             models
@@ -306,8 +322,8 @@ async fn set_search(
     headers: HeaderMap,
     Form(form): Form<SearchForm>,
 ) -> Response {
-    let user = match authorize(&state, &bot, &headers) {
-        Ok(v) => v,
+    let (user, bot) = match authorize(&state, &bot, &headers) {
+        Ok(auth) => auth,
         Err(e) => return auth_error(e),
     };
     if form
@@ -348,8 +364,8 @@ async fn set_capability(
     headers: HeaderMap,
     Form(form): Form<CapabilityForm>,
 ) -> Response {
-    let actor = match authorize(&state, &bot, &headers) {
-        Ok(value) => value,
+    let (actor, bot) = match authorize(&state, &bot, &headers) {
+        Ok(auth) => auth,
         Err(error) => return auth_error(error),
     };
     if form.enabled {
@@ -413,8 +429,8 @@ async fn set_credential(
     headers: HeaderMap,
     Form(form): Form<CredentialForm>,
 ) -> Response {
-    let actor = match authorize(&state, &bot, &headers) {
-        Ok(value) => value,
+    let (actor, bot) = match authorize(&state, &bot, &headers) {
+        Ok(auth) => auth,
         Err(error) => return auth_error(error),
     };
     let result = if form.action == "remove" {
@@ -452,8 +468,8 @@ async fn set_content(
     headers: HeaderMap,
     mut multipart: Multipart,
 ) -> Response {
-    let actor = match authorize(&state, &bot, &headers) {
-        Ok(value) => value,
+    let (actor, bot) = match authorize(&state, &bot, &headers) {
+        Ok(auth) => auth,
         Err(error) => return auth_error(error),
     };
     let mut kind = String::new();
@@ -583,9 +599,10 @@ async fn export_skills(
     State(state): State<AdminState>,
     headers: HeaderMap,
 ) -> Response {
-    if let Err(e) = authorize(&state, &bot, &headers) {
-        return auth_error(e);
-    }
+    let (_, bot) = match authorize(&state, &bot, &headers) {
+        Ok(auth) => auth,
+        Err(error) => return auth_error(error),
+    };
     let settings = match state.store.settings(&bot).await {
         Ok(v) => v,
         Err(e) => return internal(e),
@@ -621,8 +638,8 @@ async fn set_access(
     headers: HeaderMap,
     Form(form): Form<AccessForm>,
 ) -> Response {
-    let actor = match authorize(&state, &bot, &headers) {
-        Ok(v) => v,
+    let (actor, bot) = match authorize(&state, &bot, &headers) {
+        Ok(auth) => auth,
         Err(e) => return auth_error(e),
     };
     if state
@@ -647,10 +664,11 @@ async fn set_access(
 }
 
 async fn render_authorized(state: &AdminState, bot: &str, headers: &HeaderMap) -> Response {
-    if let Err(e) = authorize(state, bot, headers) {
-        return auth_error(e);
-    }
-    render(state, bot).await
+    let (_, canonical) = match authorize(state, bot, headers) {
+        Ok(auth) => auth,
+        Err(error) => return auth_error(error),
+    };
+    render(state, &canonical).await
 }
 async fn render(state: &AdminState, bot: &str) -> Response {
     let response = match render_html(state, bot).await {
@@ -777,7 +795,7 @@ async fn render_html(state: &AdminState, bot: &str) -> Result<String> {
         )
     };
     Ok(format!(
-        "<nav class=\"jump-nav\"><a href=\"#models\">Models</a><a href=\"#skills\">Skills</a><a href=\"#credentials\">Credentials</a><a href=\"#instructions\">Instructions</a><a href=\"#access\">Access</a></nav>
+        "<nav class=\"jump-nav\"><button type=button data-jump=\"models\">Models</button><button type=button data-jump=\"skills\">Skills</button><button type=button data-jump=\"credentials\">Credentials</button><button type=button data-jump=\"instructions\">Instructions</button><button type=button data-jump=\"access\">Access</button></nav>
         <section id=\"models\"><div class=\"section-head\"><div><h2>Models by capability</h2><p>Every compatible model in OpenRouter's live catalog is searchable.</p></div><span class=\"badge\">Live catalog</span></div><div class=\"grid model-grid\">{model_forms}</div><form hx-post=\"search\" hx-target=\"#panel\" hx-swap=\"innerHTML transition:true\"><label>Web search provider<select name=provider>{}</select></label><button>Save search provider</button></form></section>
         <section id=\"skills\"><div class=\"section-head\"><div><h2>Built-in skills</h2><p>Enable only the callable APIs and instructions this bot should expose.</p></div></div><div class=grid>{caps}</div></section>
         <section id=\"credentials\"><div class=\"section-head\"><div><h2>API credentials</h2><p>Encrypted at rest and never returned to the browser.</p></div></div><div class=grid>{creds}</div></section>
@@ -896,13 +914,14 @@ fn provider_options(selected: &str, configured: &BTreeMap<&str, bool>) -> String
         .collect()
 }
 
-fn authorize(state: &AdminState, bot_id: &str, headers: &HeaderMap) -> Result<u64> {
+fn authorize(state: &AdminState, bot_id: &str, headers: &HeaderMap) -> Result<(u64, String)> {
     let bot = state.config.bot(bot_id).context("Unknown bot")?;
     let raw = headers
         .get("x-telegram-init-data")
         .and_then(|v| v.to_str().ok())
         .context("Missing Telegram authentication")?;
-    authenticate_init_data(bot, state.config.server.admin_init_data_ttl_seconds, raw)
+    let user = authenticate_init_data(bot, state.config.server.admin_init_data_ttl_seconds, raw)?;
+    Ok((user, bot.id.clone()))
 }
 
 fn authenticate_init_data(

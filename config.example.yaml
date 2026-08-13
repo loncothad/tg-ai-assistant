@@ -64,7 +64,7 @@ openrouter:
         models: []
         provider:
           allow_fallbacks: true
-          data_collection: "deny"
+          data_collection: "allow"
           # Keep this false when models are selected from the live catalog.
           # OpenRouter can otherwise reject every endpoint when a model does
           # not implement an optional default such as parallel_tool_calls.
@@ -95,7 +95,7 @@ openrouter:
       options:
         provider:
           allow_fallbacks: true
-          data_collection: "deny"
+          data_collection: "allow"
 
   understanding:
     image:
@@ -121,8 +121,8 @@ openrouter:
       # OpenRouter's default. Set true only when every selected model/provider
       # supports every optional request parameter configured below.
       require_parameters: false
-      data_collection: "deny"
-      zdr: true
+      data_collection: "allow"
+      zdr: false
       # Also supported: order, only, ignore, quantizations, sort,
       # enforce_distillable_text, preferred_min_throughput,
       # preferred_max_latency, and max_price. Runtime panel routing is merged last.

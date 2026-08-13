@@ -1,9 +1,8 @@
 //! Cached OpenRouter model discovery and capability-aware catalog metadata.
 //!
-//! The public OpenRouter catalog is the source of truth for selectable models.
-//! Image and video catalogs are merged into the general catalog so the admin
-//! application can expose modality-specific metadata without maintaining a
-//! hard-coded list in Teleforge.
+//! OpenRouter's authenticated, user-scoped catalog is the source of truth for
+//! selectable models. It reflects each bot API key's preferences, guardrails,
+//! privacy policy, and eligibility without maintaining a hard-coded allowlist.
 
 use crate::Result;
 use eyre::{Context, ContextCompat, bail};
@@ -71,7 +70,7 @@ struct CachedCatalog {
 /// Shared time-bounded cache that avoids blocking each HTMX panel refresh on OpenRouter.
 #[derive(Clone, Default)]
 pub struct ModelCatalogCache {
-    inner: Arc<RwLock<Option<CachedCatalog>>>,
+    inner: Arc<RwLock<BTreeMap<String, CachedCatalog>>>,
 }
 
 impl ModelCatalogCache {
@@ -80,10 +79,12 @@ impl ModelCatalogCache {
         &self,
         client: &reqwest::Client,
         base_url: &str,
+        bot_id: &str,
+        api_key: &str,
     ) -> Result<Arc<Vec<CatalogModel>>> {
         {
             let guard = self.inner.read().await;
-            if let Some(cached) = guard.as_ref()
+            if let Some(cached) = guard.get(bot_id)
                 && cached.loaded.elapsed() < CATALOG_TTL
             {
                 return Ok(cached.models.clone());
@@ -91,25 +92,28 @@ impl ModelCatalogCache {
         }
 
         let mut guard = self.inner.write().await;
-        if let Some(cached) = guard.as_ref()
+        if let Some(cached) = guard.get(bot_id)
             && cached.loaded.elapsed() < CATALOG_TTL
         {
             return Ok(cached.models.clone());
         }
 
-        match fetch_catalog(client, base_url).await {
+        match fetch_catalog(client, base_url, api_key).await {
             Ok(models) => {
                 let models = Arc::new(models);
-                *guard = Some(CachedCatalog {
-                    loaded: Instant::now(),
-                    models: models.clone(),
-                });
+                guard.insert(
+                    bot_id.to_owned(),
+                    CachedCatalog {
+                        loaded: Instant::now(),
+                        models: models.clone(),
+                    },
+                );
                 Ok(models)
             }
             Err(error) => {
                 // A stale catalog is preferable to making model administration
                 // unavailable during a transient OpenRouter outage.
-                if let Some(cached) = guard.as_ref() {
+                if let Some(cached) = guard.get(bot_id) {
                     Ok(cached.models.clone())
                 } else {
                     Err(error)
@@ -119,40 +123,41 @@ impl ModelCatalogCache {
     }
 }
 
-async fn fetch_catalog(client: &reqwest::Client, base_url: &str) -> Result<Vec<CatalogModel>> {
+async fn fetch_catalog(
+    client: &reqwest::Client,
+    base_url: &str,
+    api_key: &str,
+) -> Result<Vec<CatalogModel>> {
     let base = base_url.trim_end_matches('/');
-    let general = fetch_data(client, &format!("{base}/models?output_modalities=all")).await?;
-    let images_url = format!("{base}/images/models");
-    let videos_url = format!("{base}/videos/models");
-    let (images, videos) = tokio::join!(
-        fetch_data(client, &images_url),
-        fetch_data(client, &videos_url)
-    );
+    // This authenticated endpoint excludes models unavailable under the API
+    // key's provider preferences, guardrails, privacy policy, and eligibility.
+    let general = fetch_data(client, &format!("{base}/models/user?sort=newest"), api_key).await?;
 
     let mut models = BTreeMap::<String, CatalogModel>::new();
     merge_values(&mut models, general);
-    if let Ok(values) = images {
-        merge_values(&mut models, values);
-    }
-    if let Ok(values) = videos {
-        merge_values(&mut models, values);
-    }
     if models.is_empty() {
         bail!("OpenRouter returned an empty model catalog");
     }
     let mut models = models.into_values().collect::<Vec<_>>();
     models.sort_by(|left, right| {
-        left.name
-            .to_ascii_lowercase()
-            .cmp(&right.name.to_ascii_lowercase())
-            .then_with(|| left.id.cmp(&right.id))
+        right
+            .created
+            .unwrap_or_default()
+            .cmp(&left.created.unwrap_or_default())
+            .then_with(|| {
+                left.name
+                    .to_ascii_lowercase()
+                    .cmp(&right.name.to_ascii_lowercase())
+                    .then_with(|| left.id.cmp(&right.id))
+            })
     });
     Ok(models)
 }
 
-async fn fetch_data(client: &reqwest::Client, url: &str) -> Result<Vec<Value>> {
+async fn fetch_data(client: &reqwest::Client, url: &str, api_key: &str) -> Result<Vec<Value>> {
     let response = client
         .get(url)
+        .bearer_auth(api_key)
         .timeout(Duration::from_secs(15))
         .send()
         .await
@@ -189,6 +194,9 @@ fn merge_values(models: &mut BTreeMap<String, CatalogModel>, values: Vec<Value>)
 
 fn parse_model(value: &Value) -> Option<CatalogModel> {
     let object = value.as_object()?;
+    if requires_additional_identification(object) {
+        return None;
+    }
     let id = string(object, "id")?;
     let architecture = object.get("architecture").and_then(Value::as_object);
     let top_provider = object.get("top_provider").and_then(Value::as_object);
@@ -215,6 +223,26 @@ fn parse_model(value: &Value) -> Option<CatalogModel> {
         generates_audio: object.get("generate_audio").and_then(Value::as_bool),
         id,
     })
+}
+
+fn requires_additional_identification(object: &Map<String, Value>) -> bool {
+    let non_empty_array = |key: &str| {
+        object
+            .get(key)
+            .and_then(Value::as_array)
+            .is_some_and(|items| !items.is_empty())
+    };
+    let true_value = |key: &str| object.get(key).and_then(Value::as_bool) == Some(true);
+    non_empty_array("required_attestation_types")
+        || true_value("requires_user_ids")
+        || true_value("requiresUserIDs")
+        || object
+            .get("data_policy")
+            .and_then(Value::as_object)
+            .is_some_and(|policy| {
+                policy.get("requires_user_ids").and_then(Value::as_bool) == Some(true)
+                    || policy.get("requiresUserIDs").and_then(Value::as_bool) == Some(true)
+            })
 }
 
 fn merge_model(current: &mut CatalogModel, incoming: CatalogModel) {
@@ -370,5 +398,15 @@ mod tests {
         assert_eq!(parsed.max_completion_tokens, Some(8192));
         assert_eq!(parsed.pricing["prompt"], "0.000001");
         assert!(parsed.supports("image_understanding"));
+    }
+
+    #[test]
+    fn excludes_models_requiring_additional_identification() {
+        let value = serde_json::json!({
+            "id": "vendor/restricted",
+            "name": "Restricted",
+            "required_attestation_types": ["organization"]
+        });
+        assert!(parse_model(&value).is_none());
     }
 }

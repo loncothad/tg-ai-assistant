@@ -42,8 +42,8 @@ h3 { font-size: 15px; margin-bottom: 3px; }
   background: color-mix(in srgb, var(--surface) 90%, transparent); backdrop-filter: blur(14px); box-shadow: var(--shadow);
   scrollbar-width: none;
 }
-.jump-nav a { color: var(--muted); text-decoration: none; white-space: nowrap; padding: 7px 11px; border-radius: 9px; font-size: 13px; }
-.jump-nav a:hover { color: var(--blue); background: var(--soft); }
+.jump-nav button { appearance: none; border: 0; background: transparent; color: var(--muted); white-space: nowrap; padding: 7px 11px; border-radius: 9px; font-size: 13px; }
+.jump-nav button:hover { color: var(--blue); background: var(--soft); }
 section {
   scroll-margin-top: 78px; border: 1px solid var(--line); border-radius: 18px;
   padding: 18px; margin: 14px 0; background: color-mix(in srgb, var(--surface) 96%, transparent); box-shadow: var(--shadow);

@@ -192,7 +192,7 @@ const renderResults = () => {
     .filter(model => supports(model, capability))
     .map(model => ({ model, score: fuzzyScore(model, query) }))
     .filter(item => item.score > 0)
-    .sort((a, b) => b.score - a.score || a.model.name.localeCompare(b.model.name));
+    .sort((a, b) => b.score - a.score || (b.model.created || 0) - (a.model.created || 0) || a.model.name.localeCompare(b.model.name));
   count.textContent = `${filtered.length.toLocaleString()} matching models · showing ${Math.min(60, filtered.length)}`;
   results.replaceChildren();
   filtered.slice(0, 60).forEach(({ model }) => {
@@ -288,11 +288,14 @@ const saveModel = async event => {
 document.addEventListener('click', event => {
   const picker = event.target.closest('.model-picker');
   if (picker) openPicker(picker);
+  const jump = event.target.closest('[data-jump]');
+  if (jump) document.getElementById(jump.dataset.jump)?.scrollIntoView({ behavior: 'smooth', block: 'start' });
 });
 document.getElementById('model-close').addEventListener('click', () => dialog.close());
 dialog.addEventListener('click', event => { if (event.target === dialog) dialog.close(); });
 search.addEventListener('input', renderResults);
 document.addEventListener('htmx:afterSwap', enrichCards);
 
-window.htmx.ajax('GET', `${location.pathname}/panel`, { target: '#panel', swap: 'innerHTML transition:true' });
+const adminPath = location.pathname.replace(/\/+$/, '');
+window.htmx.ajax('GET', `${adminPath}/panel`, { target: '#panel', swap: 'innerHTML transition:true' });
 loadCatalog().catch(() => {});

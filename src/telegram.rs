@@ -810,7 +810,7 @@ impl BotRunner {
         let url = format!(
             "{}/admin/{}",
             self.config.server.public_url.trim_end_matches('/'),
-            self.bot.id
+            self.bot_user_id
         );
         let app = WebAppInfo::builder().url(url).build();
         let button = InlineKeyboardButton::builder()

@@ -3,7 +3,12 @@
 //! Runtime-editable values live in redb; this module contains deployment settings,
 //! curated models, bootstrap secrets, and immutable Telegram administrator IDs.
 
-use std::{collections::HashSet, fs, path::Path, time::Duration};
+use std::{
+    collections::{HashMap, HashSet},
+    fs,
+    path::Path,
+    time::Duration,
+};
 
 use eyre::{Context, bail};
 use serde::{Deserialize, Serialize};
@@ -415,6 +420,14 @@ pub struct BotConfig {
     pub access: AccessConfig,
 }
 
+impl BotConfig {
+    /// Returns the numeric Telegram bot ID encoded before the colon in a Bot
+    /// API token. The secret portion of the token is never exposed.
+    pub fn telegram_bot_id(&self) -> Option<u64> {
+        self.token.split_once(':')?.0.parse().ok()
+    }
+}
+
 #[derive(Clone, Debug, Deserialize, Serialize)]
 #[serde(deny_unknown_fields)]
 pub struct AccessConfig {
@@ -608,6 +621,7 @@ impl Config {
             }
         }
         let mut bot_ids = HashSet::new();
+        let mut admin_references = HashMap::<String, String>::new();
         let mut tokens = HashSet::new();
         for bot in &self.bots {
             if bot.id.is_empty()
@@ -621,6 +635,20 @@ impl Config {
             }
             if !bot_ids.insert(bot.id.as_str()) {
                 bail!("Duplicate bot ID: {}", bot.id);
+            }
+            if bot.enabled {
+                let telegram_id = bot.telegram_bot_id().ok_or_else(|| {
+                    eyre::eyre!("Bot {} has an invalid Telegram token prefix", bot.id)
+                })?;
+                for reference in [bot.id.clone(), telegram_id.to_string()] {
+                    if admin_references
+                        .get(&reference)
+                        .is_some_and(|owner| owner != &bot.id)
+                    {
+                        bail!("Bot IDs and numeric Telegram bot IDs must be unambiguous");
+                    }
+                    admin_references.insert(reference, bot.id.clone());
+                }
             }
             if bot.enabled && !tokens.insert(bot.token.as_str()) {
                 bail!("The same Telegram token is configured more than once");
@@ -669,8 +697,16 @@ impl Config {
             options: OpenRouterOptions::default(),
         })
     }
-    pub fn bot(&self, id: &str) -> Option<&BotConfig> {
-        self.bots.iter().find(|bot| bot.enabled && bot.id == id)
+    /// Resolves either the deployment's internal bot key or Telegram's numeric
+    /// bot ID to the corresponding enabled bot configuration.
+    pub fn bot(&self, reference: &str) -> Option<&BotConfig> {
+        self.bots.iter().find(|bot| {
+            bot.enabled
+                && (bot.id == reference
+                    || bot
+                        .telegram_bot_id()
+                        .is_some_and(|id| id.to_string() == reference))
+        })
     }
     pub fn timeout(&self) -> Duration {
         Duration::from_secs(self.server.request_timeout_seconds)
