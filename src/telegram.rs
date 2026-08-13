@@ -68,6 +68,12 @@ enum MessageMode {
     Guest,
 }
 
+#[derive(Clone, Copy, Default)]
+struct CommandOptions<'a> {
+    model_override: Option<&'a MessageModelOverride>,
+    guest_pending_id: Option<&'a str>,
+}
+
 impl BotRunner {
     pub async fn new(
         bot: BotConfig,
@@ -266,7 +272,14 @@ impl BotRunner {
             && let Some((command, arguments)) = parse_command(&text)
         {
             if let Err(error) = self
-                .command(&message, mode, user_id, &command, arguments, None)
+                .command(
+                    &message,
+                    mode,
+                    user_id,
+                    &command,
+                    arguments,
+                    CommandOptions::default(),
+                )
                 .await
             {
                 error!(bot_id = %self.bot.id, user_id, error = %format!("{error:#}"), "command failed");
@@ -287,6 +300,33 @@ impl BotRunner {
             )
             .await;
         }
+        let guest_pending_id = if mode == MessageMode::Guest {
+            Some(
+                self.answer_guest_pending(&message, "Reading the request")
+                    .await?,
+            )
+        } else {
+            None
+        };
+        let (sender, receiver) = mpsc::unbounded_channel();
+        let runner = self.clone();
+        let progress_task = if let Some(inline_id) = guest_pending_id.clone() {
+            tokio::spawn(async move {
+                runner.update_guest_progress(inline_id, receiver).await;
+            })
+        } else {
+            let progress_message_id = self
+                .send_progress_message(&message, "Reading the request")
+                .await?;
+            let chat_id = message.chat.id;
+            tokio::spawn(async move {
+                runner
+                    .update_progress_message(chat_id, progress_message_id, receiver)
+                    .await;
+            })
+        };
+        let _ = sender.send(ProgressUpdate::step("Read request"));
+        let _ = sender.send(ProgressUpdate::step("Classifying request"));
         let settings = self.store.settings(&self.bot.id).await?;
         let mut capabilities = settings.capabilities.clone();
         let attachment_flags = attachment_flags(&message);
@@ -315,6 +355,11 @@ impl BotRunner {
         } else {
             None
         };
+        let _ = sender.send(ProgressUpdate::step(if plan.is_some() {
+            "Classified request"
+        } else {
+            "Applied standard routing"
+        }));
         let override_generation = if let Some(override_) = model_override.as_ref() {
             match self.media_only_override_action(override_).await {
                 Ok(action) => action,
@@ -335,6 +380,8 @@ impl BotRunner {
             _ => None,
         };
         if let Some(command) = generation_command {
+            drop(sender);
+            let _ = progress_task.await;
             if let Err(error) = self
                 .command(
                     &message,
@@ -342,20 +389,34 @@ impl BotRunner {
                     user_id,
                     command,
                     &text,
-                    model_override.as_ref(),
+                    CommandOptions {
+                        model_override: model_override.as_ref(),
+                        guest_pending_id: guest_pending_id.as_deref(),
+                    },
                 )
                 .await
             {
                 error!(bot_id = %self.bot.id, user_id, error = %format!("{error:#}"), "planned generation command failed");
-                self.respond(&message, mode, rich::compact_error(), None)
-                    .await?;
+                if let Some(inline_id) = guest_pending_id.as_deref() {
+                    self.edit_guest_error(inline_id).await;
+                } else {
+                    self.respond(&message, mode, rich::compact_error(), None)
+                        .await?;
+                }
             }
             return Ok(());
         }
         if let Some(plan) = plan.as_ref() {
             if plan.action == PlannedAction::Refuse {
-                self.respond(&message, mode, &plan.refusal_message, None)
-                    .await?;
+                drop(sender);
+                let _ = progress_task.await;
+                if let Some(inline_id) = guest_pending_id.as_deref() {
+                    self.edit_guest_text(inline_id, &plan.refusal_message)
+                        .await?;
+                } else {
+                    self.respond(&message, mode, &plan.refusal_message, None)
+                        .await?;
+                }
                 return Ok(());
             }
         }
@@ -478,37 +539,6 @@ impl BotRunner {
             .append_message(&self.bot.id, &scope, "user", &contextual_text)
             .await?;
         let session_id = format!("{}:{scope}", self.bot.id);
-        let guest_pending_id = if mode == MessageMode::Guest {
-            Some(
-                self.answer_guest_pending(&message, "Processing the request")
-                    .await?,
-            )
-        } else {
-            None
-        };
-        let (sender, receiver) = mpsc::unbounded_channel();
-        let runner = self.clone();
-        let progress_task = if let Some(inline_id) = guest_pending_id.clone() {
-            tokio::spawn(async move {
-                runner.update_guest_progress(inline_id, receiver).await;
-            })
-        } else {
-            let progress_message_id = self
-                .send_progress_message(&message, "Reading the request")
-                .await?;
-            let chat_id = message.chat.id;
-            tokio::spawn(async move {
-                runner
-                    .update_progress_message(chat_id, progress_message_id, receiver)
-                    .await;
-            })
-        };
-        let _ = sender.send(ProgressUpdate::step("Read request"));
-        let _ = sender.send(ProgressUpdate::step(if plan.is_some() {
-            "Classified request"
-        } else {
-            "Applied standard routing"
-        }));
         let _ = sender.send(ProgressUpdate::step("Prepared conversation context"));
         let _ = sender.send(ProgressUpdate::step(format!(
             "Selected model: {}",
@@ -739,8 +769,12 @@ impl BotRunner {
         user_id: u64,
         command: &str,
         arguments: &str,
-        model_override: Option<&MessageModelOverride>,
+        options: CommandOptions<'_>,
     ) -> Result<()> {
+        let CommandOptions {
+            model_override,
+            guest_pending_id,
+        } = options;
         match command {
             "start" | "help" => self.respond(message, mode, HELP, None).await?,
             "new" => {
@@ -857,9 +891,13 @@ impl BotRunner {
                     },
                 );
                 if mode == MessageMode::Guest {
-                    let inline_id = self
-                        .answer_guest_pending(message, "Generating the requested image")
-                        .await?;
+                    let inline_id = match guest_pending_id {
+                        Some(id) => id.to_owned(),
+                        None => {
+                            self.answer_guest_pending(message, "Generating the requested image")
+                                .await?
+                        }
+                    };
                     let (progress, progress_task) =
                         self.begin_guest_progress(&inline_id, "Parsed image-generation request");
                     let result = async {
@@ -987,9 +1025,13 @@ impl BotRunner {
                     },
                 );
                 if mode == MessageMode::Guest {
-                    let inline_id = self
-                        .answer_guest_pending(message, "Generating the requested audio")
-                        .await?;
+                    let inline_id = match guest_pending_id {
+                        Some(id) => id.to_owned(),
+                        None => {
+                            self.answer_guest_pending(message, "Generating the requested audio")
+                                .await?
+                        }
+                    };
                     let (progress, progress_task) =
                         self.begin_guest_progress(&inline_id, "Parsed audio-generation request");
                     let result = async {
@@ -1148,9 +1190,13 @@ impl BotRunner {
                     },
                 );
                 if mode == MessageMode::Guest {
-                    let inline_id = self
-                        .answer_guest_pending(message, "Generating the requested video")
-                        .await?;
+                    let inline_id = match guest_pending_id {
+                        Some(id) => id.to_owned(),
+                        None => {
+                            self.answer_guest_pending(message, "Generating the requested video")
+                                .await?
+                        }
+                    };
                     let (progress, progress_task) =
                         self.begin_guest_progress(&inline_id, "Parsed video-generation request");
                     let result = async {

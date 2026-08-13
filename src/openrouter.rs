@@ -875,7 +875,6 @@ impl OpenRouter {
         api_key: &str,
     ) -> Result<GeneratedImage> {
         let mut body = self.config.audio.extra.clone();
-        body.insert("voice".into(), json!(self.config.audio.voice));
         body.insert(
             "response_format".into(),
             json!(self.config.audio.response_format),
@@ -890,6 +889,17 @@ impl OpenRouter {
         {
             body.extend(choice.extra.clone());
         }
+        let configured_voice = body
+            .get("voice")
+            .and_then(Value::as_str)
+            .unwrap_or(&self.config.audio.voice);
+        let voice = if routing.model_provider == ModelProvider::Openrouter {
+            self.resolve_speech_voice(model, configured_voice, api_key)
+                .await
+        } else {
+            configured_voice.to_owned()
+        };
+        body.insert("voice".into(), json!(voice));
         let routed_model = if routing.model_provider == ModelProvider::Openrouter {
             apply_routing(&mut body, model, routing, false)
         } else {
@@ -924,7 +934,8 @@ impl OpenRouter {
             .context("Failed to read OpenRouter speech response")?;
         if !status.is_success() {
             bail!(
-                "OpenRouter returned {status}: {}",
+                "OpenRouter speech request failed for model {model}, voice {voice}, format {}: {status}: {}",
+                self.config.audio.response_format,
                 String::from_utf8_lossy(&bytes[..bytes.len().min(2000)])
             );
         }
@@ -934,6 +945,51 @@ impl OpenRouter {
             model: model.to_owned(),
             prompt: input.to_owned(),
         })
+    }
+
+    async fn resolve_speech_voice(
+        &self,
+        model: &str,
+        configured_voice: &str,
+        api_key: &str,
+    ) -> String {
+        let request = self.request(
+            self.client
+                .get(format!(
+                    "{}/models",
+                    self.config.base_url.trim_end_matches('/')
+                ))
+                .query(&[("output_modalities", "speech")]),
+            api_key,
+        );
+        let Ok(response) = request.send().await else {
+            return configured_voice.to_owned();
+        };
+        let Ok(response) = response.error_for_status() else {
+            return configured_voice.to_owned();
+        };
+        let Ok(value) = response.json::<Value>().await else {
+            return configured_voice.to_owned();
+        };
+        let voices = value
+            .get("data")
+            .and_then(Value::as_array)
+            .and_then(|models| {
+                models
+                    .iter()
+                    .find(|candidate| candidate.get("id").and_then(Value::as_str) == Some(model))
+            })
+            .and_then(|model| model.get("supported_voices"))
+            .and_then(Value::as_array)
+            .map(|voices| {
+                voices
+                    .iter()
+                    .filter_map(Value::as_str)
+                    .filter(|voice| !voice.trim().is_empty())
+                    .collect::<Vec<_>>()
+            })
+            .unwrap_or_default();
+        select_speech_voice(configured_voice, &voices)
     }
 
     pub async fn transcribe_audio(
@@ -1157,6 +1213,14 @@ impl OpenRouter {
             ModelProvider::Openrouter => self.config.base_url.trim_end_matches('/'),
             ModelProvider::Aihub => self.aihub.base_url.trim_end_matches('/'),
         }
+    }
+}
+
+fn select_speech_voice(configured: &str, supported: &[&str]) -> String {
+    if supported.is_empty() || supported.contains(&configured) {
+        configured.to_owned()
+    } else {
+        supported[0].to_owned()
     }
 }
 
@@ -1973,6 +2037,16 @@ mod tests {
             plan.action,
             &Capabilities::default()
         ));
+    }
+
+    #[test]
+    fn speech_voice_prefers_configured_when_supported_and_falls_back_safely() {
+        assert_eq!(select_speech_voice("nova", &["alloy", "nova"]), "nova");
+        assert_eq!(
+            select_speech_voice("nova", &["flux-alexis-en", "flux-bree-en"]),
+            "flux-alexis-en"
+        );
+        assert_eq!(select_speech_voice("custom", &[]), "custom");
     }
 
     #[test]
