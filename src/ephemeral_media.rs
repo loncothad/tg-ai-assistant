@@ -15,8 +15,7 @@ use axum::{
     extract::Path,
     http::{HeaderMap, HeaderValue, Method, Response, StatusCode, header},
 };
-use base64::{Engine, engine::general_purpose::URL_SAFE_NO_PAD};
-use rand::RngExt;
+use uuid::Uuid;
 
 use crate::Result;
 use eyre::bail;
@@ -62,13 +61,18 @@ fn publish_inner(bytes: Vec<u8>, content_type: String, filename: Option<String>)
     if bytes.is_empty() || bytes.len() > MAX_ITEM_BYTES {
         bail!("Generated guest media must be between 1 byte and 50 MiB");
     }
-    let mut random = [0_u8; 32];
-    rand::rng().fill(&mut random);
-    let token = format!(
-        "{}.{}",
-        URL_SAFE_NO_PAD.encode(random),
-        extension_for_content_type(&content_type)
-    );
+    let extension = filename
+        .as_deref()
+        .and_then(|name| name.rsplit_once('.').map(|(_, extension)| extension))
+        .filter(|extension| {
+            !extension.is_empty()
+                && extension.len() <= 12
+                && extension
+                    .chars()
+                    .all(|character| character.is_ascii_alphanumeric())
+        })
+        .unwrap_or_else(|| extension_for_content_type(&content_type));
+    let token = format!("{}.{extension}", Uuid::now_v7());
     let mut media = MEDIA.write().expect("ephemeral media lock poisoned");
     media.retain(|_, item| item.expires > Instant::now());
     while media.values().map(|item| item.bytes.len()).sum::<usize>() + bytes.len() > MAX_TOTAL_BYTES
@@ -207,9 +211,17 @@ mod tests {
     fn hosted_tokens_have_media_extensions_and_ranges_are_bounded() {
         let token = publish(vec![1, 2, 3], "image/png").unwrap();
         assert!(token.ends_with(".png"));
+        let id = token.strip_suffix(".png").unwrap().parse::<Uuid>().unwrap();
+        assert_eq!(id.get_version_num(), 7);
         assert_eq!(parse_range("bytes=0-0", 3), Some((0, 1)));
         assert_eq!(parse_range("bytes=1-", 3), Some((1, 3)));
         assert_eq!(parse_range("bytes=3-4", 3), None);
         assert_eq!(parse_range("bytes=0-1,2-2", 3), None);
+    }
+
+    #[test]
+    fn named_documents_preserve_their_safe_extension() {
+        let token = publish_named(vec![1, 2, 3], "text/html", "index.html").unwrap();
+        assert!(token.ends_with(".html"));
     }
 }

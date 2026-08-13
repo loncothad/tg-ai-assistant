@@ -2,7 +2,11 @@
 
 use std::{net::SocketAddr, path::PathBuf, sync::Arc, time::Duration};
 
-use axum::{Json, Router, routing::get};
+use axum::{
+    Json, Router,
+    http::{HeaderValue, Request},
+    routing::get,
+};
 use clap::Parser;
 use eyre::{Context, bail};
 use serde_json::json;
@@ -20,11 +24,12 @@ use tokio::{
 };
 use tower_http::{
     catch_panic::CatchPanicLayer,
-    request_id::{MakeRequestUuid, PropagateRequestIdLayer, SetRequestIdLayer},
+    request_id::{MakeRequestId, PropagateRequestIdLayer, RequestId, SetRequestIdLayer},
     trace::TraceLayer,
 };
 use tracing::{error, info};
 use tracing_subscriber::EnvFilter;
+use uuid::Uuid;
 
 #[global_allocator]
 static ALLOC: tikv_jemallocator::Jemalloc = tikv_jemallocator::Jemalloc;
@@ -37,6 +42,17 @@ struct Args {
     /// Probe the local readiness endpoint and exit without starting workers.
     #[arg(long)]
     healthcheck: bool,
+}
+
+#[derive(Clone, Copy)]
+struct MakeRequestUuidV7;
+
+impl MakeRequestId for MakeRequestUuidV7 {
+    fn make_request_id<B>(&mut self, _request: &Request<B>) -> Option<RequestId> {
+        HeaderValue::from_str(&Uuid::now_v7().to_string())
+            .ok()
+            .map(RequestId::new)
+    }
 }
 
 #[tokio::main]
@@ -126,7 +142,7 @@ async fn spawn_health_server(
         .route("/generated/{token}", get(ephemeral_media::serve))
         .merge(admin::router(admin_state))
         .layer(PropagateRequestIdLayer::x_request_id())
-        .layer(SetRequestIdLayer::x_request_id(MakeRequestUuid))
+        .layer(SetRequestIdLayer::x_request_id(MakeRequestUuidV7))
         .layer(TraceLayer::new_for_http())
         .layer(CatchPanicLayer::new());
     let listener = tokio::net::TcpListener::bind(address)

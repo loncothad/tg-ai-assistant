@@ -33,6 +33,7 @@ use tokio::{
     time::sleep,
 };
 use tracing::{error, info, warn};
+use uuid::Uuid;
 
 use crate::{
     Result,
@@ -1593,7 +1594,7 @@ impl BotRunner {
                 .rich_message(rich_message)
                 .build();
             let article = InlineQueryResultArticle::builder()
-                .id("answer")
+                .id(Uuid::now_v7().to_string())
                 .title("AI assistant answer")
                 .input_message_content(InputMessageContent::Rich(input))
                 .build();
@@ -1716,7 +1717,7 @@ impl BotRunner {
             .rich_message(rich_message)
             .build();
         let article = InlineQueryResultArticle::builder()
-            .id("generation")
+            .id(Uuid::now_v7().to_string())
             .title(status)
             .input_message_content(InputMessageContent::Rich(input))
             .build();
@@ -1752,14 +1753,23 @@ impl BotRunner {
         if let Err(error) = self.telegram.edit_message_media(&params).await {
             warn!(bot_id = %self.bot.id, %error, "photo delivery failed; retrying generated image as a document");
             let media = InputMediaDocument::builder()
-                .media(FileUpload::from(url))
+                .media(FileUpload::from(url.clone()))
                 .caption(generation_caption(model, prompt))
                 .build();
             let params = EditMessageMediaParams::builder()
                 .inline_message_id(inline_message_id)
                 .media(InputMedia::Document(media))
                 .build();
-            self.telegram.edit_message_media(&params).await?;
+            if let Err(document_error) = self.telegram.edit_message_media(&params).await {
+                warn!(bot_id = %self.bot.id, %document_error, "generated image URL was rejected; falling back to a download link");
+                self.edit_guest_download_link(
+                    inline_message_id,
+                    "Generated image",
+                    &url,
+                    Some(&generation_caption(model, prompt)),
+                )
+                .await?;
+            }
         }
         Ok(())
     }
@@ -1774,14 +1784,23 @@ impl BotRunner {
     ) -> Result<()> {
         let url = self.host_guest_media(bytes, media_type, None).await?;
         let media = InputMediaAudio::builder()
-            .media(FileUpload::from(url))
+            .media(FileUpload::from(url.clone()))
             .caption(generation_caption(model, prompt))
             .build();
         let params = EditMessageMediaParams::builder()
             .inline_message_id(inline_message_id)
             .media(InputMedia::Audio(media))
             .build();
-        self.telegram.edit_message_media(&params).await?;
+        if let Err(error) = self.telegram.edit_message_media(&params).await {
+            warn!(bot_id = %self.bot.id, %error, "generated audio URL was rejected; falling back to a download link");
+            self.edit_guest_download_link(
+                inline_message_id,
+                "Generated audio",
+                &url,
+                Some(&generation_caption(model, prompt)),
+            )
+            .await?;
+        }
         Ok(())
     }
 
@@ -1806,14 +1825,23 @@ impl BotRunner {
         if let Err(error) = self.telegram.edit_message_media(&params).await {
             warn!(bot_id = %self.bot.id, %error, "video delivery failed; retrying generated video as a document");
             let media = InputMediaDocument::builder()
-                .media(FileUpload::from(url))
+                .media(FileUpload::from(url.clone()))
                 .caption(generation_caption(model, prompt))
                 .build();
             let params = EditMessageMediaParams::builder()
                 .inline_message_id(inline_message_id)
                 .media(InputMedia::Document(media))
                 .build();
-            self.telegram.edit_message_media(&params).await?;
+            if let Err(document_error) = self.telegram.edit_message_media(&params).await {
+                warn!(bot_id = %self.bot.id, %document_error, "generated video URL was rejected; falling back to a download link");
+                self.edit_guest_download_link(
+                    inline_message_id,
+                    "Generated video",
+                    &url,
+                    Some(&generation_caption(model, prompt)),
+                )
+                .await?;
+            }
         }
         Ok(())
     }
@@ -1824,19 +1852,47 @@ impl BotRunner {
         bytes: Vec<u8>,
         filename: &str,
     ) -> Result<()> {
+        let media_type = document_media_type(filename);
         let url = self
-            .host_guest_media(bytes, "application/octet-stream", Some(filename))
+            .host_guest_media(bytes, media_type, Some(filename))
             .await?;
         let media = InputMediaDocument::builder()
-            .media(FileUpload::from(url))
+            .media(FileUpload::from(url.clone()))
             .caption(format!("Generated file: {filename}"))
             .build();
         let params = EditMessageMediaParams::builder()
             .inline_message_id(inline_message_id)
             .media(InputMedia::Document(media))
             .build();
-        self.telegram.edit_message_media(&params).await?;
+        if let Err(error) = self.telegram.edit_message_media(&params).await {
+            warn!(bot_id = %self.bot.id, %error, filename, "generated document URL was rejected; falling back to a download link");
+            self.edit_guest_download_link(
+                inline_message_id,
+                filename,
+                &url,
+                Some("Telegram could not attach the generated file directly. The temporary link remains available for ten minutes."),
+            )
+            .await?;
+        }
         Ok(())
+    }
+
+    async fn edit_guest_download_link(
+        &self,
+        inline_message_id: &str,
+        label: &str,
+        url: &str,
+        detail: Option<&str>,
+    ) -> Result<()> {
+        let mut markdown = format!(
+            "# Result ready\n\n[Download {}]({url})",
+            rich::escape_text(label)
+        );
+        if let Some(detail) = detail {
+            markdown.push_str("\n\n");
+            markdown.push_str(detail);
+        }
+        self.edit_guest_text(inline_message_id, &markdown).await
     }
 
     async fn host_guest_media(
@@ -2790,6 +2846,31 @@ fn generation_caption(model: &str, prompt: &str) -> String {
     format!("Model: {model}\nPrompt: {prompt}")
 }
 
+fn document_media_type(filename: &str) -> &'static str {
+    match filename
+        .rsplit_once('.')
+        .map(|(_, extension)| extension.to_ascii_lowercase())
+        .as_deref()
+    {
+        Some("html" | "htm") => "text/html; charset=utf-8",
+        Some("txt" | "log") => "text/plain; charset=utf-8",
+        Some("md" | "markdown") => "text/markdown; charset=utf-8",
+        Some("json") => "application/json",
+        Some("yaml" | "yml") => "application/yaml",
+        Some("xml") => "application/xml",
+        Some("csv") => "text/csv; charset=utf-8",
+        Some("pdf") => "application/pdf",
+        Some("zip") => "application/zip",
+        Some("js" | "mjs" | "cjs") => "text/javascript; charset=utf-8",
+        Some("css") => "text/css; charset=utf-8",
+        Some(
+            "rs" | "py" | "go" | "java" | "kt" | "kts" | "c" | "h" | "cpp" | "hpp" | "cs" | "sh"
+            | "bash" | "zsh" | "fish" | "toml" | "sql",
+        ) => "text/plain; charset=utf-8",
+        _ => "application/octet-stream",
+    }
+}
+
 fn push_progress_step(steps: &mut Vec<ProgressUpdate>, update: ProgressUpdate) {
     if steps.last() == Some(&update) {
         return;
@@ -3253,6 +3334,19 @@ mod tests {
         assert_eq!(
             parse_command("-SEARCH current news"),
             Some(("search".to_owned(), "current news"))
+        );
+    }
+
+    #[test]
+    fn generated_documents_use_specific_safe_media_types() {
+        assert_eq!(
+            document_media_type("index.html"),
+            "text/html; charset=utf-8"
+        );
+        assert_eq!(document_media_type("main.rs"), "text/plain; charset=utf-8");
+        assert_eq!(
+            document_media_type("archive.bin"),
+            "application/octet-stream"
         );
     }
 

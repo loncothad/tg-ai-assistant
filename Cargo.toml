@@ -29,6 +29,7 @@ tower-http = { version = "0.7", features = ["catch-panic", "request-id", "trace"
 tracing = "0.1"
 tracing-subscriber = { version = "0.3", features = ["env-filter", "json"] }
 url = "2.5"
+uuid = { version = "1.24", features = ["v7"] }
 tikv-jemallocator = "0.7"
 
 [profile.release]
