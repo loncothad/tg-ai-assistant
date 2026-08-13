@@ -67,7 +67,6 @@ pub struct GeneratedFile {
 #[derive(Clone, Debug, Deserialize, Serialize, PartialEq, Eq)]
 pub struct RequestPlan {
     pub action: PlannedAction,
-    pub instructions: String,
     pub skills: Vec<PlannedSkill>,
     pub delivery: PlannedDelivery,
     pub filename: String,
@@ -75,27 +74,6 @@ pub struct RequestPlan {
 }
 
 impl RequestPlan {
-    /// Returns bounded guidance for the main assistant model.
-    pub fn guidance(&self) -> String {
-        let skills = self
-            .skills
-            .iter()
-            .map(|skill| skill.as_str())
-            .collect::<Vec<_>>()
-            .join(", ");
-        format!(
-            "Request planner recommendation: use skills [{}]. Delivery: {}{}. Execution instructions: {}. This is routing guidance only; preserve the user's exact intent and use only enabled tools.",
-            skills,
-            self.delivery.as_str(),
-            if self.filename.trim().is_empty() {
-                String::new()
-            } else {
-                format!(" as {}", self.filename.trim())
-            },
-            self.instructions.trim()
-        )
-    }
-
     /// Resolves a direct media action from either the primary action field or
     /// the planner's selected generation skill. This tolerates inexpensive
     /// models that emit a correct skill but leave `action` set to `chat`.
@@ -115,7 +93,11 @@ impl RequestPlan {
                         _ => None,
                     })
                     .collect::<Vec<_>>();
-                (generations.len() == 1).then_some(generations[0])
+                if generations.len() == 1 {
+                    generations.first().copied()
+                } else {
+                    None
+                }
             }
             PlannedAction::Refuse => None,
         }
@@ -130,11 +112,29 @@ pub enum PlannedDelivery {
     File,
 }
 
-impl PlannedDelivery {
-    fn as_str(self) -> &'static str {
-        match self {
-            Self::Inline => "inline Telegram text",
-            Self::File => "Telegram file",
+/// A user-visible milestone recorded in the live Telegram progress message.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub enum ProgressUpdate {
+    /// A short processing milestone.
+    Step(String),
+    /// A media-generation call, including its unmodified effective input.
+    Generation {
+        kind: &'static str,
+        model: String,
+        prompt: String,
+    },
+}
+
+impl ProgressUpdate {
+    pub fn step(value: impl Into<String>) -> Self {
+        Self::Step(value.into())
+    }
+
+    pub fn generation(kind: &'static str, model: &str, prompt: &str) -> Self {
+        Self::Generation {
+            kind,
+            model: model.to_owned(),
+            prompt: prompt.to_owned(),
         }
     }
 }
@@ -186,6 +186,7 @@ pub enum PlannedSkill {
     VideoUnderstanding,
     Transcription,
     FileDelivery,
+    ModelUpgrade,
 }
 
 impl PlannedSkill {
@@ -200,6 +201,7 @@ impl PlannedSkill {
             Self::VideoUnderstanding => "video_understanding",
             Self::Transcription => "transcription",
             Self::FileDelivery => "file_delivery",
+            Self::ModelUpgrade => "model_upgrade",
         }
     }
 }
@@ -241,7 +243,7 @@ pub struct ChatRequest<'a> {
     pub capabilities: &'a Capabilities,
     pub routing: &'a ModelRouting,
     pub tool_models: ToolModels<'a>,
-    pub progress: Option<UnboundedSender<String>>,
+    pub progress: Option<UnboundedSender<ProgressUpdate>>,
 }
 
 #[derive(Clone, Copy)]
@@ -282,13 +284,9 @@ impl OpenRouter {
                     "enum": ["chat", "generate_image", "generate_audio", "generate_video", "refuse"],
                     "description": "Use generate_image, generate_audio, or generate_video whenever the user explicitly asks to create that media artifact, in any language. Use chat otherwise."
                 },
-                "instructions": {
-                    "type": "string",
-                    "description": "A concise imperative execution plan that preserves the user's language and requirements."
-                },
                 "skills": {
                     "type": "array",
-                    "items": {"type":"string", "enum": ["search", "web_fetch", "image_generation", "audio_generation", "video_generation", "image_understanding", "video_understanding", "transcription", "file_delivery"]},
+                    "items": {"type":"string", "enum": ["search", "web_fetch", "image_generation", "audio_generation", "video_generation", "image_understanding", "video_understanding", "transcription", "file_delivery", "model_upgrade"]},
                     "uniqueItems": true
                 },
                 "delivery": {
@@ -305,11 +303,11 @@ impl OpenRouter {
                     "description": "Empty unless action is refuse; then a concise, respectful response in the user's language."
                 }
             },
-            "required": ["action", "instructions", "skills", "delivery", "filename", "refusal_message"],
+            "required": ["action", "skills", "delivery", "filename", "refusal_message"],
             "additionalProperties": false
         });
         let system = format!(
-            "You are a request router for a Telegram AI assistant. Return only the required schema. Enabled skills: {}. Attachments: image={}, video={}, audio={}. An explicit request to draw, generate, create, synthesize, or make new image/audio/video media MUST use the corresponding generate_* action and generation skill, regardless of the user's language. Describing or understanding existing media, transcribing, researching, opening URLs, answering, and transforming text use chat with suitable skills. Decide delivery in this same plan: use file for a requested downloadable artifact, a complete source-code/configuration file, or output expected to be unwieldy in chat; provide a safe filename and include file_delivery when enabled. Use inline for normal prose. Never select a disabled skill. Select refuse only when fulfilling the request itself is disallowed; do not refuse merely because a skill is unavailable. For refusal, write a useful localized explanation and a safe alternative. Do not execute the request.",
+            "You are a request classifier for a Telegram AI assistant. Return only the required schema. Enabled skills: {}. Attachments: image={}, video={}, audio={}. Classify the user's original text; never rewrite, expand, translate, improve, or execute it. An explicit request to draw, generate, create, synthesize, or make new image/audio/video media MUST use the corresponding generate_* action and generation skill, regardless of language. Describing or understanding existing media, transcribing, researching, opening URLs, answering, and transforming text use chat with suitable skills. Select model_upgrade only for a genuinely difficult request whose complexity, ambiguity, reasoning depth, or accuracy requirements materially benefit from the configured advanced model; do not select it for routine requests. Choose file only for a requested downloadable artifact, a complete source-code/configuration file, or output expected to be unwieldy in chat; provide a safe filename and include file_delivery when enabled. Use inline for normal prose. Never select a disabled skill. Select refuse only when fulfilling the request itself is disallowed; do not refuse merely because a skill is unavailable. For refusal, write a concise localized explanation and safe alternative. The original user text is the sole downstream request and is not a field in your output.",
             enabled.join(", "),
             request.has_image,
             request.has_video,
@@ -383,7 +381,6 @@ impl OpenRouter {
                 failures.join("; ")
             )
         })?;
-        plan.instructions.truncate(2_000);
         plan.refusal_message.truncate(2_000);
         plan.skills
             .retain(|skill| enabled.contains(&skill.as_str()));
@@ -562,11 +559,16 @@ impl OpenRouter {
                         }
                     }
                     "generate_image" if capabilities.image => {
-                        report_progress(&progress, "Generating the image");
                         let prompt = arguments
                             .get("prompt")
                             .and_then(Value::as_str)
                             .unwrap_or(user_message);
+                        report_generation_progress(
+                            &progress,
+                            "image",
+                            tool_models.image_generation.model,
+                            prompt,
+                        );
                         match self
                             .generate_image_with_references(
                                 prompt,
@@ -586,11 +588,16 @@ impl OpenRouter {
                         }
                     }
                     "generate_audio" if capabilities.audio => {
-                        report_progress(&progress, "Generating audio");
                         let input = arguments
                             .get("text")
                             .and_then(Value::as_str)
                             .unwrap_or(user_message);
+                        report_generation_progress(
+                            &progress,
+                            "audio",
+                            tool_models.audio_generation.model,
+                            input,
+                        );
                         match self
                             .generate_audio(
                                 input,
@@ -608,11 +615,16 @@ impl OpenRouter {
                         }
                     }
                     "generate_video" if capabilities.video => {
-                        report_progress(&progress, "Generating the video");
                         let prompt = arguments
                             .get("prompt")
                             .and_then(Value::as_str)
                             .unwrap_or(user_message);
+                        report_generation_progress(
+                            &progress,
+                            "video",
+                            tool_models.video_generation.model,
+                            prompt,
+                        );
                         match self
                             .generate_video_with_references(
                                 prompt,
@@ -1340,9 +1352,20 @@ fn add_tools(body: &mut Map<String, Value>, capabilities: &Capabilities, context
     body.entry("tool_choice").or_insert(json!("auto"));
 }
 
-fn report_progress(progress: &Option<UnboundedSender<String>>, status: &str) {
+fn report_progress(progress: &Option<UnboundedSender<ProgressUpdate>>, status: &str) {
     if let Some(progress) = progress {
-        let _ = progress.send(status.to_owned());
+        let _ = progress.send(ProgressUpdate::step(status));
+    }
+}
+
+fn report_generation_progress(
+    progress: &Option<UnboundedSender<ProgressUpdate>>,
+    kind: &'static str,
+    model: &str,
+    prompt: &str,
+) {
+    if let Some(progress) = progress {
+        let _ = progress.send(ProgressUpdate::generation(kind, model, prompt));
     }
 }
 
@@ -1357,6 +1380,7 @@ fn enabled_planner_skills(capabilities: &Capabilities) -> Vec<&'static str> {
         (capabilities.media, "video_understanding"),
         (capabilities.transcription, "transcription"),
         (capabilities.file, "file_delivery"),
+        (capabilities.model_upgrade, "model_upgrade"),
     ]
     .into_iter()
     .filter_map(|(enabled, name)| enabled.then_some(name))
@@ -1644,7 +1668,6 @@ fn parse_planner_response(value: &Value) -> Result<RequestPlan> {
     if let Some(refusal) = extract_refusal(message) {
         return Ok(RequestPlan {
             action: PlannedAction::Refuse,
-            instructions: String::new(),
             skills: Vec::new(),
             delivery: PlannedDelivery::Inline,
             filename: String::new(),
@@ -1867,7 +1890,6 @@ mod tests {
     fn planner_accepts_string_array_object_and_fenced_responses() {
         let document = json!({
             "action":"generate_image",
-            "instructions":"Generate the requested image.",
             "skills":["image_generation"],
             "delivery":"inline",
             "filename":"",
@@ -1914,13 +1936,26 @@ mod tests {
     fn planner_generation_skill_recovers_a_chat_action() {
         let plan = RequestPlan {
             action: PlannedAction::Chat,
-            instructions: "Generate it".to_owned(),
             skills: vec![PlannedSkill::ImageGeneration],
             delivery: PlannedDelivery::Inline,
             filename: String::new(),
             refusal_message: String::new(),
         };
         assert_eq!(plan.direct_generation(), Some(PlannedAction::GenerateImage));
+    }
+
+    #[test]
+    fn planner_generation_recovery_never_indexes_an_empty_or_ambiguous_list() {
+        let mut plan = RequestPlan {
+            action: PlannedAction::Chat,
+            skills: Vec::new(),
+            delivery: PlannedDelivery::Inline,
+            filename: String::new(),
+            refusal_message: String::new(),
+        };
+        assert_eq!(plan.direct_generation(), None);
+        plan.skills = vec![PlannedSkill::ImageGeneration, PlannedSkill::VideoGeneration];
+        assert_eq!(plan.direct_generation(), None);
     }
 
     #[test]

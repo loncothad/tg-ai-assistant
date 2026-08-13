@@ -39,7 +39,8 @@ use crate::{
     config::{BotConfig, Config, ModelProvider, SearchProvider},
     db::{ModelRouting, Store},
     openrouter::{
-        ChatRequest, MediaInput, OpenRouter, PlannedAction, PlanningRequest, ToolModel, ToolModels,
+        ChatRequest, MediaInput, OpenRouter, PlannedAction, PlannedSkill, PlanningRequest,
+        ProgressUpdate, ToolModel, ToolModels,
     },
     rich,
     search::SearchService,
@@ -368,7 +369,7 @@ impl BotRunner {
         } else {
             Vec::new()
         };
-        let (model_capability, selected) = if capabilities.media
+        let (mut model_capability, mut selected) = if capabilities.media
             && media
                 .iter()
                 .any(|item| matches!(item, MediaInput::Video { .. }))
@@ -389,6 +390,16 @@ impl BotRunner {
         } else {
             ("chat", &settings.selected_model)
         };
+        if model_override.is_none()
+            && model_capability == "chat"
+            && capabilities.model_upgrade
+            && plan
+                .as_ref()
+                .is_some_and(|plan| plan.skills.contains(&PlannedSkill::ModelUpgrade))
+        {
+            model_capability = "model_upgrade";
+            selected = &settings.selected_upgrade_model;
+        }
         let default_routing = ModelRouting::default();
         let override_routing = model_override.as_ref().map(|override_| ModelRouting {
             model_provider: override_.model_provider,
@@ -449,11 +460,7 @@ impl BotRunner {
         let author = caller_name(&message);
         let contextual_text = format!("{author}: {text}{}", media_summary(&media));
         let mut instructions = self.store.effective_instructions(&self.bot.id).await?;
-        if let Some(plan) = plan.as_ref() {
-            instructions.push_str("\n\n# Structured request plan\n");
-            instructions.push_str(&plan.guidance());
-        }
-        instructions.push_str(&format!("\n\n# Current request context\nCurrent UTC date and time: {}\nBot: @{} (backend ID {})\nConversation mode: {:?}\nChat: {} (ID {})\nCaller: {} (ID {}, language {})\nTelegram message Unix time: {}\nEnabled capabilities and callable tools for this request: search={}, web_fetch={}, image_generation={}, audio_generation={}, video_generation={}, media_understanding={}, transcription={}, file_delivery={}. If a capability is true, never claim it is disabled; call its tool when the user explicitly requests that operation.", chrono::Utc::now().to_rfc3339(), self.username, self.bot.id, mode, message.chat.title.as_deref().unwrap_or("Private or untitled chat"), message.chat.id, author, user_id, message.guest_bot_caller_user.as_ref().or(message.from.as_ref()).and_then(|u| u.language_code.as_deref()).unwrap_or("unknown"), message.date, capabilities.search, capabilities.web_fetch, capabilities.image, capabilities.audio, capabilities.video, capabilities.media, capabilities.transcription, capabilities.file));
+        instructions.push_str(&format!("\n\n# Current request context\nCurrent UTC date and time: {}\nBot: @{} (backend ID {})\nConversation mode: {:?}\nChat: {} (ID {})\nCaller: {} (ID {}, language {})\nTelegram message Unix time: {}\nEnabled capabilities and callable tools for this request: search={}, web_fetch={}, image_generation={}, audio_generation={}, video_generation={}, media_understanding={}, transcription={}, file_delivery={}, model_upgrade={}. If a capability is true, never claim it is disabled; call its tool when the user explicitly requests that operation. Preserve the user's exact request; do not substitute a planner-written prompt. Format non-trivial responses for Telegram Rich Messages with descriptive headings, bold key terms and labels, and sparing italics for qualifications.", chrono::Utc::now().to_rfc3339(), self.username, self.bot.id, mode, message.chat.title.as_deref().unwrap_or("Private or untitled chat"), message.chat.id, author, user_id, message.guest_bot_caller_user.as_ref().or(message.from.as_ref()).and_then(|u| u.language_code.as_deref()).unwrap_or("unknown"), message.date, capabilities.search, capabilities.web_fetch, capabilities.image, capabilities.audio, capabilities.video, capabilities.media, capabilities.transcription, capabilities.file, capabilities.model_upgrade));
         self.store
             .append_message(&self.bot.id, &scope, "user", &contextual_text)
             .await?;
@@ -483,7 +490,17 @@ impl BotRunner {
                     .await;
             })
         };
-        let _ = sender.send("Preparing conversation context".to_owned());
+        let _ = sender.send(ProgressUpdate::step("Read request"));
+        let _ = sender.send(ProgressUpdate::step(if plan.is_some() {
+            "Classified request"
+        } else {
+            "Applied standard routing"
+        }));
+        let _ = sender.send(ProgressUpdate::step("Prepared conversation context"));
+        let _ = sender.send(ProgressUpdate::step(format!(
+            "Selected model: {}",
+            model.id
+        )));
         let mut result = self
             .openrouter
             .chat(ChatRequest {
@@ -528,11 +545,11 @@ impl BotRunner {
         if let (Ok(answer), Some(plan)) = (&mut result, plan.as_ref()) {
             answer.apply_planned_delivery(plan, capabilities.file);
         }
-        let _ = sender.send(if result.is_ok() {
-            "Request completed".to_owned()
+        let _ = sender.send(ProgressUpdate::step(if result.is_ok() {
+            "Request completed"
         } else {
-            "Request failed".to_owned()
-        });
+            "Request failed"
+        }));
         drop(sender);
         let _ = progress_task.await;
         match result {
@@ -783,10 +800,13 @@ impl BotRunner {
                         .answer_guest_pending(message, "Generating the requested image")
                         .await?;
                     let (progress, progress_task) =
-                        self.begin_guest_progress(&inline_id, "Preparing image generation");
+                        self.begin_guest_progress(&inline_id, "Parsed image-generation request");
                     let result = async {
-                        let _ = progress
-                            .send(format!("Generating the image with {}", generation_model));
+                        let _ = progress.send(ProgressUpdate::generation(
+                            "image",
+                            generation_model,
+                            arguments,
+                        ));
                         let key = self.model_api_key(routing.model_provider).await?;
                         let references = self.collect_media(message, arguments).await?;
                         self.openrouter
@@ -828,7 +848,7 @@ impl BotRunner {
                     return Ok(());
                 }
                 let (progress, progress_task) = self
-                    .begin_chat_progress(message, "Preparing image generation")
+                    .begin_chat_progress(message, "Parsed image-generation request")
                     .await?;
                 self.send_action(
                     message.chat.id,
@@ -836,10 +856,14 @@ impl BotRunner {
                     ChatAction::UploadPhoto,
                 )
                 .await;
-                let _ = progress.send("Reading reference media".to_owned());
+                let _ = progress.send(ProgressUpdate::step("Read reference media"));
                 let references = self.collect_media(message, arguments).await?;
                 let key = self.model_api_key(routing.model_provider).await?;
-                let _ = progress.send(format!("Generating the image with {}", generation_model));
+                let _ = progress.send(ProgressUpdate::generation(
+                    "image",
+                    generation_model,
+                    arguments,
+                ));
                 let result = self
                     .openrouter
                     .generate_image_with_references(
@@ -850,11 +874,11 @@ impl BotRunner {
                         &key,
                     )
                     .await;
-                let _ = progress.send(if result.is_ok() {
-                    "Image generation completed".to_owned()
+                let _ = progress.send(ProgressUpdate::step(if result.is_ok() {
+                    "Image generation completed"
                 } else {
-                    "Image generation failed".to_owned()
-                });
+                    "Image generation failed"
+                }));
                 drop(progress);
                 let _ = progress_task.await;
                 match result {
@@ -906,10 +930,13 @@ impl BotRunner {
                         .answer_guest_pending(message, "Generating the requested audio")
                         .await?;
                     let (progress, progress_task) =
-                        self.begin_guest_progress(&inline_id, "Preparing speech generation");
+                        self.begin_guest_progress(&inline_id, "Parsed audio-generation request");
                     let result = async {
-                        let _ =
-                            progress.send(format!("Generating speech with {}", generation_model));
+                        let _ = progress.send(ProgressUpdate::generation(
+                            "audio",
+                            generation_model,
+                            arguments,
+                        ));
                         let key = self.model_api_key(routing.model_provider).await?;
                         self.openrouter
                             .generate_audio(arguments, generation_model, &routing, &key)
@@ -942,7 +969,7 @@ impl BotRunner {
                     return Ok(());
                 }
                 let (progress, progress_task) = self
-                    .begin_chat_progress(message, "Preparing speech generation")
+                    .begin_chat_progress(message, "Parsed audio-generation request")
                     .await?;
                 self.send_action(
                     message.chat.id,
@@ -951,16 +978,20 @@ impl BotRunner {
                 )
                 .await;
                 let key = self.model_api_key(routing.model_provider).await?;
-                let _ = progress.send(format!("Generating speech with {}", generation_model));
+                let _ = progress.send(ProgressUpdate::generation(
+                    "audio",
+                    generation_model,
+                    arguments,
+                ));
                 let result = self
                     .openrouter
                     .generate_audio(arguments, generation_model, &routing, &key)
                     .await;
-                let _ = progress.send(if result.is_ok() {
-                    "Speech generation completed".to_owned()
+                let _ = progress.send(ProgressUpdate::step(if result.is_ok() {
+                    "Speech generation completed"
                 } else {
-                    "Speech generation failed".to_owned()
-                });
+                    "Speech generation failed"
+                }));
                 drop(progress);
                 let _ = progress_task.await;
                 match result {
@@ -1060,10 +1091,13 @@ impl BotRunner {
                         .answer_guest_pending(message, "Generating the requested video")
                         .await?;
                     let (progress, progress_task) =
-                        self.begin_guest_progress(&inline_id, "Preparing video generation");
+                        self.begin_guest_progress(&inline_id, "Parsed video-generation request");
                     let result = async {
-                        let _ = progress
-                            .send(format!("Generating the video with {}", generation_model));
+                        let _ = progress.send(ProgressUpdate::generation(
+                            "video",
+                            generation_model,
+                            arguments,
+                        ));
                         let key = self.model_api_key(routing.model_provider).await?;
                         let references = self.collect_media(message, arguments).await?;
                         self.openrouter
@@ -1097,7 +1131,7 @@ impl BotRunner {
                     return Ok(());
                 }
                 let (progress, progress_task) = self
-                    .begin_chat_progress(message, "Preparing video generation")
+                    .begin_chat_progress(message, "Parsed video-generation request")
                     .await?;
                 self.send_action(
                     message.chat.id,
@@ -1105,10 +1139,14 @@ impl BotRunner {
                     ChatAction::UploadVideo,
                 )
                 .await;
-                let _ = progress.send("Reading reference media".to_owned());
+                let _ = progress.send(ProgressUpdate::step("Read reference media"));
                 let references = self.collect_media(message, arguments).await?;
                 let key = self.model_api_key(routing.model_provider).await?;
-                let _ = progress.send(format!("Generating the video with {}", generation_model));
+                let _ = progress.send(ProgressUpdate::generation(
+                    "video",
+                    generation_model,
+                    arguments,
+                ));
                 let result = self
                     .openrouter
                     .generate_video_with_references(
@@ -1119,11 +1157,11 @@ impl BotRunner {
                         &key,
                     )
                     .await;
-                let _ = progress.send(if result.is_ok() {
-                    "Video generation completed".to_owned()
+                let _ = progress.send(ProgressUpdate::step(if result.is_ok() {
+                    "Video generation completed"
                 } else {
-                    "Video generation failed".to_owned()
-                });
+                    "Video generation failed"
+                }));
                 drop(progress);
                 let _ = progress_task.await;
                 match result {
@@ -1457,7 +1495,7 @@ impl BotRunner {
     }
 
     async fn send_progress_message(&self, message: &Message, status: &str) -> Result<i32> {
-        let rich_message = progress_rich_message(status, 0);
+        let rich_message = progress_rich_message(&[ProgressUpdate::step(status)]);
         let mut params = SendRichMessageParams::builder()
             .chat_id(message.chat.id)
             .rich_message(rich_message)
@@ -1480,7 +1518,10 @@ impl BotRunner {
         &self,
         message: &Message,
         status: &str,
-    ) -> Result<(mpsc::UnboundedSender<String>, tokio::task::JoinHandle<()>)> {
+    ) -> Result<(
+        mpsc::UnboundedSender<ProgressUpdate>,
+        tokio::task::JoinHandle<()>,
+    )> {
         let message_id = self.send_progress_message(message, status).await?;
         let (sender, receiver) = mpsc::unbounded_channel();
         let runner = self.clone();
@@ -1490,7 +1531,7 @@ impl BotRunner {
                 .update_progress_message(chat_id, message_id, receiver)
                 .await;
         });
-        let _ = sender.send(status.to_owned());
+        let _ = sender.send(ProgressUpdate::step(status));
         Ok((sender, task))
     }
 
@@ -1498,7 +1539,10 @@ impl BotRunner {
         &self,
         inline_message_id: &str,
         status: &str,
-    ) -> (mpsc::UnboundedSender<String>, tokio::task::JoinHandle<()>) {
+    ) -> (
+        mpsc::UnboundedSender<ProgressUpdate>,
+        tokio::task::JoinHandle<()>,
+    ) {
         let (sender, receiver) = mpsc::unbounded_channel();
         let runner = self.clone();
         let inline_message_id = inline_message_id.to_owned();
@@ -1507,7 +1551,7 @@ impl BotRunner {
                 .update_guest_progress(inline_message_id, receiver)
                 .await;
         });
-        let _ = sender.send(status.to_owned());
+        let _ = sender.send(ProgressUpdate::step(status));
         (sender, task)
     }
 
@@ -1515,35 +1559,39 @@ impl BotRunner {
         &self,
         chat_id: i64,
         message_id: i32,
-        mut updates: mpsc::UnboundedReceiver<String>,
+        mut updates: mpsc::UnboundedReceiver<ProgressUpdate>,
     ) {
-        let started = tokio::time::Instant::now();
-        let mut status = "Starting".to_owned();
-        let mut ticker = tokio::time::interval(Duration::from_secs(2));
+        let mut steps = Vec::new();
+        let mut dirty = false;
+        let mut ticker = tokio::time::interval(Duration::from_secs(1));
         ticker.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
         loop {
             tokio::select! {
                 update = updates.recv() => match update {
-                    Some(update) => status = update,
+                    Some(update) => {
+                        push_progress_step(&mut steps, update);
+                        dirty = true;
+                    },
                     None => break,
                 },
-                _ = ticker.tick() => {
+                _ = ticker.tick(), if dirty => {
                     let params = EditMessageTextParams::builder()
                         .chat_id(chat_id)
                         .message_id(message_id)
-                        .rich_message(progress_rich_message(&status, started.elapsed().as_secs()))
+                        .rich_message(progress_rich_message(&steps))
                         .build();
                     if let Err(error) = self.telegram.edit_message_text(&params).await {
                         warn!(bot_id = %self.bot.id, %error, "failed to update progress message");
                         break;
                     }
+                    dirty = false;
                 }
             }
         }
         let params = EditMessageTextParams::builder()
             .chat_id(chat_id)
             .message_id(message_id)
-            .rich_message(progress_rich_message(&status, started.elapsed().as_secs()))
+            .rich_message(progress_rich_message(&steps))
             .build();
         if let Err(error) = self.telegram.edit_message_text(&params).await {
             warn!(bot_id = %self.bot.id, %error, "failed to complete progress message");
@@ -1553,28 +1601,41 @@ impl BotRunner {
     async fn update_guest_progress(
         &self,
         inline_message_id: String,
-        mut updates: mpsc::UnboundedReceiver<String>,
+        mut updates: mpsc::UnboundedReceiver<ProgressUpdate>,
     ) {
-        let started = tokio::time::Instant::now();
-        let mut status = "Starting".to_owned();
-        let mut ticker = tokio::time::interval(Duration::from_secs(2));
+        let mut steps = Vec::new();
+        let mut dirty = false;
+        let mut ticker = tokio::time::interval(Duration::from_secs(1));
         ticker.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
         loop {
             tokio::select! {
                 update = updates.recv() => match update {
-                    Some(update) => status = update,
+                    Some(update) => {
+                        push_progress_step(&mut steps, update);
+                        dirty = true;
+                    },
                     None => break,
                 },
-                _ = ticker.tick() => {
+                _ = ticker.tick(), if dirty => {
                     let params = EditMessageTextParams::builder()
                         .inline_message_id(inline_message_id.clone())
-                        .rich_message(progress_rich_message(&status, started.elapsed().as_secs()))
+                        .rich_message(progress_rich_message(&steps))
                         .build();
                     if let Err(error) = self.telegram.edit_message_text(&params).await {
                         warn!(bot_id = %self.bot.id, %error, "failed to update guest progress message");
                         break;
                     }
+                    dirty = false;
                 }
+            }
+        }
+        if dirty {
+            let params = EditMessageTextParams::builder()
+                .inline_message_id(inline_message_id)
+                .rich_message(progress_rich_message(&steps))
+                .build();
+            if let Err(error) = self.telegram.edit_message_text(&params).await {
+                warn!(bot_id = %self.bot.id, %error, "failed to complete guest progress message");
             }
         }
     }
@@ -1989,8 +2050,49 @@ fn generation_caption(model: &str, prompt: &str) -> String {
     format!("Model: {model}\nPrompt: {prompt}")
 }
 
-fn progress_rich_message(status: &str, elapsed_seconds: u64) -> InputRichMessage {
-    let markdown = format!("**{status}…**\n\nElapsed: {elapsed_seconds}s");
+fn push_progress_step(steps: &mut Vec<ProgressUpdate>, update: ProgressUpdate) {
+    if steps.last() == Some(&update) {
+        return;
+    }
+    steps.push(update);
+    if steps.len() > 12 {
+        steps.remove(0);
+    }
+}
+
+fn progress_rich_message(steps: &[ProgressUpdate]) -> InputRichMessage {
+    let mut markdown = String::from("## Processing\n\n");
+    if steps.is_empty() {
+        markdown.push_str("- **Current:** Starting");
+    }
+    for (index, update) in steps.iter().enumerate() {
+        let is_current = index + 1 == steps.len();
+        let marker = if is_current { "Current" } else { "Done" };
+        match update {
+            ProgressUpdate::Step(status) => {
+                markdown.push_str(&format!("- **{marker}:** {}\n", rich::escape_text(status)));
+            }
+            ProgressUpdate::Generation {
+                kind,
+                model,
+                prompt,
+            } => {
+                let prompt = prompt
+                    .split_whitespace()
+                    .collect::<Vec<_>>()
+                    .join(" ")
+                    .chars()
+                    .take(1_500)
+                    .collect::<String>();
+                markdown.push_str(&format!(
+                    "- **{marker}:** Generating {}\n  - **Model:** `{}`\n  - **Prompt:** *{}*\n",
+                    rich::escape_text(kind),
+                    rich::escape_text(model),
+                    rich::escape_text(&prompt)
+                ));
+            }
+        }
+    }
     InputRichMessage::builder()
         .markdown(rich::to_telegram_markdown(&markdown))
         .build()

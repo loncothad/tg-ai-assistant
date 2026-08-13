@@ -50,4 +50,9 @@ pub const BUILTIN_SKILLS: &[BuiltinSkill] = &[
         description: "Deliver long answers, source code, and structured text as Telegram files.",
         instructions: include_str!("../defaults/skills/file.md"),
     },
+    BuiltinSkill {
+        id: "model_upgrade",
+        description: "Route difficult requests to an administrator-selected, more capable model.",
+        instructions: include_str!("../defaults/skills/model_upgrade.md"),
+    },
 ];

@@ -50,6 +50,8 @@ pub struct Capabilities {
     pub transcription: bool,
     #[serde(default = "enabled_by_default")]
     pub file: bool,
+    #[serde(default = "enabled_by_default")]
+    pub model_upgrade: bool,
 }
 impl Default for Capabilities {
     fn default() -> Self {
@@ -62,6 +64,7 @@ impl Default for Capabilities {
             media: true,
             transcription: true,
             file: true,
+            model_upgrade: true,
         }
     }
 }
@@ -73,6 +76,8 @@ pub struct BotSettings {
     pub selected_planner_model: String,
     #[serde(default)]
     pub selected_planner_fallback_model: String,
+    #[serde(default)]
+    pub selected_upgrade_model: String,
     #[serde(default)]
     pub selected_image_understanding_model: String,
     #[serde(default)]
@@ -155,6 +160,7 @@ impl Store {
                         .planner
                         .fallback_model
                         .clone(),
+                    selected_upgrade_model: bot.default_model.clone(),
                     selected_image_understanding_model: config
                         .openrouter
                         .understanding
@@ -193,6 +199,7 @@ impl Store {
                 &mut settings.selected_planner_fallback_model,
                 &config.openrouter.planner.fallback_model,
             ),
+            (&mut settings.selected_upgrade_model, &bot.default_model),
             (
                 &mut settings.selected_image_understanding_model,
                 &config.openrouter.understanding.image.default_model,
@@ -281,6 +288,7 @@ impl Store {
             "chat" => settings.selected_model = model.into(),
             "intent_planning" => settings.selected_planner_model = model.into(),
             "intent_planning_fallback" => settings.selected_planner_fallback_model = model.into(),
+            "model_upgrade" => settings.selected_upgrade_model = model.into(),
             "image_understanding" => settings.selected_image_understanding_model = model.into(),
             "video_understanding" => settings.selected_video_understanding_model = model.into(),
             "image_generation" => settings.selected_image_generation_model = model.into(),
@@ -328,6 +336,7 @@ impl Store {
             "media" => settings.capabilities.media = enabled,
             "transcription" => settings.capabilities.transcription = enabled,
             "file" => settings.capabilities.file = enabled,
+            "model_upgrade" => settings.capabilities.model_upgrade = enabled,
             _ => bail!("Unknown capability: {capability}"),
         }
         self.save_settings_unlocked(bot_id, &settings).await
@@ -375,6 +384,7 @@ impl Store {
             "media" => settings.capabilities.media,
             "transcription" => settings.capabilities.transcription,
             "file" => settings.capabilities.file,
+            "model_upgrade" => settings.capabilities.model_upgrade,
             _ => false,
         };
         let mut skills = crate::defaults::BUILTIN_SKILLS
@@ -626,6 +636,7 @@ mod tests {
                         selected_model: "chat".into(),
                         selected_planner_model: "planner".into(),
                         selected_planner_fallback_model: "planner-fallback".into(),
+                        selected_upgrade_model: "advanced".into(),
                         selected_image_understanding_model: "vision".into(),
                         selected_video_understanding_model: "video-vision".into(),
                         selected_image_generation_model: "image".into(),

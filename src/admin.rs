@@ -691,6 +691,7 @@ async fn import_skill_bundle(store: &Store, bot: &str, content: &str) -> Result<
             "media" => settings.capabilities.media = skill.enabled,
             "transcription" => settings.capabilities.transcription = skill.enabled,
             "file" => settings.capabilities.file = skill.enabled,
+            "model_upgrade" => settings.capabilities.model_upgrade = skill.enabled,
             _ => bail!("Unknown built-in skill: {}", skill.id),
         }
     }
@@ -720,6 +721,7 @@ async fn export_skills(
         "media" => settings.capabilities.media,
         "transcription" => settings.capabilities.transcription,
         "file" => settings.capabilities.file,
+        "model_upgrade" => settings.capabilities.model_upgrade,
         _ => false,
     };
     let skills=crate::defaults::BUILTIN_SKILLS.iter().map(|s|serde_json::json!({"id":s.id,"description":s.description,"enabled":enabled(s.id),"instructions":s.instructions})).collect::<Vec<_>>();
@@ -824,6 +826,14 @@ async fn render_html(state: &AdminState, bot: &str) -> Result<String> {
             any_model_provider_ready,
         ),
         model_form(
+            "Advanced model",
+            "model_upgrade",
+            &settings.selected_upgrade_model,
+            &route("model_upgrade"),
+            &configured,
+            any_model_provider_ready,
+        ),
+        model_form(
             "Image understanding",
             "image_understanding",
             &settings.selected_image_understanding_model,
@@ -887,6 +897,7 @@ async fn render_html(state: &AdminState, bot: &str) -> Result<String> {
         "media" => settings.capabilities.media,
         "transcription" => settings.capabilities.transcription,
         "file" => settings.capabilities.file,
+        "model_upgrade" => settings.capabilities.model_upgrade,
         _ => false,
     };
     let caps = crate::defaults::BUILTIN_SKILLS
@@ -1020,6 +1031,7 @@ fn model_provider_for_skill(settings: &crate::db::BotSettings, skill: &str) -> M
         "transcription" => "transcription",
         "media" => "image_understanding",
         "file" => "chat",
+        "model_upgrade" => "model_upgrade",
         _ => "chat",
     };
     model_provider_for_capability(settings, capability)
@@ -1027,7 +1039,7 @@ fn model_provider_for_skill(settings: &crate::db::BotSettings, skill: &str) -> M
 
 fn model_allowed_fallback(config: &Config, capability: &str, id: &str) -> bool {
     match capability {
-        "chat" => config.openrouter.models.iter().any(|model| model.id == id),
+        "chat" | "model_upgrade" => config.openrouter.models.iter().any(|model| model.id == id),
         "intent_planning" => config.openrouter.planner.model == id,
         "intent_planning_fallback" => config.openrouter.planner.fallback_model == id,
         "image_understanding" => config

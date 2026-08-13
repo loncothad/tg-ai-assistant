@@ -93,6 +93,23 @@ pub fn to_telegram_markdown(input: &str) -> String {
     output
 }
 
+/// Escapes arbitrary plain text before embedding it in generated Rich Markdown.
+pub fn escape_text(input: &str) -> String {
+    input
+        .chars()
+        .flat_map(|character| {
+            if matches!(
+                character,
+                '\\' | '*' | '_' | '~' | '`' | '#' | '[' | ']' | '<' | '>' | '|'
+            ) {
+                vec!['\\', character]
+            } else {
+                vec![character]
+            }
+        })
+        .collect()
+}
+
 fn normalize_inline(line: &str) -> String {
     // These are the delimiters most frequently emitted by models trained to
     // target MathJax. Telegram Rich Markdown documents `$` and `$$` instead.
