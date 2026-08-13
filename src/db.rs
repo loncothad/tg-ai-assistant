@@ -48,6 +48,8 @@ pub struct Capabilities {
     pub media: bool,
     #[serde(default = "enabled_by_default")]
     pub transcription: bool,
+    #[serde(default = "enabled_by_default")]
+    pub file: bool,
 }
 impl Default for Capabilities {
     fn default() -> Self {
@@ -59,6 +61,7 @@ impl Default for Capabilities {
             video: true,
             media: true,
             transcription: true,
+            file: true,
         }
     }
 }
@@ -300,6 +303,7 @@ impl Store {
             "video" => settings.capabilities.video = enabled,
             "media" => settings.capabilities.media = enabled,
             "transcription" => settings.capabilities.transcription = enabled,
+            "file" => settings.capabilities.file = enabled,
             _ => bail!("Unknown capability: {capability}"),
         }
         self.save_settings_unlocked(bot_id, &settings).await
@@ -346,6 +350,7 @@ impl Store {
             "video" => settings.capabilities.video,
             "media" => settings.capabilities.media,
             "transcription" => settings.capabilities.transcription,
+            "file" => settings.capabilities.file,
             _ => false,
         };
         let mut skills = crate::defaults::BUILTIN_SKILLS

@@ -12,9 +12,9 @@ use frankenstein::{
     },
     input_file::FileUpload,
     methods::{
-        AnswerGuestQueryParams, GetFileParams, GetUpdatesParams, SendAudioParams,
-        SendChatActionParams, SendDocumentParams, SendPhotoParams, SendRichMessageParams,
-        SendVideoParams,
+        AnswerGuestQueryParams, DeleteMessageParams, GetFileParams, GetUpdatesParams,
+        SendAudioParams, SendChatActionParams, SendDocumentParams, SendPhotoParams,
+        SendRichMessageDraftParams, SendRichMessageParams, SendVideoParams,
     },
     rich_message::InputRichMessage,
     types::{
@@ -25,7 +25,7 @@ use frankenstein::{
 };
 use tempfile::Builder as TempFileBuilder;
 use tokio::{
-    sync::{Semaphore, watch},
+    sync::{Semaphore, mpsc, watch},
     task::JoinSet,
     time::sleep,
 };
@@ -262,6 +262,7 @@ impl BotRunner {
             capabilities.video = false;
             capabilities.media = false;
             capabilities.transcription = false;
+            capabilities.file = false;
         }
         let provider = self.search_provider().await?;
         let openrouter_key = self
@@ -315,7 +316,7 @@ impl BotRunner {
         let author = caller_name(&message);
         let contextual_text = format!("{author}: {text}{}", media_summary(&media));
         let mut instructions = self.store.effective_instructions(&self.bot.id).await?;
-        instructions.push_str(&format!("\n\n# Current request context\nCurrent UTC date and time: {}\nBot: @{} (backend ID {})\nConversation mode: {:?}\nChat: {} (ID {})\nCaller: {} (ID {}, language {})\nTelegram message Unix time: {}\nEnabled capabilities for this request: search={}, web_fetch={}, image={}, audio={}, video={}, media={}, transcription={}", chrono::Utc::now().to_rfc3339(), self.username, self.bot.id, mode, message.chat.title.as_deref().unwrap_or("Private or untitled chat"), message.chat.id, author, user_id, message.guest_bot_caller_user.as_ref().or(message.from.as_ref()).and_then(|u| u.language_code.as_deref()).unwrap_or("unknown"), message.date, capabilities.search, capabilities.web_fetch, capabilities.image, capabilities.audio, capabilities.video, capabilities.media, capabilities.transcription));
+        instructions.push_str(&format!("\n\n# Current request context\nCurrent UTC date and time: {}\nBot: @{} (backend ID {})\nConversation mode: {:?}\nChat: {} (ID {})\nCaller: {} (ID {}, language {})\nTelegram message Unix time: {}\nEnabled capabilities and callable tools for this request: search={}, web_fetch={}, image_generation={}, audio_generation={}, video_generation={}, media_understanding={}, transcription={}, file_delivery={}. If a capability is true, never claim it is disabled; call its tool when the user explicitly requests that operation.", chrono::Utc::now().to_rfc3339(), self.username, self.bot.id, mode, message.chat.title.as_deref().unwrap_or("Private or untitled chat"), message.chat.id, author, user_id, message.guest_bot_caller_user.as_ref().or(message.from.as_ref()).and_then(|u| u.language_code.as_deref()).unwrap_or("unknown"), message.date, capabilities.search, capabilities.web_fetch, capabilities.image, capabilities.audio, capabilities.video, capabilities.media, capabilities.transcription, capabilities.file));
         self.store
             .append_message(&self.bot.id, &scope, "user", &contextual_text)
             .await?;
@@ -325,7 +326,23 @@ impl BotRunner {
             .get(model_capability)
             .unwrap_or(&default_routing);
         let session_id = format!("{}:{scope}", self.bot.id);
-        match self
+        let (progress, progress_task) = if mode == MessageMode::Guest {
+            (None, None)
+        } else {
+            let (sender, receiver) = mpsc::unbounded_channel();
+            let runner = self.clone();
+            let chat_id = message.chat.id;
+            let thread_id = message.message_thread_id;
+            let draft_id = i64::from(message.message_id);
+            let task = tokio::spawn(async move {
+                runner
+                    .update_progress_draft(chat_id, thread_id, draft_id, receiver)
+                    .await;
+            });
+            let _ = sender.send("Reading your request".to_owned());
+            (Some(sender), Some(task))
+        };
+        let result = self
             .openrouter
             .chat(ChatRequest {
                 model: &model,
@@ -362,9 +379,13 @@ impl BotRunner {
                         .get("video_generation")
                         .unwrap_or(&default_routing),
                 },
+                progress,
             })
-            .await
-        {
+            .await;
+        if let Some(task) = progress_task {
+            let _ = task.await;
+        }
+        match result {
             Ok(answer) => {
                 self.store
                     .append_message(&self.bot.id, &scope, "assistant", &answer.text)
@@ -396,6 +417,15 @@ impl BotRunner {
                             message.message_thread_id,
                             &video,
                             Some("Generated with OpenRouter"),
+                        )
+                        .await?;
+                    }
+                    for file in answer.generated_files {
+                        self.send_document_bytes(
+                            message.chat.id,
+                            message.message_thread_id,
+                            &file.filename,
+                            &file.bytes,
                         )
                         .await?;
                     }
@@ -503,7 +533,7 @@ impl BotRunner {
                     self.respond(
                         message,
                         mode,
-                        "Image generation is not available in guest mode.",
+                        "Image generation is enabled, but Telegram guest queries cannot receive generated file uploads. Open this bot in a private chat or use it in a normal group, then send `-image <prompt>`.",
                         None,
                     )
                     .await?;
@@ -527,7 +557,16 @@ impl BotRunner {
                     .get("image_generation")
                     .cloned()
                     .unwrap_or_default();
-                match self
+                let stub = self
+                    .send_generation_stub(
+                        message.chat.id,
+                        message.message_thread_id,
+                        i64::from(message.message_id),
+                        "Generating the requested image",
+                    )
+                    .await
+                    .ok();
+                let result = self
                     .openrouter
                     .generate_image_with_references(
                         arguments,
@@ -536,8 +575,11 @@ impl BotRunner {
                         &routing,
                         &key,
                     )
-                    .await
-                {
+                    .await;
+                if let Some(stub) = stub {
+                    self.delete_generation_stub(message.chat.id, stub).await;
+                }
+                match result {
                     Ok(images) => {
                         for image in images {
                             self.send_photo_bytes(
@@ -562,7 +604,7 @@ impl BotRunner {
                     self.respond(
                         message,
                         mode,
-                        "Audio generation is not available in guest mode.",
+                        "Audio generation is enabled, but Telegram guest queries cannot receive generated file uploads. Open this bot in a private chat or normal group.",
                         None,
                     )
                     .await?;
@@ -589,7 +631,16 @@ impl BotRunner {
                     .get("audio_generation")
                     .cloned()
                     .unwrap_or_default();
-                match self
+                let stub = self
+                    .send_generation_stub(
+                        message.chat.id,
+                        message.message_thread_id,
+                        i64::from(message.message_id),
+                        "Generating the requested audio",
+                    )
+                    .await
+                    .ok();
+                let result = self
                     .openrouter
                     .generate_audio(
                         arguments,
@@ -597,8 +648,11 @@ impl BotRunner {
                         &routing,
                         &key,
                     )
-                    .await
-                {
+                    .await;
+                if let Some(stub) = stub {
+                    self.delete_generation_stub(message.chat.id, stub).await;
+                }
+                match result {
                     Ok(audio) => {
                         self.send_audio_bytes(
                             message.chat.id,
@@ -620,7 +674,7 @@ impl BotRunner {
                     self.respond(
                         message,
                         mode,
-                        "Transcription is not available in guest mode.",
+                        "Transcription is enabled, but Telegram guest queries cannot upload or return the required media. Open this bot in a private chat or normal group.",
                         None,
                     )
                     .await?;
@@ -678,7 +732,7 @@ impl BotRunner {
                     self.respond(
                         message,
                         mode,
-                        "Video generation is not available in guest mode.",
+                        "Video generation is enabled, but Telegram guest queries cannot receive generated file uploads. Open this bot in a private chat or normal group.",
                         None,
                     )
                     .await?;
@@ -702,7 +756,16 @@ impl BotRunner {
                     .get("video_generation")
                     .cloned()
                     .unwrap_or_default();
-                match self
+                let stub = self
+                    .send_generation_stub(
+                        message.chat.id,
+                        message.message_thread_id,
+                        i64::from(message.message_id),
+                        "Generating the requested video",
+                    )
+                    .await
+                    .ok();
+                let result = self
                     .openrouter
                     .generate_video_with_references(
                         arguments,
@@ -711,8 +774,11 @@ impl BotRunner {
                         &routing,
                         &key,
                     )
-                    .await
-                {
+                    .await;
+                if let Some(stub) = stub {
+                    self.delete_generation_stub(message.chat.id, stub).await;
+                }
+                match result {
                     Ok(url) => {
                         self.send_video_url(
                             message.chat.id,
@@ -890,6 +956,102 @@ impl BotRunner {
         Ok(())
     }
 
+    async fn update_progress_draft(
+        &self,
+        chat_id: i64,
+        thread_id: Option<i32>,
+        draft_id: i64,
+        mut updates: mpsc::UnboundedReceiver<String>,
+    ) {
+        let started = tokio::time::Instant::now();
+        let mut status = "Starting".to_owned();
+        let mut stub_message = None;
+        let mut drafts_enabled = true;
+        let mut ticker = tokio::time::interval(Duration::from_secs(3));
+        ticker.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
+        loop {
+            tokio::select! {
+                update = updates.recv() => match update {
+                    Some(update) => {
+                        status = update;
+                        if stub_message.is_none()
+                            && (status.starts_with("Generating")
+                                || status.starts_with("Preparing a downloadable file"))
+                        {
+                            stub_message = self
+                                .send_generation_stub(chat_id, thread_id, draft_id, &status)
+                                .await
+                                .ok();
+                        }
+                    },
+                    None => break,
+                },
+                _ = ticker.tick(), if drafts_enabled => {
+                    let markdown = format!("⏳ **{status}…**\n\nElapsed: {}s", started.elapsed().as_secs());
+                    let rich_message = InputRichMessage::builder().markdown(markdown).build();
+                    let mut params = SendRichMessageDraftParams::builder()
+                        .chat_id(chat_id)
+                        .draft_id(draft_id)
+                        .rich_message(rich_message)
+                        .build();
+                    params.message_thread_id = thread_id;
+                    if let Err(error) = self.telegram.send_rich_message_draft(&params).await {
+                        warn!(bot_id = %self.bot.id, %error, "failed to update progress draft");
+                        drafts_enabled = false;
+                    }
+                }
+            }
+        }
+        if let Some(message_id) = stub_message {
+            self.delete_generation_stub(chat_id, message_id).await;
+        }
+    }
+
+    async fn send_generation_stub(
+        &self,
+        chat_id: i64,
+        thread_id: Option<i32>,
+        reply_to: i64,
+        status: &str,
+    ) -> Result<i32> {
+        let file = TempFileBuilder::new()
+            .prefix("teleforge-generation-in-progress-")
+            .suffix(".txt")
+            .tempfile()?;
+        tokio::fs::write(
+            file.path(),
+            format!("{status}…\n\nTeleforge will send the completed file when it is ready.\n"),
+        )
+        .await?;
+        let mut params = SendDocumentParams::builder()
+            .chat_id(chat_id)
+            .document(FileUpload::from(file.path().to_path_buf()))
+            .caption(format!("⏳ {status}…"))
+            .reply_parameters(
+                ReplyParameters::builder()
+                    .message_id(i32::try_from(reply_to).wrap_err("Invalid reply message ID")?)
+                    .build(),
+            )
+            .build();
+        params.message_thread_id = thread_id;
+        Ok(self
+            .telegram
+            .send_document(&params)
+            .await?
+            .result
+            .message_id)
+    }
+
+    async fn delete_generation_stub(&self, chat_id: i64, message_id: i32) {
+        let params = DeleteMessageParams::builder()
+            .chat_id(chat_id)
+            .message_id(message_id)
+            .build();
+        if let Err(error) = self.telegram.delete_message(&params).await {
+            warn!(bot_id = %self.bot.id, %error, "failed to remove generation stub");
+        }
+    }
+
     async fn send_action(&self, chat_id: i64, thread_id: Option<i32>, action: ChatAction) {
         let mut params = SendChatActionParams::builder()
             .chat_id(chat_id)
@@ -940,6 +1102,26 @@ impl BotRunner {
         params.message_thread_id = thread_id;
         params.caption = caption.map(str::to_owned);
         self.telegram.send_photo(&params).await?;
+        Ok(())
+    }
+
+    async fn send_document_bytes(
+        &self,
+        chat_id: i64,
+        thread_id: Option<i32>,
+        filename: &str,
+        bytes: &[u8],
+    ) -> Result<()> {
+        let directory = tempfile::tempdir()?;
+        let path = directory.path().join(filename);
+        tokio::fs::write(&path, bytes).await?;
+        let mut params = SendDocumentParams::builder()
+            .chat_id(chat_id)
+            .document(FileUpload::from(path))
+            .caption(format!("Generated file · {filename}"))
+            .build();
+        params.message_thread_id = thread_id;
+        self.telegram.send_document(&params).await?;
         Ok(())
     }
 

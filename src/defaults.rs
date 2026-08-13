@@ -45,4 +45,9 @@ pub const BUILTIN_SKILLS: &[BuiltinSkill] = &[
         description: "Transcribe Telegram voice notes and audio through OpenRouter.",
         instructions: include_str!("../defaults/skills/transcription.md"),
     },
+    BuiltinSkill {
+        id: "file",
+        description: "Deliver long answers, source code, and structured text as Telegram files.",
+        instructions: include_str!("../defaults/skills/file.md"),
+    },
 ];

@@ -5,6 +5,7 @@ use std::time::{Duration, Instant};
 use base64::{Engine, engine::general_purpose::STANDARD};
 use eyre::{Context, ContextCompat, bail};
 use serde_json::{Map, Value, json};
+use tokio::sync::mpsc::UnboundedSender;
 use tokio::time::sleep;
 
 use crate::{
@@ -31,12 +32,20 @@ pub struct AssistantResponse {
     pub generated_images: Vec<GeneratedImage>,
     pub generated_audio: Vec<GeneratedImage>,
     pub generated_videos: Vec<String>,
+    pub generated_files: Vec<GeneratedFile>,
 }
 
 #[derive(Clone, Debug)]
 pub struct GeneratedImage {
     pub bytes: Vec<u8>,
     pub media_type: String,
+}
+
+/// A UTF-8 file requested by the model for delivery through Telegram.
+#[derive(Clone, Debug)]
+pub struct GeneratedFile {
+    pub filename: String,
+    pub bytes: Vec<u8>,
 }
 
 /// Private media downloaded from Telegram or a public video URL supplied by a user.
@@ -62,6 +71,7 @@ pub struct ChatRequest<'a> {
     pub capabilities: &'a Capabilities,
     pub routing: &'a ModelRouting,
     pub tool_models: ToolModels<'a>,
+    pub progress: Option<UnboundedSender<String>>,
 }
 
 #[derive(Clone, Copy)]
@@ -96,7 +106,58 @@ impl OpenRouter {
             capabilities,
             routing,
             tool_models,
+            progress,
         } = request;
+        report_progress(&progress, "Preparing conversation context");
+        if let Some(kind) = explicit_media_request(user_message, capabilities) {
+            return match kind {
+                "image" => {
+                    report_progress(&progress, "Generating the requested image");
+                    let images = self
+                        .generate_image_with_references(
+                            user_message,
+                            media,
+                            tool_models.image_generation,
+                            tool_models.image_routing,
+                            api_key,
+                        )
+                        .await?;
+                    Ok(AssistantResponse {
+                        text: "Done — I generated the requested image.".to_owned(),
+                        media_urls: Vec::new(),
+                        generation_id: None,
+                        usage: None,
+                        generated_images: images,
+                        generated_audio: Vec::new(),
+                        generated_videos: Vec::new(),
+                        generated_files: Vec::new(),
+                    })
+                }
+                "video" => {
+                    report_progress(&progress, "Generating the requested video");
+                    let video = self
+                        .generate_video_with_references(
+                            user_message,
+                            media,
+                            tool_models.video_generation,
+                            tool_models.video_routing,
+                            api_key,
+                        )
+                        .await?;
+                    Ok(AssistantResponse {
+                        text: "Done — I generated the requested video.".to_owned(),
+                        media_urls: Vec::new(),
+                        generation_id: None,
+                        usage: None,
+                        generated_images: Vec::new(),
+                        generated_audio: Vec::new(),
+                        generated_videos: vec![video],
+                        generated_files: Vec::new(),
+                    })
+                }
+                _ => unreachable!("explicit media kinds are closed"),
+            };
+        }
         let mut messages = vec![json!({ "role": "system", "content": system_prompt })];
         messages.extend(
             history
@@ -108,6 +169,7 @@ impl OpenRouter {
         let mut generated_images = Vec::new();
         let mut generated_audio = Vec::new();
         let mut generated_videos = Vec::new();
+        let mut generated_files = Vec::new();
         for _ in 0..MAX_TOOL_ROUNDS {
             let mut body = Map::new();
             body.insert("messages".into(), Value::Array(messages.clone()));
@@ -127,6 +189,7 @@ impl OpenRouter {
                     .iter()
                     .any(|item| matches!(item, MediaInput::Audio { .. })),
             );
+            report_progress(&progress, "Waiting for the selected AI model");
 
             let value = self
                 .post_json("chat/completions", Value::Object(body), api_key)
@@ -145,6 +208,15 @@ impl OpenRouter {
                 if text.is_empty() && media_urls.is_empty() {
                     bail!("OpenRouter returned an empty response");
                 }
+                let text = if text.chars().count() > 12_000 && capabilities.file {
+                    generated_files.push(GeneratedFile {
+                        filename: "answer.md".to_owned(),
+                        bytes: text.as_bytes().to_vec(),
+                    });
+                    "The complete answer was too large for a convenient chat message, so I attached it as `answer.md`.".to_owned()
+                } else {
+                    text
+                };
                 return Ok(AssistantResponse {
                     text,
                     media_urls,
@@ -153,6 +225,7 @@ impl OpenRouter {
                     generated_images,
                     generated_audio,
                     generated_videos,
+                    generated_files,
                 });
             }
 
@@ -170,6 +243,7 @@ impl OpenRouter {
                     .unwrap_or(Value::Null);
                 let output = match name {
                     "web_search" => {
+                        report_progress(&progress, "Searching the web");
                         let query = arguments
                             .get("query")
                             .and_then(Value::as_str)
@@ -179,6 +253,7 @@ impl OpenRouter {
                             .await
                     }
                     "generate_image" if capabilities.image => {
+                        report_progress(&progress, "Generating the image");
                         let prompt = arguments
                             .get("prompt")
                             .and_then(Value::as_str)
@@ -202,6 +277,7 @@ impl OpenRouter {
                         }
                     }
                     "generate_audio" if capabilities.audio => {
+                        report_progress(&progress, "Generating audio");
                         let input = arguments
                             .get("text")
                             .and_then(Value::as_str)
@@ -223,6 +299,7 @@ impl OpenRouter {
                         }
                     }
                     "generate_video" if capabilities.video => {
+                        report_progress(&progress, "Generating the video");
                         let prompt = arguments
                             .get("prompt")
                             .and_then(Value::as_str)
@@ -245,6 +322,7 @@ impl OpenRouter {
                         }
                     }
                     "transcribe_audio" if capabilities.transcription => {
+                        report_progress(&progress, "Transcribing the audio");
                         let language = arguments.get("language").and_then(Value::as_str);
                         let mut transcripts = Vec::new();
                         for item in media {
@@ -271,6 +349,19 @@ impl OpenRouter {
                             json!({"error":"No audio attachment is available"}).to_string()
                         } else {
                             json!({"transcripts":transcripts}).to_string()
+                        }
+                    }
+                    "send_file" if capabilities.file => {
+                        report_progress(&progress, "Preparing a downloadable file");
+                        match file_from_arguments(&arguments) {
+                            Ok(file) => {
+                                let filename = file.filename.clone();
+                                let bytes = file.bytes.len();
+                                generated_files.push(file);
+                                json!({"status":"ready","filename":filename,"bytes":bytes})
+                                    .to_string()
+                            }
+                            Err(error) => json!({"error":error.to_string()}).to_string(),
                         }
                     }
                     _ => {
@@ -800,6 +891,23 @@ fn add_tools(
             }
         }));
     }
+    if capabilities.file {
+        additions.push(json!({
+            "type":"function",
+            "function": {
+                "name":"send_file",
+                "description":"Deliver a long answer, source code, configuration, or structured text as a downloadable Telegram file.",
+                "parameters": {
+                    "type":"object",
+                    "properties": {
+                        "filename":{"type":"string","description":"Safe filename including an appropriate extension"},
+                        "content":{"type":"string","description":"Complete UTF-8 file content"}
+                    },
+                    "required":["filename","content"]
+                }
+            }
+        }));
+    }
     if additions.is_empty() {
         return;
     }
@@ -810,6 +918,77 @@ fn add_tools(
         }
     }
     body.entry("tool_choice").or_insert(json!("auto"));
+}
+
+fn report_progress(progress: &Option<UnboundedSender<String>>, status: &str) {
+    if let Some(progress) = progress {
+        let _ = progress.send(status.to_owned());
+    }
+}
+
+fn explicit_media_request(message: &str, capabilities: &Capabilities) -> Option<&'static str> {
+    let message = message.to_lowercase();
+    if capabilities.image
+        && [
+            "generate an image",
+            "generate image",
+            "create an image",
+            "create image",
+            "draw ",
+            "сгенер",
+        ]
+        .iter()
+        .any(|needle| message.contains(needle))
+        && ["image", "picture", "photo", "картин", "изображ", "фото"]
+            .iter()
+            .any(|needle| message.contains(needle))
+    {
+        Some("image")
+    } else if capabilities.video
+        && ["generate video", "create video", "сгенер"]
+            .iter()
+            .any(|needle| message.contains(needle))
+        && ["video", "видео", "ролик"]
+            .iter()
+            .any(|needle| message.contains(needle))
+    {
+        Some("video")
+    } else {
+        None
+    }
+}
+
+fn file_from_arguments(arguments: &Value) -> Result<GeneratedFile> {
+    const MAX_FILE_BYTES: usize = 20 * 1024 * 1024;
+    let raw_name = arguments
+        .get("filename")
+        .and_then(Value::as_str)
+        .context("File tool requires a filename")?;
+    let filename = raw_name
+        .chars()
+        .map(|character| {
+            if character.is_ascii_alphanumeric() || matches!(character, '.' | '-' | '_') {
+                character
+            } else {
+                '_'
+            }
+        })
+        .collect::<String>()
+        .trim_matches('.')
+        .to_owned();
+    if filename.is_empty() || filename.len() > 128 {
+        bail!("File name must contain 1 to 128 safe characters");
+    }
+    let bytes = arguments
+        .get("content")
+        .and_then(Value::as_str)
+        .context("File tool requires content")?
+        .as_bytes()
+        .to_vec();
+    if bytes.is_empty() || bytes.len() > MAX_FILE_BYTES {
+        bail!("File content must be between 1 byte and 20 MiB");
+    }
+    Ok(GeneratedFile { filename, bytes })
 }
 
 fn openrouter_web_search_tool(config: &crate::config::OpenRouterWebSearchConfig) -> Value {
@@ -1035,5 +1214,33 @@ mod tests {
         );
         assert_eq!(content[0]["type"], "text");
         assert_eq!(content[1]["type"], "image_url");
+    }
+
+    #[test]
+    fn explicit_image_requests_are_detected_in_english_and_russian() {
+        let capabilities = Capabilities::default();
+        assert_eq!(
+            explicit_media_request("Please generate an image of a fox", &capabilities),
+            Some("image")
+        );
+        assert_eq!(
+            explicit_media_request("сгенерь картинку с белочкой", &capabilities),
+            Some("image")
+        );
+        assert_eq!(
+            explicit_media_request("describe this image", &capabilities),
+            None
+        );
+    }
+
+    #[test]
+    fn file_tool_sanitizes_names_and_limits_content() {
+        let file = file_from_arguments(&json!({
+            "filename": "../answer file.rs",
+            "content": "fn main() {}"
+        }))
+        .unwrap();
+        assert_eq!(file.filename, "_answer_file.rs");
+        assert_eq!(file.bytes, b"fn main() {}");
     }
 }

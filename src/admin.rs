@@ -587,6 +587,7 @@ async fn import_skill_bundle(store: &Store, bot: &str, content: &str) -> Result<
             "video" => settings.capabilities.video = skill.enabled,
             "media" => settings.capabilities.media = skill.enabled,
             "transcription" => settings.capabilities.transcription = skill.enabled,
+            "file" => settings.capabilities.file = skill.enabled,
             _ => bail!("Unknown built-in skill: {}", skill.id),
         }
     }
@@ -615,6 +616,7 @@ async fn export_skills(
         "video" => settings.capabilities.video,
         "media" => settings.capabilities.media,
         "transcription" => settings.capabilities.transcription,
+        "file" => settings.capabilities.file,
         _ => false,
     };
     let skills=crate::defaults::BUILTIN_SKILLS.iter().map(|s|serde_json::json!({"id":s.id,"description":s.description,"enabled":enabled(s.id),"instructions":s.instructions})).collect::<Vec<_>>();
@@ -756,6 +758,7 @@ async fn render_html(state: &AdminState, bot: &str) -> Result<String> {
         "video" => settings.capabilities.video,
         "media" => settings.capabilities.media,
         "transcription" => settings.capabilities.transcription,
+        "file" => settings.capabilities.file,
         _ => false,
     };
     let caps = crate::defaults::BUILTIN_SKILLS
