@@ -206,6 +206,18 @@ openrouter:
     speed: 1.0
     extra: {}
 
+  # Music/non-speech audio uses OpenRouter chat completions with streamed audio.
+  music:
+    model: "google/lyria-3-clip-preview"
+    models:
+      - id: "google/lyria-3-clip-preview"
+        label: "Google Lyria 3 Clip Preview"
+        extra: {}
+      - id: "google/lyria-3-pro-preview"
+        label: "Google Lyria 3 Pro Preview"
+        extra: {}
+    extra: {}
+
   transcription:
     model: "openai/whisper-large-v3"
     models:

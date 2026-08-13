@@ -686,7 +686,8 @@ async fn import_skill_bundle(store: &Store, bot: &str, content: &str) -> Result<
             "search" => settings.capabilities.search = skill.enabled,
             "web_fetch" => settings.capabilities.web_fetch = skill.enabled,
             "image" => settings.capabilities.image = skill.enabled,
-            "audio" => settings.capabilities.audio = skill.enabled,
+            "audio" | "speech" => settings.capabilities.audio = skill.enabled,
+            "music" => settings.capabilities.music = skill.enabled,
             "video" => settings.capabilities.video = skill.enabled,
             "media" => settings.capabilities.media = skill.enabled,
             "transcription" => settings.capabilities.transcription = skill.enabled,
@@ -716,7 +717,8 @@ async fn export_skills(
         "search" => settings.capabilities.search,
         "web_fetch" => settings.capabilities.web_fetch,
         "image" => settings.capabilities.image,
-        "audio" => settings.capabilities.audio,
+        "audio" | "speech" => settings.capabilities.audio,
+        "music" => settings.capabilities.music,
         "video" => settings.capabilities.video,
         "media" => settings.capabilities.media,
         "transcription" => settings.capabilities.transcription,
@@ -859,9 +861,22 @@ async fn render_html(state: &AdminState, bot: &str) -> Result<String> {
         ),
         model_form(
             "Speech generation",
-            "audio_generation",
+            "speech_generation",
             &settings.selected_audio_generation_model,
-            &route("audio_generation"),
+            &settings
+                .model_routing
+                .get("speech_generation")
+                .cloned()
+                .or_else(|| settings.model_routing.get("audio_generation").cloned())
+                .unwrap_or_default(),
+            &configured,
+            any_model_provider_ready,
+        ),
+        model_form(
+            "Music generation",
+            "music_generation",
+            &settings.selected_music_generation_model,
+            &route("music_generation"),
             &configured,
             any_model_provider_ready,
         ),
@@ -892,7 +907,8 @@ async fn render_html(state: &AdminState, bot: &str) -> Result<String> {
         "search" => settings.capabilities.search,
         "web_fetch" => settings.capabilities.web_fetch,
         "image" => settings.capabilities.image,
-        "audio" => settings.capabilities.audio,
+        "audio" | "speech" => settings.capabilities.audio,
+        "music" => settings.capabilities.music,
         "video" => settings.capabilities.video,
         "media" => settings.capabilities.media,
         "transcription" => settings.capabilities.transcription,
@@ -1026,7 +1042,8 @@ fn model_provider_for_capability(
 fn model_provider_for_skill(settings: &crate::db::BotSettings, skill: &str) -> ModelProvider {
     let capability = match skill {
         "image" => "image_generation",
-        "audio" => "audio_generation",
+        "audio" | "speech" => "speech_generation",
+        "music" => "music_generation",
         "video" => "video_generation",
         "transcription" => "transcription",
         "media" => "image_understanding",
@@ -1062,9 +1079,15 @@ fn model_allowed_fallback(config: &Config, capability: &str, id: &str) -> bool {
             .models
             .iter()
             .any(|model| model.id == id),
-        "audio_generation" => config
+        "audio_generation" | "speech_generation" => config
             .openrouter
             .audio
+            .models
+            .iter()
+            .any(|model| model.id == id),
+        "music_generation" => config
+            .openrouter
+            .music
             .models
             .iter()
             .any(|model| model.id == id),

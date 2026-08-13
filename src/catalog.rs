@@ -61,7 +61,8 @@ impl CatalogModel {
             "image_understanding" => input("image") && output("text"),
             "video_understanding" => input("video") && output("text"),
             "image_generation" => output("image"),
-            "audio_generation" => output("speech"),
+            "audio_generation" | "speech_generation" => output("speech"),
+            "music_generation" => output("audio"),
             "transcription" => output("transcription"),
             "video_generation" => output("video"),
             _ => false,
@@ -527,6 +528,8 @@ mod tests {
         assert!(model(&["text"], &["image"]).supports("image_generation"));
         assert!(model(&["audio"], &["transcription"]).supports("transcription"));
         assert!(model(&["text"], &["speech"]).supports("audio_generation"));
+        assert!(model(&["text"], &["speech"]).supports("speech_generation"));
+        assert!(model(&["text"], &["audio"]).supports("music_generation"));
         assert!(model(&["text", "video"], &["text"]).supports("video_understanding"));
         assert!(model(&["text", "image"], &["video"]).supports("video_generation"));
         let mut planner = model(&["text"], &["text"]);

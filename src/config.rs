@@ -158,6 +158,9 @@ pub struct OpenRouterConfig {
     pub planner: PlannerConfig,
     pub image: MediaModelConfig,
     pub audio: AudioModelConfig,
+    /// Music and other non-speech audio generation through chat completions.
+    #[serde(default)]
+    pub music: MusicModelConfig,
     pub transcription: TranscriptionModelConfig,
     pub video: VideoModelConfig,
 }
@@ -399,6 +402,26 @@ pub struct AudioModelConfig {
     pub speed: f64,
     #[serde(default)]
     pub extra: serde_json::Map<String, Value>,
+}
+
+/// Configuration for models that generate music or other non-speech audio.
+#[derive(Clone, Debug, Deserialize, Serialize)]
+#[serde(deny_unknown_fields)]
+pub struct MusicModelConfig {
+    pub model: String,
+    pub models: Vec<ModelChoice>,
+    #[serde(default)]
+    pub extra: serde_json::Map<String, Value>,
+}
+
+impl Default for MusicModelConfig {
+    fn default() -> Self {
+        Self {
+            model: "google/lyria-3-clip-preview".into(),
+            models: Vec::new(),
+            extra: serde_json::Map::new(),
+        }
+    }
 }
 
 #[derive(Clone, Debug, Deserialize, Serialize)]
@@ -684,10 +707,17 @@ impl Config {
             &self.openrouter.image.models,
         )?;
         validate_model_choices(
-            "audio generation",
+            "speech generation",
             &self.openrouter.audio.model,
             &self.openrouter.audio.models,
         )?;
+        if !self.openrouter.music.models.is_empty() {
+            validate_model_choices(
+                "music generation",
+                &self.openrouter.music.model,
+                &self.openrouter.music.models,
+            )?;
+        }
         validate_model_choices(
             "transcription",
             &self.openrouter.transcription.model,
@@ -701,13 +731,16 @@ impl Config {
         if [
             self.openrouter.image.model.as_str(),
             self.openrouter.audio.model.as_str(),
+            self.openrouter.music.model.as_str(),
             self.openrouter.transcription.model.as_str(),
             self.openrouter.video.model.as_str(),
         ]
         .iter()
         .any(|v| v.is_empty())
         {
-            bail!("OpenRouter image, audio, transcription, and video models must be configured");
+            bail!(
+                "OpenRouter image, speech, music, transcription, and video models must be configured"
+            );
         }
         let mut model_ids = HashSet::new();
         for model in &self.openrouter.models {

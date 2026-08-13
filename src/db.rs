@@ -43,6 +43,8 @@ pub struct Capabilities {
     pub web_fetch: bool,
     pub image: bool,
     pub audio: bool,
+    #[serde(default = "enabled_by_default")]
+    pub music: bool,
     pub video: bool,
     #[serde(default = "enabled_by_default")]
     pub media: bool,
@@ -60,6 +62,7 @@ impl Default for Capabilities {
             web_fetch: true,
             image: true,
             audio: true,
+            music: true,
             video: true,
             media: true,
             transcription: true,
@@ -86,6 +89,8 @@ pub struct BotSettings {
     pub selected_image_generation_model: String,
     #[serde(default)]
     pub selected_audio_generation_model: String,
+    #[serde(default)]
+    pub selected_music_generation_model: String,
     #[serde(default)]
     pub selected_transcription_model: String,
     #[serde(default)]
@@ -175,6 +180,7 @@ impl Store {
                         .clone(),
                     selected_image_generation_model: config.openrouter.image.model.clone(),
                     selected_audio_generation_model: config.openrouter.audio.model.clone(),
+                    selected_music_generation_model: config.openrouter.music.model.clone(),
                     selected_transcription_model: config.openrouter.transcription.model.clone(),
                     selected_video_generation_model: config.openrouter.video.model.clone(),
                     model_routing: BTreeMap::new(),
@@ -215,6 +221,10 @@ impl Store {
             (
                 &mut settings.selected_audio_generation_model,
                 &config.openrouter.audio.model,
+            ),
+            (
+                &mut settings.selected_music_generation_model,
+                &config.openrouter.music.model,
             ),
             (
                 &mut settings.selected_transcription_model,
@@ -292,7 +302,10 @@ impl Store {
             "image_understanding" => settings.selected_image_understanding_model = model.into(),
             "video_understanding" => settings.selected_video_understanding_model = model.into(),
             "image_generation" => settings.selected_image_generation_model = model.into(),
-            "audio_generation" => settings.selected_audio_generation_model = model.into(),
+            "audio_generation" | "speech_generation" => {
+                settings.selected_audio_generation_model = model.into()
+            }
+            "music_generation" => settings.selected_music_generation_model = model.into(),
             "transcription" => settings.selected_transcription_model = model.into(),
             "video_generation" => settings.selected_video_generation_model = model.into(),
             _ => bail!("Unknown model capability: {capability}"),
@@ -332,6 +345,8 @@ impl Store {
             "web_fetch" => settings.capabilities.web_fetch = enabled,
             "image" => settings.capabilities.image = enabled,
             "audio" => settings.capabilities.audio = enabled,
+            "speech" => settings.capabilities.audio = enabled,
+            "music" => settings.capabilities.music = enabled,
             "video" => settings.capabilities.video = enabled,
             "media" => settings.capabilities.media = enabled,
             "transcription" => settings.capabilities.transcription = enabled,
@@ -380,6 +395,8 @@ impl Store {
             "web_fetch" => settings.capabilities.web_fetch,
             "image" => settings.capabilities.image,
             "audio" => settings.capabilities.audio,
+            "speech" => settings.capabilities.audio,
+            "music" => settings.capabilities.music,
             "video" => settings.capabilities.video,
             "media" => settings.capabilities.media,
             "transcription" => settings.capabilities.transcription,
@@ -641,6 +658,7 @@ mod tests {
                         selected_video_understanding_model: "video-vision".into(),
                         selected_image_generation_model: "image".into(),
                         selected_audio_generation_model: "speech".into(),
+                        selected_music_generation_model: "music".into(),
                         selected_transcription_model: "stt".into(),
                         selected_video_generation_model: "video".into(),
                         model_routing: BTreeMap::new(),

@@ -4,7 +4,10 @@ COPY Cargo.toml Cargo.lock ./
 COPY src ./src
 COPY defaults ./defaults
 COPY assets ./assets
-RUN cargo build --locked --release
+RUN cargo clean \
+    && cargo build --locked --release \
+    && cp target/release/teleforge /build/teleforge \
+    && cargo clean
 
 FROM debian:bookworm-slim
 # The Rust builder already contains the Mozilla CA bundle. Copy it instead of
@@ -13,7 +16,7 @@ FROM debian:bookworm-slim
 COPY --from=builder /etc/ssl/certs/ca-certificates.crt /etc/ssl/certs/ca-certificates.crt
 RUN useradd --system --uid 10001 --create-home teleforge
 WORKDIR /app
-COPY --from=builder /build/target/release/teleforge /usr/local/bin/teleforge
+COPY --from=builder /build/teleforge /usr/local/bin/teleforge
 COPY config.example.yaml /app/config.yaml
 RUN mkdir -p /app/data && chown -R teleforge:teleforge /app
 USER teleforge

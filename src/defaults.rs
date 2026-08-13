@@ -26,9 +26,14 @@ pub const BUILTIN_SKILLS: &[BuiltinSkill] = &[
         instructions: include_str!("../defaults/skills/image.md"),
     },
     BuiltinSkill {
-        id: "audio",
+        id: "speech",
         description: "Generate spoken audio through OpenRouter text-to-speech.",
-        instructions: include_str!("../defaults/skills/audio.md"),
+        instructions: include_str!("../defaults/skills/speech.md"),
+    },
+    BuiltinSkill {
+        id: "music",
+        description: "Generate music and other non-speech audio through OpenRouter.",
+        instructions: include_str!("../defaults/skills/music.md"),
     },
     BuiltinSkill {
         id: "video",

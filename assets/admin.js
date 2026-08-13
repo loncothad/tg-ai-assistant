@@ -26,7 +26,7 @@ const providerCache = new Map();
 const capabilityNames = {
   chat: 'General chat', model_upgrade: 'Advanced model', image_understanding: 'Image understanding', video_understanding: 'Video understanding',
   intent_planning: 'Intent processing', intent_planning_fallback: 'Intent processing fallback',
-  image_generation: 'Image generation', audio_generation: 'Speech generation', transcription: 'Transcription',
+  image_generation: 'Image generation', audio_generation: 'Speech generation', speech_generation: 'Speech generation', music_generation: 'Music generation', transcription: 'Transcription',
   video_generation: 'Video generation'
 };
 
@@ -53,7 +53,8 @@ const supports = (model, cap) => {
   if (cap === 'image_understanding') return input.includes('image') && output.includes('text');
   if (cap === 'video_understanding') return input.includes('video') && output.includes('text');
   if (cap === 'image_generation') return output.includes('image');
-  if (cap === 'audio_generation') return output.includes('speech');
+  if (cap === 'audio_generation' || cap === 'speech_generation') return output.includes('speech');
+  if (cap === 'music_generation') return output.includes('audio');
   if (cap === 'transcription') return output.includes('transcription');
   if (cap === 'video_generation') return output.includes('video');
   return false;
@@ -86,7 +87,7 @@ const price = value => {
 };
 const date = value => value ? new Date(value * 1000).toLocaleDateString() : 'Not published';
 const unitPrice = (key, value) => {
-  const mediaEndpoint = ['image_generation', 'audio_generation', 'transcription', 'video_generation'].includes(capability);
+  const mediaEndpoint = ['image_generation', 'audio_generation', 'speech_generation', 'music_generation', 'transcription', 'video_generation'].includes(capability);
   if (['prompt', 'completion'].includes(key) && mediaEndpoint) {
     const numeric = Number(value);
     if (numeric === 0) return `${key}: not billed on this field`;
@@ -107,7 +108,7 @@ const meaningfulTokenPrice = value => {
 const primaryRate = value => {
   if (value === undefined || value === null || value === '') return 'Not published';
   if (Number(value) === 0) return 'Not billed on this field';
-  if (['image_generation', 'audio_generation', 'transcription', 'video_generation'].includes(capability)) {
+  if (['image_generation', 'audio_generation', 'speech_generation', 'music_generation', 'transcription', 'video_generation'].includes(capability)) {
     return `$${Number(value).toLocaleString(undefined, { maximumFractionDigits: 6 })} / published unit`;
   }
   return meaningfulTokenPrice(value);

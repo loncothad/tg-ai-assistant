@@ -80,6 +80,8 @@ impl RequestPlan {
     pub fn direct_generation(&self) -> Option<PlannedAction> {
         match self.action {
             PlannedAction::GenerateImage
+            | PlannedAction::GenerateSpeech
+            | PlannedAction::GenerateMusic
             | PlannedAction::GenerateAudio
             | PlannedAction::GenerateVideo => Some(self.action),
             PlannedAction::Chat | PlannedAction::GenerateCode => {
@@ -88,7 +90,10 @@ impl RequestPlan {
                     .iter()
                     .filter_map(|skill| match skill {
                         PlannedSkill::ImageGeneration => Some(PlannedAction::GenerateImage),
-                        PlannedSkill::AudioGeneration => Some(PlannedAction::GenerateAudio),
+                        PlannedSkill::SpeechGeneration | PlannedSkill::AudioGeneration => {
+                            Some(PlannedAction::GenerateSpeech)
+                        }
+                        PlannedSkill::MusicGeneration => Some(PlannedAction::GenerateMusic),
                         PlannedSkill::VideoGeneration => Some(PlannedAction::GenerateVideo),
                         _ => None,
                     })
@@ -170,6 +175,9 @@ pub enum PlannedAction {
     Chat,
     GenerateCode,
     GenerateImage,
+    GenerateSpeech,
+    GenerateMusic,
+    /// Backward-compatible planner alias for speech generation.
     GenerateAudio,
     GenerateVideo,
     Refuse,
@@ -182,6 +190,9 @@ pub enum PlannedSkill {
     Search,
     WebFetch,
     ImageGeneration,
+    SpeechGeneration,
+    MusicGeneration,
+    /// Backward-compatible planner alias for speech generation.
     AudioGeneration,
     VideoGeneration,
     ImageUnderstanding,
@@ -198,6 +209,8 @@ impl PlannedSkill {
             Self::Search => "search",
             Self::WebFetch => "web_fetch",
             Self::ImageGeneration => "image_generation",
+            Self::SpeechGeneration => "speech_generation",
+            Self::MusicGeneration => "music_generation",
             Self::AudioGeneration => "audio_generation",
             Self::VideoGeneration => "video_generation",
             Self::ImageUnderstanding => "image_understanding",
@@ -253,6 +266,7 @@ pub struct ChatRequest<'a> {
 pub struct ToolModels<'a> {
     pub image_generation: ToolModel<'a>,
     pub audio_generation: ToolModel<'a>,
+    pub music_generation: ToolModel<'a>,
     pub transcription: ToolModel<'a>,
     pub video_generation: ToolModel<'a>,
 }
@@ -284,12 +298,12 @@ impl OpenRouter {
             "properties": {
                 "action": {
                     "type": "string",
-                    "enum": ["chat", "generate_code", "generate_image", "generate_audio", "generate_video", "refuse"],
-                    "description": "Use generate_code for source code, configuration, scripts, patches, or complete software artifacts. Use generate_image, generate_audio, or generate_video whenever the user explicitly asks to create that media artifact, in any language. Use chat for ordinary prose."
+                    "enum": ["chat", "generate_code", "generate_image", "generate_speech", "generate_music", "generate_audio", "generate_video", "refuse"],
+                    "description": "Use generate_speech for narration or text-to-speech, generate_music for songs or non-speech audio, and generate_audio only as a backward-compatible alias for generate_speech. Use generate_code for software artifacts and chat for ordinary prose."
                 },
                 "skills": {
                     "type": "array",
-                    "items": {"type":"string", "enum": ["generate_code", "search", "web_fetch", "image_generation", "audio_generation", "video_generation", "image_understanding", "video_understanding", "transcription", "file_delivery", "model_upgrade"]},
+                    "items": {"type":"string", "enum": ["generate_code", "search", "web_fetch", "image_generation", "speech_generation", "music_generation", "audio_generation", "video_generation", "image_understanding", "video_understanding", "transcription", "file_delivery", "model_upgrade"]},
                     "uniqueItems": true
                 },
                 "delivery": {
@@ -310,7 +324,7 @@ impl OpenRouter {
             "additionalProperties": false
         });
         let system = format!(
-            "You are a request classifier for a Telegram AI assistant. Return only the required schema. Enabled skills: {}. Attachments: image={}, video={}, audio={}. Classify the user's original text; never rewrite, expand, translate, improve, or execute it. Use generate_code for source code, configuration, scripts, patches, and complete software artifacts; it is handled by the normal assistant pipeline. An explicit request to draw, generate, create, synthesize, or make new image/audio/video media MUST use the corresponding generate_* action and generation skill, regardless of language. Describing or understanding existing media, transcribing, researching, opening URLs, answering, and transforming text use chat with suitable skills. Select model_upgrade only for a genuinely difficult request whose complexity, ambiguity, reasoning depth, or accuracy requirements materially benefit from the configured advanced model; do not select it for routine requests. Choose file for a complete source-code/configuration artifact when file_delivery is enabled, a requested downloadable artifact, or output expected to be unwieldy in chat; provide a safe filename and include file_delivery when enabled. Use inline for normal prose. Never select a disabled skill. Select refuse only when fulfilling the request itself is disallowed; do not refuse merely because a skill is unavailable. For refusal, write a concise localized explanation and safe alternative. The original user text is the sole downstream request and is not a field in your output.",
+            "You are a request classifier for a Telegram AI assistant. Return only the required schema. Enabled skills: {}. Attachments: image={}, video={}, audio={}. Classify the user's original text; never rewrite, expand, translate, improve, or execute it. Use generate_code for source code, configuration, scripts, patches, and complete software artifacts; it is handled by the normal assistant pipeline. Use generate_speech with speech_generation only for narration, spoken words, or text-to-speech. Use generate_music with music_generation for songs, instrumental music, loops, and non-speech generated audio. Treat generate_audio as a backward-compatible alias for generate_speech. An explicit request to create new image, speech, music, or video media MUST use its corresponding action and skill, regardless of language. Describing or understanding existing media, transcribing, researching, opening URLs, answering, and transforming text use chat with suitable skills. Select model_upgrade only for a genuinely difficult request whose complexity, ambiguity, reasoning depth, or accuracy requirements materially benefit from the configured advanced model; do not select it for routine requests. Choose file for a complete source-code/configuration artifact when file_delivery is enabled, a requested downloadable artifact, or output expected to be unwieldy in chat; provide a safe filename and include file_delivery when enabled. Use inline for normal prose. Never select a disabled skill. Select refuse only when fulfilling the request itself is disallowed; do not refuse merely because a skill is unavailable. For refusal, write a concise localized explanation and safe alternative. The original user text is the sole downstream request and is not a field in your output.",
             enabled.join(", "),
             request.has_image,
             request.has_video,
@@ -589,23 +603,50 @@ impl OpenRouter {
                             Err(error) => json!({"error":error.to_string()}).to_string(),
                         }
                     }
-                    "generate_audio" if capabilities.audio => {
+                    "generate_speech" | "generate_audio" if capabilities.audio => {
                         let input = arguments
                             .get("text")
                             .and_then(Value::as_str)
                             .unwrap_or(user_message);
                         report_generation_progress(
                             &progress,
-                            "audio",
+                            "speech",
                             tool_models.audio_generation.model,
                             input,
                         );
                         match self
-                            .generate_audio(
+                            .generate_speech(
                                 input,
                                 tool_models.audio_generation.model,
                                 tool_models.audio_generation.routing,
                                 tool_models.audio_generation.api_key,
+                            )
+                            .await
+                        {
+                            Ok(value) => {
+                                generated_audio.push(value);
+                                json!({"status":"completed","audio_files":1}).to_string()
+                            }
+                            Err(error) => json!({"error":error.to_string()}).to_string(),
+                        }
+                    }
+                    "generate_music" if capabilities.music => {
+                        let prompt = arguments
+                            .get("prompt")
+                            .and_then(Value::as_str)
+                            .unwrap_or(user_message);
+                        report_generation_progress(
+                            &progress,
+                            "music",
+                            tool_models.music_generation.model,
+                            prompt,
+                        );
+                        match self
+                            .generate_music(
+                                prompt,
+                                tool_models.music_generation.model,
+                                tool_models.music_generation.routing,
+                                tool_models.music_generation.api_key,
                             )
                             .await
                         {
@@ -867,7 +908,7 @@ impl OpenRouter {
         Ok(images)
     }
 
-    pub async fn generate_audio(
+    pub async fn generate_speech(
         &self,
         input: &str,
         model: &str,
@@ -944,6 +985,81 @@ impl OpenRouter {
             media_type,
             model: model.to_owned(),
             prompt: input.to_owned(),
+        })
+    }
+
+    /// Generates music or other non-speech audio through chat completions.
+    pub async fn generate_music(
+        &self,
+        prompt: &str,
+        model: &str,
+        routing: &ModelRouting,
+        api_key: &str,
+    ) -> Result<GeneratedImage> {
+        if routing.model_provider != ModelProvider::Openrouter {
+            bail!("Music generation currently requires OpenRouter");
+        }
+        self.generate_general_audio(prompt, model, routing, api_key)
+            .await
+    }
+
+    async fn generate_general_audio(
+        &self,
+        prompt: &str,
+        model: &str,
+        routing: &ModelRouting,
+        api_key: &str,
+    ) -> Result<GeneratedImage> {
+        let mut body = self.config.music.extra.clone();
+        if let Some(choice) = self
+            .config
+            .music
+            .models
+            .iter()
+            .find(|choice| choice.id == model)
+        {
+            body.extend(choice.extra.clone());
+        }
+        let routed_model = apply_routing(&mut body, model, routing, false);
+        body.insert("model".into(), json!(routed_model));
+        body.insert(
+            "messages".into(),
+            json!([{"role":"user", "content":prompt}]),
+        );
+        body.insert("modalities".into(), json!(["text", "audio"]));
+        body.insert("stream".into(), json!(true));
+        let response = self
+            .request(
+                self.client
+                    .post(format!(
+                        "{}/chat/completions",
+                        self.config.base_url.trim_end_matches('/')
+                    ))
+                    .json(&body),
+                api_key,
+            )
+            .send()
+            .await
+            .context("OpenRouter audio generation request failed")?;
+        let status = response.status();
+        let payload = response
+            .text()
+            .await
+            .context("Failed to read OpenRouter audio generation response")?;
+        if !status.is_success() {
+            bail!(
+                "OpenRouter audio generation returned {status}: {}",
+                payload.chars().take(2_000).collect::<String>()
+            );
+        }
+        let (encoded, media_type) = collect_streamed_audio(&payload)?;
+        Ok(GeneratedImage {
+            bytes: STANDARD
+                .decode(&encoded)
+                .context("OpenRouter returned invalid base64 audio")?,
+            media_type,
+            model: model.to_owned(),
+            prompt: prompt.to_owned(),
         })
     }
 
@@ -1364,9 +1480,16 @@ fn add_tools(body: &mut Map<String, Value>, capabilities: &Capabilities, context
     }
     if capabilities.audio {
         additions.push(function_tool(
-            "generate_audio",
+            "generate_speech",
             "Generate spoken audio and deliver it to Telegram.",
             "text",
+        ));
+    }
+    if capabilities.music {
+        additions.push(function_tool(
+            "generate_music",
+            "Generate music or other non-speech audio and deliver it to Telegram.",
+            "prompt",
         ));
     }
     if capabilities.video {
@@ -1424,6 +1547,58 @@ fn report_progress(progress: &Option<UnboundedSender<ProgressUpdate>>, status: &
     }
 }
 
+/// Collects base64 audio chunks from an OpenRouter SSE response.
+fn collect_streamed_audio(payload: &str) -> Result<(String, String)> {
+    let mut encoded = String::new();
+    let mut media_type = "audio/mpeg".to_owned();
+    let mut values = Vec::new();
+    for line in payload.lines() {
+        let Some(data) = line.trim().strip_prefix("data:") else {
+            continue;
+        };
+        let data = data.trim();
+        if data.is_empty() || data == "[DONE]" {
+            continue;
+        }
+        values.push(
+            serde_json::from_str::<Value>(data)
+                .wrap_err("OpenRouter returned malformed streamed audio JSON")?,
+        );
+    }
+    if values.is_empty() {
+        values.push(
+            serde_json::from_str::<Value>(payload)
+                .wrap_err("OpenRouter returned neither SSE nor valid audio JSON")?,
+        );
+    }
+    for value in values {
+        let audio = value
+            .pointer("/choices/0/delta/audio")
+            .or_else(|| value.pointer("/choices/0/message/audio"));
+        let Some(audio) = audio else { continue };
+        if let Some(format) = audio.get("format").and_then(Value::as_str) {
+            media_type = match format {
+                "mp3" | "mpeg" => "audio/mpeg".into(),
+                "wav" => "audio/wav".into(),
+                "opus" => "audio/ogg".into(),
+                other if other.starts_with("audio/") => other.to_owned(),
+                _ => media_type,
+            };
+        }
+        if let Some(chunk) = audio.get("data").and_then(Value::as_str) {
+            let chunk = chunk
+                .split_once(',')
+                .filter(|(prefix, _)| prefix.starts_with("data:"))
+                .map_or(chunk, |(_, data)| data);
+            encoded.push_str(chunk);
+        }
+    }
+    if encoded.is_empty() {
+        bail!("OpenRouter returned no generated audio data");
+    }
+    Ok((encoded, media_type))
+}
+
 fn report_generation_progress(
     progress: &Option<UnboundedSender<ProgressUpdate>>,
     kind: &'static str,
@@ -1441,7 +1616,10 @@ fn enabled_planner_skills(capabilities: &Capabilities) -> Vec<&'static str> {
         (capabilities.search, "search"),
         (capabilities.web_fetch, "web_fetch"),
         (capabilities.image, "image_generation"),
+        (capabilities.audio, "speech_generation"),
+        // Accept plans emitted by older configured planner models.
         (capabilities.audio, "audio_generation"),
+        (capabilities.music, "music_generation"),
         (capabilities.video, "video_generation"),
         (capabilities.media, "image_understanding"),
         (capabilities.media, "video_understanding"),
@@ -1457,7 +1635,8 @@ fn enabled_planner_skills(capabilities: &Capabilities) -> Vec<&'static str> {
 fn planned_action_enabled(action: PlannedAction, capabilities: &Capabilities) -> bool {
     match action {
         PlannedAction::GenerateImage => capabilities.image,
-        PlannedAction::GenerateAudio => capabilities.audio,
+        PlannedAction::GenerateSpeech | PlannedAction::GenerateAudio => capabilities.audio,
+        PlannedAction::GenerateMusic => capabilities.music,
         PlannedAction::GenerateVideo => capabilities.video,
         PlannedAction::Chat | PlannedAction::GenerateCode | PlannedAction::Refuse => true,
     }
@@ -1896,7 +2075,8 @@ mod tests {
                 .iter()
                 .any(|tool| tool["type"] == "openrouter:web_fetch")
         );
-        assert!(names.contains(&"generate_audio"));
+        assert!(names.contains(&"generate_speech"));
+        assert!(names.contains(&"generate_music"));
         assert!(names.contains(&"transcribe_audio"));
         assert!(!names.contains(&"generate_image"));
         assert!(!names.contains(&"generate_video"));
@@ -2047,6 +2227,19 @@ mod tests {
             "flux-alexis-en"
         );
         assert_eq!(select_speech_voice("custom", &[]), "custom");
+    }
+
+    #[test]
+    fn streamed_music_audio_is_collected_from_sse_chunks() {
+        let payload = concat!(
+            "data: {\"choices\":[{\"delta\":{\"audio\":{\"data\":\"SGVs\",\"format\":\"mp3\"}}}]}\n\n",
+            "data: {\"choices\":[{\"delta\":{\"audio\":{\"data\":\"bG8=\"}}}]}\n\n",
+            "data: [DONE]\n"
+        );
+        let (encoded, media_type) = collect_streamed_audio(payload).unwrap();
+        assert_eq!(encoded, "SGVsbG8=");
+        assert_eq!(media_type, "audio/mpeg");
+        assert_eq!(STANDARD.decode(encoded).unwrap(), b"Hello");
     }
 
     #[test]

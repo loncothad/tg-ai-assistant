@@ -9,11 +9,11 @@ Teleforge is a production-oriented, multi-bot Telegram AI assistant written in R
 - OpenRouter chat options including fallback model lists, provider routing, server tools, plugins, transforms, reasoning, structured responses, modalities, sampling controls, usage, and forward-compatible fields under `extra`.
 - AI Hub chat/tool calling and image generation through its OpenAI-compatible endpoints. Its authenticated `/v1/models` catalog and encrypted per-bot credential are independent from OpenRouter.
 - OpenRouter server-side Web Search and Web Fetch. Fetch is a separately toggleable built-in skill that can retrieve page and PDF text, with engine, usage/content limits, and domain policy configured in YAML.
-- Real model tools named `web_search`, `generate_image`, `generate_audio`, `generate_video`, and attachment-scoped `transcribe_audio`. The AI can invoke them during an ordinary conversation; the backend executes the selected API and delivers generated media to Telegram.
+- Real model tools named `web_search`, `generate_image`, `generate_speech`, `generate_music`, `generate_video`, and attachment-scoped `transcribe_audio`. The AI can invoke them during an ordinary conversation; the backend executes the selected API and delivers generated media to Telegram.
 - Continuous long polling dispatches every received update into an independent Tokio task without a per-bot semaphore or batch-completion barrier. A long video job therefore does not delay polling or later messages.
 - Live reply-linked Rich Messages are created before intent classification and retain the completed processing steps while assistant and media-generation requests run; generation steps disclose the exact effective prompt and model, and guest mode immediately creates and updates its pending inline result. A bounded OpenRouter structured-output classifier selects actions without producing or rewriting downstream prompts; explicit commands remain deterministic.
 - A toggleable `send_file` tool lets the model deliver source code, configuration, structured text, or an unwieldy answer as a named Telegram document. Answers above 8,000 characters automatically become `answer.md`, and substantial fenced code becomes a language-appropriate file even when the model forgets to call the tool.
-- Direct `/search`, `/image`, `/audio`, `/transcribe`, and `/video` commands. Every command also accepts the `-COMMAND` form (case-insensitive), including query and guest requests.
+- Direct `/search`, `/image`, `/speech`, `/music`, `/transcribe`, and `/video` commands. `/audio` remains an alias for `/speech`. Every command also accepts the `-COMMAND` form (case-insensitive), including query and guest requests.
 - An authenticated Telegram Mini App admin panel built with HTMX for model/provider selection, per-skill switches, API-key management, custom prompt/skill import, skill-bundle export/import, and user allowlisting. Its responsive blue interface uses a local fuzzy-search picker instead of rendering enormous model dropdowns.
 - Native Telegram Rich Message responses and rich guest-query results with CommonMark-to-Rich-Markdown normalization, Unicode-safe limits, block limits, and code-fence repair across chunks.
 - Bounded per-bot concurrency, timeouts, polling backoff, graceful shutdown, structured logs, and health endpoints.
@@ -79,7 +79,8 @@ Leave `openrouter.defaults.provider.require_parameters` set to `false` when usin
 | `-model [openrouter:\|aihub:]<model-id> <request>` | Use that model for one request (administrators only) |
 | `/search <query>` | Force live web search |
 | `/image <prompt>` | Generate and upload an image |
-| `/audio <text>` | Generate and upload spoken audio |
+| `/speech <text>` | Generate and upload spoken audio (`/audio` is an alias) |
+| `/music <prompt>` | Generate and upload music or other non-speech audio |
 | `/transcribe` | Transcribe attached or replied-to voice/audio |
 | `/video <prompt>` | Generate and send a video |
 | `/admin` | Open the Mini App (immutable administrators only) |

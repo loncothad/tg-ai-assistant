@@ -375,7 +375,8 @@ impl BotRunner {
             .or_else(|| plan.as_ref().and_then(RequestPlan::direct_generation))
         {
             Some(PlannedAction::GenerateImage) => Some("image"),
-            Some(PlannedAction::GenerateAudio) => Some("audio"),
+            Some(PlannedAction::GenerateSpeech | PlannedAction::GenerateAudio) => Some("speech"),
+            Some(PlannedAction::GenerateMusic) => Some("music"),
             Some(PlannedAction::GenerateVideo) => Some("video"),
             _ => None,
         };
@@ -502,7 +503,12 @@ impl BotRunner {
             .unwrap_or(&default_routing);
         let audio_routing = settings
             .model_routing
-            .get("audio_generation")
+            .get("speech_generation")
+            .or_else(|| settings.model_routing.get("audio_generation"))
+            .unwrap_or(&default_routing);
+        let music_routing = settings
+            .model_routing
+            .get("music_generation")
             .unwrap_or(&default_routing);
         let transcription_routing = settings
             .model_routing
@@ -518,6 +524,9 @@ impl BotRunner {
         let audio_key = self
             .optional_model_api_key(audio_routing.model_provider, capabilities.audio)
             .await?;
+        let music_key = self
+            .optional_model_api_key(music_routing.model_provider, capabilities.music)
+            .await?;
         let transcription_key = self
             .optional_model_api_key(
                 transcription_routing.model_provider,
@@ -529,12 +538,13 @@ impl BotRunner {
             .await?;
         capabilities.image &= !image_key.is_empty();
         capabilities.audio &= !audio_key.is_empty();
+        capabilities.music &= !music_key.is_empty();
         capabilities.transcription &= !transcription_key.is_empty();
         capabilities.video &= !video_key.is_empty();
         let author = caller_name(&message);
         let contextual_text = format!("{author}: {text}{}", media_summary(&media));
         let mut instructions = self.store.effective_instructions(&self.bot.id).await?;
-        instructions.push_str(&format!("\n\n# Current request context\nCurrent UTC date and time: {}\nBot: @{} (backend ID {})\nConversation mode: {:?}\nChat: {} (ID {})\nCaller: {} (ID {}, language {})\nTelegram message Unix time: {}\nEnabled capabilities and callable tools for this request: search={}, web_fetch={}, image_generation={}, audio_generation={}, video_generation={}, media_understanding={}, transcription={}, file_delivery={}, model_upgrade={}. If a capability is true, never claim it is disabled; call its tool when the user explicitly requests that operation. Preserve the user's exact request; do not substitute a planner-written prompt. Format non-trivial responses for Telegram Rich Messages with descriptive headings, bold key terms and labels, and sparing italics for qualifications.", chrono::Utc::now().to_rfc3339(), self.username, self.bot.id, mode, message.chat.title.as_deref().unwrap_or("Private or untitled chat"), message.chat.id, author, user_id, message.guest_bot_caller_user.as_ref().or(message.from.as_ref()).and_then(|u| u.language_code.as_deref()).unwrap_or("unknown"), message.date, capabilities.search, capabilities.web_fetch, capabilities.image, capabilities.audio, capabilities.video, capabilities.media, capabilities.transcription, capabilities.file, capabilities.model_upgrade));
+        instructions.push_str(&format!("\n\n# Current request context\nCurrent UTC date and time: {}\nBot: @{} (backend ID {})\nConversation mode: {:?}\nChat: {} (ID {})\nCaller: {} (ID {}, language {})\nTelegram message Unix time: {}\nEnabled capabilities and callable tools for this request: search={}, web_fetch={}, image_generation={}, speech_generation={}, music_generation={}, video_generation={}, media_understanding={}, transcription={}, file_delivery={}, model_upgrade={}. If a capability is true, never claim it is disabled; call its tool when the user explicitly requests that operation. Preserve the user's exact request; do not substitute a planner-written prompt. Format non-trivial responses for Telegram Rich Messages with descriptive headings, bold key terms and labels, and sparing italics for qualifications.", chrono::Utc::now().to_rfc3339(), self.username, self.bot.id, mode, message.chat.title.as_deref().unwrap_or("Private or untitled chat"), message.chat.id, author, user_id, message.guest_bot_caller_user.as_ref().or(message.from.as_ref()).and_then(|u| u.language_code.as_deref()).unwrap_or("unknown"), message.date, capabilities.search, capabilities.web_fetch, capabilities.image, capabilities.audio, capabilities.music, capabilities.video, capabilities.media, capabilities.transcription, capabilities.file, capabilities.model_upgrade));
         self.store
             .append_message(&self.bot.id, &scope, "user", &contextual_text)
             .await?;
@@ -570,6 +580,11 @@ impl BotRunner {
                         model: &settings.selected_audio_generation_model,
                         routing: audio_routing,
                         api_key: &audio_key,
+                    },
+                    music_generation: ToolModel {
+                        model: &settings.selected_music_generation_model,
+                        routing: music_routing,
+                        api_key: &music_key,
                     },
                     transcription: ToolModel {
                         model: &settings.selected_transcription_model,
@@ -749,7 +764,8 @@ impl BotRunner {
         }
         let actions = [
             ("image_generation", PlannedAction::GenerateImage),
-            ("audio_generation", PlannedAction::GenerateAudio),
+            ("speech_generation", PlannedAction::GenerateSpeech),
+            ("music_generation", PlannedAction::GenerateMusic),
             ("video_generation", PlannedAction::GenerateVideo),
         ]
         .into_iter()
@@ -772,9 +788,24 @@ impl BotRunner {
         options: CommandOptions<'_>,
     ) -> Result<()> {
         let CommandOptions {
-            model_override,
+            model_override: outer_model_override,
             guest_pending_id,
         } = options;
+        let mut arguments = arguments;
+        let inline_model_override = if outer_model_override.is_none()
+            && let Some((nested_command, nested_arguments)) = parse_command(arguments)
+            && nested_command == "model"
+        {
+            if !self.is_admin(user_id) {
+                bail!("Administrator access is required for per-message model overrides");
+            }
+            let (override_, prompt) = parse_model_override(nested_arguments)?;
+            arguments = prompt;
+            Some(override_)
+        } else {
+            None
+        };
+        let model_override = outer_model_override.or(inline_model_override.as_ref());
         match command {
             "start" | "help" => self.respond(message, mode, HELP, None).await?,
             "new" => {
@@ -1001,21 +1032,45 @@ impl BotRunner {
                     }
                 }
             }
-            "audio" => {
+            "audio" | "speech" | "music" => {
                 let settings = self.store.settings(&self.bot.id).await?;
-                if !settings.capabilities.audio {
-                    bail!("Audio generation is disabled by an administrator");
+                let is_music = command == "music";
+                if is_music && !settings.capabilities.music {
+                    bail!("Music generation is disabled by an administrator");
                 }
-                require_arguments(arguments, "/audio <text>")?;
+                if !is_music && !settings.capabilities.audio {
+                    bail!("Speech generation is disabled by an administrator");
+                }
+                require_arguments(
+                    arguments,
+                    if is_music {
+                        "/music <prompt>"
+                    } else {
+                        "/speech <text>"
+                    },
+                )?;
                 let generation_model = model_override.map_or(
-                    settings.selected_audio_generation_model.as_str(),
+                    if is_music {
+                        settings.selected_music_generation_model.as_str()
+                    } else {
+                        settings.selected_audio_generation_model.as_str()
+                    },
                     |override_| override_.model.as_str(),
                 );
                 let routing = model_override.map_or_else(
                     || {
                         settings
                             .model_routing
-                            .get("audio_generation")
+                            .get(if is_music {
+                                "music_generation"
+                            } else {
+                                "speech_generation"
+                            })
+                            .or_else(|| {
+                                (!is_music)
+                                    .then(|| settings.model_routing.get("audio_generation"))
+                                    .flatten()
+                            })
                             .cloned()
                             .unwrap_or_default()
                     },
@@ -1028,22 +1083,41 @@ impl BotRunner {
                     let inline_id = match guest_pending_id {
                         Some(id) => id.to_owned(),
                         None => {
-                            self.answer_guest_pending(message, "Generating the requested audio")
-                                .await?
+                            self.answer_guest_pending(
+                                message,
+                                if is_music {
+                                    "Generating the requested music"
+                                } else {
+                                    "Generating the requested speech"
+                                },
+                            )
+                            .await?
                         }
                     };
-                    let (progress, progress_task) =
-                        self.begin_guest_progress(&inline_id, "Parsed audio-generation request");
+                    let (progress, progress_task) = self.begin_guest_progress(
+                        &inline_id,
+                        if is_music {
+                            "Parsed music-generation request"
+                        } else {
+                            "Parsed speech-generation request"
+                        },
+                    );
                     let result = async {
                         let _ = progress.send(ProgressUpdate::generation(
-                            "audio",
+                            if is_music { "music" } else { "speech" },
                             generation_model,
                             arguments,
                         ));
                         let key = self.model_api_key(routing.model_provider).await?;
-                        self.openrouter
-                            .generate_audio(arguments, generation_model, &routing, &key)
-                            .await
+                        if is_music {
+                            self.openrouter
+                                .generate_music(arguments, generation_model, &routing, &key)
+                                .await
+                        } else {
+                            self.openrouter
+                                .generate_speech(arguments, generation_model, &routing, &key)
+                                .await
+                        }
                     }
                     .await;
                     drop(progress);
@@ -1072,7 +1146,14 @@ impl BotRunner {
                     return Ok(());
                 }
                 let (progress, progress_task) = self
-                    .begin_chat_progress(message, "Parsed audio-generation request")
+                    .begin_chat_progress(
+                        message,
+                        if is_music {
+                            "Parsed music-generation request"
+                        } else {
+                            "Parsed speech-generation request"
+                        },
+                    )
                     .await?;
                 self.send_action(
                     message.chat.id,
@@ -1082,18 +1163,31 @@ impl BotRunner {
                 .await;
                 let key = self.model_api_key(routing.model_provider).await?;
                 let _ = progress.send(ProgressUpdate::generation(
-                    "audio",
+                    if is_music { "music" } else { "speech" },
                     generation_model,
                     arguments,
                 ));
-                let result = self
-                    .openrouter
-                    .generate_audio(arguments, generation_model, &routing, &key)
-                    .await;
-                let _ = progress.send(ProgressUpdate::step(if result.is_ok() {
-                    "Speech generation completed"
+                let result = if is_music {
+                    self.openrouter
+                        .generate_music(arguments, generation_model, &routing, &key)
+                        .await
                 } else {
-                    "Speech generation failed"
+                    self.openrouter
+                        .generate_speech(arguments, generation_model, &routing, &key)
+                        .await
+                };
+                let _ = progress.send(ProgressUpdate::step(if result.is_ok() {
+                    if is_music {
+                        "Music generation completed"
+                    } else {
+                        "Speech generation completed"
+                    }
+                } else {
+                    if is_music {
+                        "Music generation failed"
+                    } else {
+                        "Speech generation failed"
+                    }
                 }));
                 drop(progress);
                 let _ = progress_task.await;
@@ -2563,7 +2657,8 @@ Ask me a question directly. I can use live web search when the selected model de
 - `/search <query>` — force a live web search
 - `/searchprovider` — show the active search provider
 - `/image <prompt>` — generate an image
-- `/audio <text>` — generate spoken audio
+- `/speech <text>` — generate spoken audio (`/audio` is an alias)
+- `/music <prompt>` — generate music or other non-speech audio
 - `/transcribe` — transcribe an attached/replied-to voice note or audio file
 - `/video <prompt>` — generate a video
 - `/admin` — open the admin panel (administrators only)
