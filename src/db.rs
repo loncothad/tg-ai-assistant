@@ -76,6 +76,10 @@ impl Default for Capabilities {
 pub struct BotSettings {
     pub selected_model: String,
     #[serde(default)]
+    pub selected_output_processing_model: String,
+    #[serde(default)]
+    pub selected_error_processing_model: String,
+    #[serde(default)]
     pub selected_planner_model: String,
     #[serde(default)]
     pub selected_planner_fallback_model: String,
@@ -159,6 +163,8 @@ impl Store {
                 &settings_key(&bot.id),
                 &BotSettings {
                     selected_model: bot.default_model.clone(),
+                    selected_output_processing_model: bot.default_model.clone(),
+                    selected_error_processing_model: bot.default_model.clone(),
                     selected_planner_model: config.openrouter.planner.model.clone(),
                     selected_planner_fallback_model: config
                         .openrouter
@@ -197,6 +203,14 @@ impl Store {
         let mut settings = self.settings(&bot.id).await?;
         let mut changed = false;
         for (value, fallback) in [
+            (
+                &mut settings.selected_output_processing_model,
+                &bot.default_model,
+            ),
+            (
+                &mut settings.selected_error_processing_model,
+                &bot.default_model,
+            ),
             (
                 &mut settings.selected_planner_model,
                 &config.openrouter.planner.model,
@@ -296,6 +310,8 @@ impl Store {
         let mut settings = self.settings(bot_id).await?;
         match capability {
             "chat" => settings.selected_model = model.into(),
+            "output_processing" => settings.selected_output_processing_model = model.into(),
+            "error_processing" => settings.selected_error_processing_model = model.into(),
             "intent_planning" => settings.selected_planner_model = model.into(),
             "intent_planning_fallback" => settings.selected_planner_fallback_model = model.into(),
             "model_upgrade" => settings.selected_upgrade_model = model.into(),
@@ -651,6 +667,8 @@ mod tests {
                     &settings_key(bot),
                     &BotSettings {
                         selected_model: "chat".into(),
+                        selected_output_processing_model: "output".into(),
+                        selected_error_processing_model: "errors".into(),
                         selected_planner_model: "planner".into(),
                         selected_planner_fallback_model: "planner-fallback".into(),
                         selected_upgrade_model: "advanced".into(),

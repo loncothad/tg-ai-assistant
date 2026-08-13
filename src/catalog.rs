@@ -50,7 +50,9 @@ impl CatalogModel {
         let input = |value: &str| self.input_modalities.iter().any(|item| item == value);
         let output = |value: &str| self.output_modalities.iter().any(|item| item == value);
         match capability {
-            "chat" | "model_upgrade" => input("text") && output("text"),
+            "chat" | "model_upgrade" | "output_processing" | "error_processing" => {
+                input("text") && output("text")
+            }
             "intent_planning" | "intent_planning_fallback" => {
                 input("text")
                     && output("text")

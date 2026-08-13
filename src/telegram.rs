@@ -40,8 +40,9 @@ use crate::{
     config::{BotConfig, Config, ModelProvider, SearchProvider},
     db::{ModelRouting, Store},
     openrouter::{
-        ChatRequest, GenerationPromptContext, MediaInput, OpenRouter, PlannedAction, PlannedSkill,
-        PlanningRequest, ProgressUpdate, RequestPlan, ToolModel, ToolModels,
+        ChatRequest, GenerationPromptContext, MediaInput, OpenRouter, OutputProcessingRequest,
+        PlannedAction, PlannedSkill, PlanningRequest, ProgressUpdate, RequestPlan, ToolModel,
+        ToolModels,
     },
     rich,
     search::SearchService,
@@ -297,8 +298,8 @@ impl BotRunner {
                 .await
             {
                 error!(bot_id = %self.bot.id, user_id, error = %format!("{error:#}"), "command failed");
-                self.respond(&message, mode, &rich::detailed_error(&error), None)
-                    .await?;
+                let detail = self.process_error_output(&message, &error).await;
+                self.respond(&message, mode, &detail, None).await?;
             }
             return Ok(());
         }
@@ -424,10 +425,10 @@ impl BotRunner {
             {
                 error!(bot_id = %self.bot.id, user_id, error = %format!("{error:#}"), "planned generation command failed");
                 if let Some(inline_id) = guest_pending_id.as_deref() {
-                    self.edit_guest_error(inline_id, &error).await;
+                    self.edit_guest_error(&message, inline_id, &error).await;
                 } else {
-                    self.respond(&message, mode, &rich::detailed_error(&error), None)
-                        .await?;
+                    let detail = self.process_error_output(&message, &error).await;
+                    self.respond(&message, mode, &detail, None).await?;
                 }
             }
             return Ok(());
@@ -649,7 +650,10 @@ impl BotRunner {
         drop(sender);
         let _ = progress_task.await;
         match result {
-            Ok(answer) => {
+            Ok(mut answer) => {
+                if !answer.text.trim().is_empty() {
+                    answer.text = self.process_text_output(&message, &answer.text).await;
+                }
                 self.store
                     .append_message(&self.bot.id, &scope, "assistant", &answer.text)
                     .await?;
@@ -686,7 +690,7 @@ impl BotRunner {
                     };
                     if let Err(error) = delivery {
                         error!(bot_id = %self.bot.id, user_id, error = %format!("{error:#}"), "guest result delivery failed");
-                        self.edit_guest_error(inline_id, &error).await;
+                        self.edit_guest_error(&message, inline_id, &error).await;
                     }
                     if let Some(id) = answer.generation_id {
                         self.store
@@ -757,10 +761,10 @@ impl BotRunner {
             Err(error) => {
                 error!(bot_id = %self.bot.id, user_id, error = %format!("{error:#}"), "assistant request failed");
                 if let Some(inline_id) = guest_pending_id.as_deref() {
-                    self.edit_guest_error(inline_id, &error).await;
+                    self.edit_guest_error(&message, inline_id, &error).await;
                 } else {
-                    self.respond(&message, mode, &rich::detailed_error(&error), None)
-                        .await?;
+                    let detail = self.process_error_output(&message, &error).await;
+                    self.respond(&message, mode, &detail, None).await?;
                 }
             }
         }
@@ -1012,11 +1016,12 @@ impl BotRunner {
                                 .await
                             {
                                 error!(bot_id = %self.bot.id, user_id, error = %format!("{error:#}"), "guest image delivery failed");
-                                self.edit_guest_error(&inline_id, &error).await;
+                                self.edit_guest_error(message, &inline_id, &error).await;
                             }
                         }
                         Ok(_) => {
                             self.edit_guest_error(
+                                message,
                                 &inline_id,
                                 &"OpenRouter returned no generated images",
                             )
@@ -1024,7 +1029,7 @@ impl BotRunner {
                         }
                         Err(error) => {
                             error!(bot_id = %self.bot.id, user_id, error = %format!("{error:#}"), "guest image generation failed");
-                            self.edit_guest_error(&inline_id, &error).await;
+                            self.edit_guest_error(message, &inline_id, &error).await;
                         }
                     }
                     return Ok(());
@@ -1082,8 +1087,8 @@ impl BotRunner {
                     }
                     Err(error) => {
                         error!(bot_id = %self.bot.id, user_id, error = %format!("{error:#}"), "image generation failed");
-                        self.respond(message, mode, &rich::detailed_error(&error), None)
-                            .await?;
+                        let detail = self.process_error_output(message, &error).await;
+                        self.respond(message, mode, &detail, None).await?;
                     }
                 }
             }
@@ -1209,12 +1214,12 @@ impl BotRunner {
                                 .await
                             {
                                 error!(bot_id = %self.bot.id, user_id, error = %format!("{error:#}"), "guest audio delivery failed");
-                                self.edit_guest_error(&inline_id, &error).await;
+                                self.edit_guest_error(message, &inline_id, &error).await;
                             }
                         }
                         Err(error) => {
                             error!(bot_id = %self.bot.id, user_id, error = %format!("{error:#}"), "guest audio generation failed");
-                            self.edit_guest_error(&inline_id, &error).await;
+                            self.edit_guest_error(message, &inline_id, &error).await;
                         }
                     }
                     return Ok(());
@@ -1298,8 +1303,8 @@ impl BotRunner {
                     }
                     Err(error) => {
                         error!(bot_id = %self.bot.id, user_id, error = %format!("{error:#}"), "audio generation failed");
-                        self.respond(message, mode, &rich::detailed_error(&error), None)
-                            .await?;
+                        let detail = self.process_error_output(message, &error).await;
+                        self.respond(message, mode, &detail, None).await?;
                     }
                 }
             }
@@ -1336,7 +1341,7 @@ impl BotRunner {
                         }
                         Err(error) => {
                             error!(bot_id = %self.bot.id, user_id, error = %format!("{error:#}"), "guest transcription failed");
-                            self.edit_guest_error(&inline_id, &error).await;
+                            self.edit_guest_error(message, &inline_id, &error).await;
                         }
                     }
                     return Ok(());
@@ -1412,12 +1417,12 @@ impl BotRunner {
                                 .await
                             {
                                 error!(bot_id = %self.bot.id, user_id, error = %format!("{error:#}"), "guest video delivery failed");
-                                self.edit_guest_error(&inline_id, &error).await;
+                                self.edit_guest_error(message, &inline_id, &error).await;
                             }
                         }
                         Err(error) => {
                             error!(bot_id = %self.bot.id, user_id, error = %format!("{error:#}"), "guest video generation failed");
-                            self.edit_guest_error(&inline_id, &error).await;
+                            self.edit_guest_error(message, &inline_id, &error).await;
                         }
                     }
                     return Ok(());
@@ -1469,8 +1474,8 @@ impl BotRunner {
                     }
                     Err(error) => {
                         error!(bot_id = %self.bot.id, user_id, error = %format!("{error:#}"), "video generation failed");
-                        self.respond(message, mode, &rich::detailed_error(&error), None)
-                            .await?;
+                        let detail = self.process_error_output(message, &error).await;
+                        self.respond(message, mode, &detail, None).await?;
                     }
                 }
             }
@@ -1607,6 +1612,94 @@ impl BotRunner {
             keyboard,
         )
         .await
+    }
+
+    async fn process_text_output(&self, message: &Message, text: &str) -> String {
+        self.run_output_processor(message, text, false)
+            .await
+            .unwrap_or_else(|error| {
+                warn!(bot_id = %self.bot.id, error = %format!("{error:#}"), "text output processor failed");
+                text.to_owned()
+            })
+    }
+
+    async fn process_error_output(
+        &self,
+        message: &Message,
+        error: &(dyn std::fmt::Display + Sync),
+    ) -> String {
+        let sanitized = rich::sanitized_error(error);
+        self.run_output_processor(message, &sanitized, true)
+            .await
+            .unwrap_or_else(|processor_error| {
+                warn!(bot_id = %self.bot.id, error = %format!("{processor_error:#}"), "error output processor failed");
+                rich::detailed_error(error)
+            })
+    }
+
+    async fn run_output_processor(
+        &self,
+        message: &Message,
+        content: &str,
+        error: bool,
+    ) -> Result<String> {
+        let settings = self.store.settings(&self.bot.id).await?;
+        let capability = if error {
+            "error_processing"
+        } else {
+            "output_processing"
+        };
+        let selected = if error {
+            &settings.selected_error_processing_model
+        } else {
+            &settings.selected_output_processing_model
+        };
+        let routing = settings
+            .model_routing
+            .get(capability)
+            .cloned()
+            .unwrap_or_default();
+        let model = match routing.model_provider {
+            ModelProvider::Openrouter => self.config.resolved_model(capability, selected),
+            ModelProvider::Aihub => self.config.resolved_aihub_model(selected),
+        };
+        let api_key = self.model_api_key(routing.model_provider).await?;
+        let original_request = message
+            .text
+            .as_deref()
+            .or(message.caption.as_deref())
+            .unwrap_or_default();
+        let language_hint = message
+            .guest_bot_caller_user
+            .as_ref()
+            .or(message.from.as_ref())
+            .and_then(|user| user.language_code.as_deref())
+            .unwrap_or("unknown");
+        if error {
+            self.openrouter
+                .process_error_output(OutputProcessingRequest {
+                    content,
+                    original_request,
+                    language_hint,
+                    model: &model,
+                    routing: &routing,
+                    provider: routing.model_provider,
+                    api_key: &api_key,
+                })
+                .await
+        } else {
+            self.openrouter
+                .process_text_output(OutputProcessingRequest {
+                    content,
+                    original_request,
+                    language_hint,
+                    model: &model,
+                    routing: &routing,
+                    provider: routing.model_provider,
+                    api_key: &api_key,
+                })
+                .await
+        }
     }
 
     async fn answer_guest_pending(&self, message: &Message, status: &str) -> Result<String> {
@@ -1877,10 +1970,11 @@ impl BotRunner {
 
     async fn edit_guest_error(
         &self,
+        message: &Message,
         inline_message_id: &str,
         error: &(dyn std::fmt::Display + Sync),
     ) {
-        let detail = rich::detailed_error(error);
+        let detail = self.process_error_output(message, error).await;
         let mut bounded = detail.chars().take(3_750).collect::<String>();
         if detail.chars().count() > 3_750 {
             bounded.push_str("\n…\n```");

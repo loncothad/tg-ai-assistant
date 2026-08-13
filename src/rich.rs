@@ -226,8 +226,15 @@ pub fn compact_error() -> &'static str {
 /// Formats a detailed provider error for users after removing fields that can
 /// identify users, bots, requests, credentials, or internal logging targets.
 pub fn detailed_error(error: &dyn std::fmt::Display) -> String {
-    let sanitized = sanitize_error_text(&format!("{error:#}")).replace("```", "` ` `");
+    let sanitized = sanitized_error(error).replace("```", "` ` `");
     format!("# Request failed\n\n```text\n{sanitized}\n```")
+}
+
+/// Returns a locally redacted diagnostic suitable for sending to a configured
+/// error-explanation model. Credentials and identifying structured fields are
+/// removed before the text leaves the backend.
+pub fn sanitized_error(error: &dyn std::fmt::Display) -> String {
+    sanitize_error_text(&format!("{error:#}"))
 }
 
 fn sanitize_error_text(input: &str) -> String {

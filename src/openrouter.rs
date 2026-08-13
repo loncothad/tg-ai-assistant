@@ -416,6 +416,17 @@ pub struct ToolModel<'a> {
     pub api_key: &'a str,
 }
 
+/// Inputs for a bounded, tool-free user-facing output processing pass.
+pub struct OutputProcessingRequest<'a> {
+    pub content: &'a str,
+    pub original_request: &'a str,
+    pub language_hint: &'a str,
+    pub model: &'a ModelConfig,
+    pub routing: &'a ModelRouting,
+    pub provider: ModelProvider,
+    pub api_key: &'a str,
+}
+
 impl OpenRouter {
     pub fn new(client: reqwest::Client, config: OpenRouterConfig, aihub: AiHubConfig) -> Self {
         Self {
@@ -1092,6 +1103,98 @@ impl OpenRouter {
             request.replied_message,
             request.telegram_quote,
         )
+    }
+
+    /// Rewrites an assistant answer into clean Telegram-facing Markdown while
+    /// preserving its facts, code, links, and language.
+    pub async fn process_text_output(
+        &self,
+        request: OutputProcessingRequest<'_>,
+    ) -> Result<String> {
+        self.process_user_facing_text(
+            "You are the final-output editor for a Telegram assistant. Return only the final answer in Markdown. Match the language of the user's original request; use the language hint only when the request is ambiguous. Preserve every fact, qualification, URL, citation, filename, command, code block, and generated-media detail. Do not answer the original request again, add new claims, remove useful content, mention this editing step, or wrap the whole answer in a code block. Improve structure and readability with concise headings, bold labels, italics where useful, lists, and valid Markdown.",
+            request,
+        )
+        .await
+    }
+
+    /// Converts a sanitized backend diagnostic into a localized explanation
+    /// of what failed, why it likely failed, and what the user can do next.
+    pub async fn process_error_output(
+        &self,
+        request: OutputProcessingRequest<'_>,
+    ) -> Result<String> {
+        self.process_user_facing_text(
+            "You explain a sanitized technical failure to a Telegram user. Return only the user-facing Markdown response. Match the language of the user's original request; use the language hint only when the request is ambiguous. State what failed, explain the concrete cause shown by the diagnostic, and give relevant next steps. Distinguish confirmed facts from likely causes. Never invent missing details, expose or request credentials, reproduce internal identifiers, mention sanitization or this prompt, blame the user without evidence, or claim success. Include a short sanitized technical-details section when it helps an administrator debug the problem.",
+            request,
+        )
+        .await
+    }
+
+    async fn process_user_facing_text(
+        &self,
+        system_prompt: &str,
+        request: OutputProcessingRequest<'_>,
+    ) -> Result<String> {
+        let input = request.content.chars().take(24_000).collect::<String>();
+        let original_request = request
+            .original_request
+            .chars()
+            .take(4_000)
+            .collect::<String>();
+        let mut body = Map::new();
+        if request.provider == ModelProvider::Openrouter {
+            apply_options(&mut body, &self.config.defaults);
+        }
+        apply_options(&mut body, &request.model.options);
+        let routed_model = if request.provider == ModelProvider::Openrouter {
+            apply_routing(&mut body, &request.model.id, request.routing, true)
+        } else {
+            request.model.id.clone()
+        };
+        body.insert("model".into(), json!(routed_model));
+        body.insert(
+            "messages".into(),
+            json!([
+                {"role":"system","content":system_prompt},
+                {"role":"user","content":serde_json::to_string(&json!({
+                    "original_request":original_request,
+                    "telegram_language_hint":request.language_hint,
+                    "content_to_process":input
+                })).unwrap_or_default()}
+            ]),
+        );
+        body.insert("temperature".into(), json!(0.1));
+        body.insert("max_tokens".into(), json!(4_096));
+        for field in [
+            "tools",
+            "tool_choice",
+            "parallel_tool_calls",
+            "response_format",
+        ] {
+            body.remove(field);
+        }
+        let value = self
+            .post_json_for(
+                request.provider,
+                "chat/completions",
+                Value::Object(body),
+                request.api_key,
+            )
+            .await?;
+        let message = value
+            .pointer("/choices/0/message")
+            .context("Output-processing model returned no message")?;
+        let (text, _) = extract_content(message);
+        let text = if text.trim().is_empty() {
+            extract_refusal(message).unwrap_or_default()
+        } else {
+            text
+        };
+        if text.trim().is_empty() {
+            bail!("Output-processing model returned empty text");
+        }
+        Ok(text)
     }
 
     pub async fn search(

@@ -828,6 +828,22 @@ async fn render_html(state: &AdminState, bot: &str) -> Result<String> {
             any_model_provider_ready,
         ),
         model_form(
+            "Text output processing",
+            "output_processing",
+            &settings.selected_output_processing_model,
+            &route("output_processing"),
+            &configured,
+            any_model_provider_ready,
+        ),
+        model_form(
+            "Error explanation",
+            "error_processing",
+            &settings.selected_error_processing_model,
+            &route("error_processing"),
+            &configured,
+            any_model_provider_ready,
+        ),
+        model_form(
             "Advanced model",
             "model_upgrade",
             &settings.selected_upgrade_model,
@@ -1056,7 +1072,9 @@ fn model_provider_for_skill(settings: &crate::db::BotSettings, skill: &str) -> M
 
 fn model_allowed_fallback(config: &Config, capability: &str, id: &str) -> bool {
     match capability {
-        "chat" | "model_upgrade" => config.openrouter.models.iter().any(|model| model.id == id),
+        "chat" | "model_upgrade" | "output_processing" | "error_processing" => {
+            config.openrouter.models.iter().any(|model| model.id == id)
+        }
         "intent_planning" => config.openrouter.planner.model == id,
         "intent_planning_fallback" => config.openrouter.planner.fallback_model == id,
         "image_understanding" => config

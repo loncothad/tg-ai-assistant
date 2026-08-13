@@ -825,7 +825,10 @@ impl Config {
     /// Resolves a runtime-selected chat-style model while retaining any curated
     /// per-model overrides for entries present in the deployment configuration.
     pub fn resolved_model(&self, capability: &str, id: &str) -> ModelConfig {
-        let configured = if matches!(capability, "chat" | "model_upgrade") {
+        let configured = if matches!(
+            capability,
+            "chat" | "model_upgrade" | "output_processing" | "error_processing"
+        ) {
             self.model(id)
         } else {
             self.understanding_model(capability, id)

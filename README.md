@@ -93,8 +93,10 @@ Conversation requests include the stored context plus current UTC time, Telegram
 
 Natural-language routing uses `openrouter.planner`, which defaults to the zero-cost
 `openrouter/free` router. It requests a strict JSON Schema and forces routing only to
-endpoints that advertise structured outputs. The plan contains one bounded action
-and an allowlisted skill list; it contains no replacement prompt or execution prose.
+endpoints that advertise structured outputs. The classifier contains one bounded action
+and an allowlisted skill list. A separate structured extraction pass selects only
+verbatim prompt excerpts from the current request, replied message, or Telegram quote;
+chat-model generation tool arguments are not trusted as replacement prompts.
 The backend intersects that list with admin-enabled capabilities. The same small-model prompt selects inline or
 file delivery and a safe filename; the backend enforces that choice when the main
 model does not call `send_file`. A structured refusal is returned directly in
@@ -116,6 +118,14 @@ Already-compatible headings, tables, task lists, footnotes, links, remote media,
 quotes, and fenced code remain intact. Long output is split below Telegram's 32,768
 character and 500-block limits, with open code fences closed and reopened so every
 chunk is independently parseable.
+
+The admin model panel also selects independent text-output and error-explanation
+models per bot. Normal assistant prose passes through the text-output model for
+localized, readable Markdown without changing facts, code, links, or citations.
+Errors are redacted locally before the error model sees them; that model explains
+what failed, why the diagnostic indicates it failed, and useful next steps in the
+request's language. If either post-processor is unavailable, Teleforge safely falls
+back to the original answer or the locally sanitized diagnostic.
 
 Photos, videos, video notes, voice notes, audio files, and matching Telegram documents can be supplied directly or by replying to the media message. Private Telegram media is size-checked and encoded only for the current provider request. Images and videos can guide image/video generation where the selected provider endpoint supports references. YouTube URLs are sent as video inputs, subject to the selected model/provider's video support.
 
