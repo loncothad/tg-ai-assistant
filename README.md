@@ -161,7 +161,7 @@ Only restore the redb archive if a rollback explicitly requires restoring state;
 the master encryption key together with the database backup or encrypted credentials
 cannot be decrypted.
 
-The container runs as an unprivileged user and persists `/app/data`. Terminate any old instance before moving a Telegram token because long polling must have one active consumer per token. Put an HTTPS reverse proxy in front of port 8080 and do not expose the redb file.
+The container runs as an unprivileged user and persists `/app/data`. Its Docker healthcheck is built into the binary, so the runtime image does not need `curl`; only CA certificates are installed for outbound HTTPS. Terminate any old instance before moving a Telegram token because long polling must have one active consumer per token. Put an HTTPS reverse proxy in front of port 8080 and do not expose the redb file.
 
 - Never commit real bot tokens, provider keys, the master key, or `config.yaml`.
 - Keep immutable admin IDs restrictive. Every admin mutation is re-authenticated server-side; credentials are never rendered back to the browser.

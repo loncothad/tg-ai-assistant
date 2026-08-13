@@ -34,11 +34,25 @@ static ALLOC: tikv_jemallocator::Jemalloc = tikv_jemallocator::Jemalloc;
 struct Args {
     #[arg(short, long, env = "TELEFORGE_CONFIG", default_value = "config.yaml")]
     config: PathBuf,
+    /// Probe the local readiness endpoint and exit without starting workers.
+    #[arg(long)]
+    healthcheck: bool,
 }
 
 #[tokio::main]
 async fn main() -> Result<()> {
     let args = Args::parse();
+    if args.healthcheck {
+        let response = reqwest::Client::new()
+            .get("http://127.0.0.1:8080/readyz")
+            .send()
+            .await
+            .context("Readiness probe failed")?;
+        if !response.status().is_success() {
+            bail!("Readiness probe returned {}", response.status());
+        }
+        return Ok(());
+    }
     let config = Arc::new(Config::load(&args.config)?);
     init_tracing(config.server.json_logs);
     let store = Store::connect(&config.database).await?;
