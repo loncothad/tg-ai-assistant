@@ -243,12 +243,17 @@ impl BotRunner {
             return Ok(());
         }
 
-        self.send_action(
-            message.chat.id,
-            message.message_thread_id,
-            ChatAction::Typing,
-        )
-        .await;
+        // Telegram does not support sendChatAction for guest-bot messages and
+        // answers those attempts with PEER_ID_INVALID. Guest replies still use
+        // answerGuestQuery through `respond` below.
+        if mode != MessageMode::Guest && message.guest_bot_caller_user.is_none() {
+            self.send_action(
+                message.chat.id,
+                message.message_thread_id,
+                ChatAction::Typing,
+            )
+            .await;
+        }
         let settings = self.store.settings(&self.bot.id).await?;
         let mut capabilities = settings.capabilities.clone();
         if mode == MessageMode::Guest {

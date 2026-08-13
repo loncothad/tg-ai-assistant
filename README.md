@@ -53,6 +53,8 @@ Each selection also has OpenRouter routing controls: Auto uses normal OpenRouter
 
 The YAML `defaults` and configured chat-model `options` expose the current OpenRouter request surface, including server `tools`, `tool_choice`, parallel tool calls, cache control, image configuration, reasoning, response formats, provider policy, plugins, routing/service tier, tracing, sampling, and an `extra` map for newly introduced fields. Model entries in YAML are defaults and optional per-model overrides; they do not restrict the live chooser. A dynamically selected model inherits `defaults`. Runtime routing is merged last so the administrator's selection is authoritative.
 
+Leave `openrouter.defaults.provider.require_parameters` set to `false` when using the live model chooser. If it is `true`, OpenRouter rejects every endpoint that does not advertise every optional request field (for example `parallel_tool_calls`), even when the selected model itself supports tool calls. The separate `data_collection` and `zdr` provider controls continue to enforce the configured privacy policy when `require_parameters` is disabled.
+
 | Command | Purpose |
 | --- | --- |
 | `/help`, `/start` | Show usage |

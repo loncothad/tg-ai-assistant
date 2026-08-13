@@ -65,7 +65,10 @@ openrouter:
         provider:
           allow_fallbacks: true
           data_collection: "deny"
-          require_parameters: true
+          # Keep this false when models are selected from the live catalog.
+          # OpenRouter can otherwise reject every endpoint when a model does
+          # not implement an optional default such as parallel_tool_calls.
+          require_parameters: false
         plugins: []
         transforms: []
         reasoning:
@@ -115,7 +118,9 @@ openrouter:
     models: []
     provider:
       allow_fallbacks: true
-      require_parameters: true
+      # OpenRouter's default. Set true only when every selected model/provider
+      # supports every optional request parameter configured below.
+      require_parameters: false
       data_collection: "deny"
       zdr: true
       # Also supported: order, only, ignore, quantizations, sort,
