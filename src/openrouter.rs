@@ -1,16 +1,20 @@
-//! OpenRouter chat/tool, image, speech, and asynchronous video clients.
+//! OpenRouter and AI Hub chat/tool and media API clients.
 
 use std::time::{Duration, Instant};
 
 use base64::{Engine, engine::general_purpose::STANDARD};
 use eyre::{Context, ContextCompat, bail};
+use serde::{Deserialize, Serialize};
 use serde_json::{Map, Value, json};
 use tokio::sync::mpsc::UnboundedSender;
 use tokio::time::sleep;
 
 use crate::{
     Result,
-    config::{ModelConfig, OpenRouterConfig, OpenRouterOptions, SearchProvider},
+    config::{
+        AiHubConfig, ModelConfig, ModelProvider, OpenRouterConfig, OpenRouterOptions,
+        SearchProvider,
+    },
     db::{Capabilities, ChatMessage, ModelRouting},
     search::SearchService,
 };
@@ -21,6 +25,7 @@ const MAX_TOOL_ROUNDS: usize = 6;
 pub struct OpenRouter {
     client: reqwest::Client,
     config: OpenRouterConfig,
+    aihub: AiHubConfig,
 }
 
 #[derive(Clone, Debug)]
@@ -48,6 +53,83 @@ pub struct GeneratedFile {
     pub bytes: Vec<u8>,
 }
 
+/// Schema-validated routing decision produced by the inexpensive planner.
+#[derive(Clone, Debug, Deserialize, Serialize, PartialEq, Eq)]
+pub struct RequestPlan {
+    pub action: PlannedAction,
+    pub instructions: String,
+    pub skills: Vec<PlannedSkill>,
+    pub refusal_message: String,
+}
+
+impl RequestPlan {
+    /// Returns bounded guidance for the main assistant model.
+    pub fn guidance(&self) -> String {
+        let skills = self
+            .skills
+            .iter()
+            .map(|skill| skill.as_str())
+            .collect::<Vec<_>>()
+            .join(", ");
+        format!(
+            "Request planner recommendation: use skills [{}]. Execution instructions: {}. This is routing guidance only; preserve the user's exact intent and use only enabled tools.",
+            skills,
+            self.instructions.trim()
+        )
+    }
+}
+
+#[derive(Clone, Copy, Debug, Deserialize, Serialize, PartialEq, Eq)]
+#[serde(rename_all = "snake_case")]
+pub enum PlannedAction {
+    Chat,
+    GenerateImage,
+    GenerateAudio,
+    GenerateVideo,
+    Refuse,
+}
+
+#[derive(Clone, Copy, Debug, Deserialize, Serialize, PartialEq, Eq)]
+#[serde(rename_all = "snake_case")]
+pub enum PlannedSkill {
+    Search,
+    WebFetch,
+    ImageGeneration,
+    AudioGeneration,
+    VideoGeneration,
+    ImageUnderstanding,
+    VideoUnderstanding,
+    Transcription,
+    FileDelivery,
+}
+
+impl PlannedSkill {
+    fn as_str(self) -> &'static str {
+        match self {
+            Self::Search => "search",
+            Self::WebFetch => "web_fetch",
+            Self::ImageGeneration => "image_generation",
+            Self::AudioGeneration => "audio_generation",
+            Self::VideoGeneration => "video_generation",
+            Self::ImageUnderstanding => "image_understanding",
+            Self::VideoUnderstanding => "video_understanding",
+            Self::Transcription => "transcription",
+            Self::FileDelivery => "file_delivery",
+        }
+    }
+}
+
+/// Minimal context passed to the planner; attachment bytes and secrets are never
+/// included in the classification request.
+pub struct PlanningRequest<'a> {
+    pub text: &'a str,
+    pub capabilities: &'a Capabilities,
+    pub has_image: bool,
+    pub has_video: bool,
+    pub has_audio: bool,
+    pub api_key: &'a str,
+}
+
 /// Private media downloaded from Telegram or a public video URL supplied by a user.
 #[derive(Clone, Debug)]
 pub enum MediaInput {
@@ -68,6 +150,7 @@ pub struct ChatRequest<'a> {
     pub search_provider: SearchProvider,
     pub search_api_key: Option<&'a str>,
     pub api_key: &'a str,
+    pub model_provider: ModelProvider,
     pub capabilities: &'a Capabilities,
     pub routing: &'a ModelRouting,
     pub tool_models: ToolModels<'a>,
@@ -76,19 +159,132 @@ pub struct ChatRequest<'a> {
 
 #[derive(Clone, Copy)]
 pub struct ToolModels<'a> {
-    pub image_generation: &'a str,
-    pub image_routing: &'a ModelRouting,
-    pub audio_generation: &'a str,
-    pub audio_routing: &'a ModelRouting,
-    pub transcription: &'a str,
-    pub transcription_routing: &'a ModelRouting,
-    pub video_generation: &'a str,
-    pub video_routing: &'a ModelRouting,
+    pub image_generation: ToolModel<'a>,
+    pub audio_generation: ToolModel<'a>,
+    pub transcription: ToolModel<'a>,
+    pub video_generation: ToolModel<'a>,
+}
+
+/// Provider-qualified model and credential used by a model-callable media tool.
+#[derive(Clone, Copy)]
+pub struct ToolModel<'a> {
+    pub model: &'a str,
+    pub routing: &'a ModelRouting,
+    pub api_key: &'a str,
 }
 
 impl OpenRouter {
-    pub fn new(client: reqwest::Client, config: OpenRouterConfig) -> Self {
-        Self { client, config }
+    pub fn new(client: reqwest::Client, config: OpenRouterConfig, aihub: AiHubConfig) -> Self {
+        Self {
+            client,
+            config,
+            aihub,
+        }
+    }
+
+    /// Classifies a natural-language request through OpenRouter Structured
+    /// Outputs. Callers should fall back to ordinary chat if this bounded call
+    /// fails, since planning is an optimization rather than a dependency.
+    pub async fn plan_request(&self, request: PlanningRequest<'_>) -> Result<RequestPlan> {
+        let enabled = enabled_planner_skills(request.capabilities);
+        let schema = json!({
+            "type": "object",
+            "properties": {
+                "action": {
+                    "type": "string",
+                    "enum": ["chat", "generate_image", "generate_audio", "generate_video", "refuse"],
+                    "description": "Direct generation only when the user explicitly requests a new artifact; otherwise chat."
+                },
+                "instructions": {
+                    "type": "string",
+                    "description": "A concise imperative execution plan that preserves the user's language and requirements."
+                },
+                "skills": {
+                    "type": "array",
+                    "items": {"type":"string", "enum": ["search", "web_fetch", "image_generation", "audio_generation", "video_generation", "image_understanding", "video_understanding", "transcription", "file_delivery"]},
+                    "uniqueItems": true
+                },
+                "refusal_message": {
+                    "type": "string",
+                    "description": "Empty unless action is refuse; then a concise, respectful response in the user's language."
+                }
+            },
+            "required": ["action", "instructions", "skills", "refusal_message"],
+            "additionalProperties": false
+        });
+        let system = format!(
+            "You are a request router for a Telegram AI assistant. Return only the required schema. Enabled skills: {}. Attachments: image={}, video={}, audio={}. Choose direct generation only for an explicit request to CREATE new image/audio/video content. Describing, editing, transcribing, researching, opening URLs, answering, and transforming text are chat actions with suitable skills. Never select a disabled skill. Select refuse only when fulfilling the request itself is disallowed; do not refuse merely because a skill is unavailable. For refusal, write a useful localized explanation and a safe alternative. Do not execute the request.",
+            enabled.join(", "),
+            request.has_image,
+            request.has_video,
+            request.has_audio
+        );
+        let body = json!({
+            "model": self.config.planner.model,
+            "messages": [
+                {"role":"system", "content":system},
+                {"role":"user", "content":request.text}
+            ],
+            "temperature": 0,
+            "max_tokens": self.config.planner.max_tokens,
+            "provider": {
+                "require_parameters": true,
+                "allow_fallbacks": true,
+                "data_collection": "allow",
+                "zdr": false
+            },
+            "response_format": {
+                "type": "json_schema",
+                "json_schema": {
+                    "name": "telegram_request_plan",
+                    "strict": true,
+                    "schema": schema
+                }
+            }
+        });
+        let value = tokio::time::timeout(
+            Duration::from_secs(self.config.planner.timeout_seconds),
+            self.post_json_for(
+                ModelProvider::Openrouter,
+                "chat/completions",
+                body,
+                request.api_key,
+            ),
+        )
+        .await
+        .wrap_err("OpenRouter request planner timed out")?
+        .wrap_err("OpenRouter request planner failed")?;
+        let message = value
+            .pointer("/choices/0/message")
+            .context("OpenRouter request planner returned no message")?;
+        if let Some(refusal) = extract_refusal(message) {
+            return Ok(RequestPlan {
+                action: PlannedAction::Refuse,
+                instructions: String::new(),
+                skills: Vec::new(),
+                refusal_message: refusal,
+            });
+        }
+        let content = message
+            .get("content")
+            .and_then(Value::as_str)
+            .context("OpenRouter request planner returned no structured content")?;
+        let mut plan: RequestPlan = serde_json::from_str(content)
+            .wrap_err("OpenRouter request planner returned invalid structured content")?;
+        plan.instructions.truncate(2_000);
+        plan.refusal_message.truncate(2_000);
+        plan.skills
+            .retain(|skill| enabled.contains(&skill.as_str()));
+        if !planned_action_enabled(plan.action, request.capabilities) {
+            plan.action = PlannedAction::Chat;
+            plan.refusal_message.clear();
+        }
+        if plan.action == PlannedAction::Refuse && plan.refusal_message.trim().is_empty() {
+            plan.refusal_message =
+                "I can’t help fulfill that request, but I can help with a safe alternative."
+                    .to_owned();
+        }
+        Ok(plan)
     }
 
     pub async fn chat(&self, request: ChatRequest<'_>) -> Result<AssistantResponse> {
@@ -103,61 +299,13 @@ impl OpenRouter {
             search_provider,
             search_api_key,
             api_key,
+            model_provider,
             capabilities,
             routing,
             tool_models,
             progress,
         } = request;
         report_progress(&progress, "Preparing conversation context");
-        if let Some(kind) = explicit_media_request(user_message, capabilities) {
-            return match kind {
-                "image" => {
-                    report_progress(&progress, "Generating the requested image");
-                    let images = self
-                        .generate_image_with_references(
-                            user_message,
-                            media,
-                            tool_models.image_generation,
-                            tool_models.image_routing,
-                            api_key,
-                        )
-                        .await?;
-                    Ok(AssistantResponse {
-                        text: "Done — I generated the requested image.".to_owned(),
-                        media_urls: Vec::new(),
-                        generation_id: None,
-                        usage: None,
-                        generated_images: images,
-                        generated_audio: Vec::new(),
-                        generated_videos: Vec::new(),
-                        generated_files: Vec::new(),
-                    })
-                }
-                "video" => {
-                    report_progress(&progress, "Generating the requested video");
-                    let video = self
-                        .generate_video_with_references(
-                            user_message,
-                            media,
-                            tool_models.video_generation,
-                            tool_models.video_routing,
-                            api_key,
-                        )
-                        .await?;
-                    Ok(AssistantResponse {
-                        text: "Done — I generated the requested video.".to_owned(),
-                        media_urls: Vec::new(),
-                        generation_id: None,
-                        usage: None,
-                        generated_images: Vec::new(),
-                        generated_audio: Vec::new(),
-                        generated_videos: vec![video],
-                        generated_files: Vec::new(),
-                    })
-                }
-                _ => unreachable!("explicit media kinds are closed"),
-            };
-        }
         let mut messages = vec![json!({ "role": "system", "content": system_prompt })];
         messages.extend(
             history
@@ -173,40 +321,65 @@ impl OpenRouter {
         for _ in 0..MAX_TOOL_ROUNDS {
             let mut body = Map::new();
             body.insert("messages".into(), Value::Array(messages.clone()));
-            body.insert("session_id".into(), json!(session_id));
-            apply_options(&mut body, &self.config.defaults);
+            if model_provider == ModelProvider::Openrouter {
+                body.insert("session_id".into(), json!(session_id));
+                apply_options(&mut body, &self.config.defaults);
+            }
             apply_options(&mut body, &model.options);
-            let routed_model = apply_routing(&mut body, &model.id, routing, true);
+            let routed_model = if model_provider == ModelProvider::Openrouter {
+                apply_routing(&mut body, &model.id, routing, true)
+            } else {
+                model.id.clone()
+            };
             body.insert("model".into(), Value::String(routed_model));
             add_tools(
                 &mut body,
                 capabilities,
-                search_provider,
-                search_api_key.is_some(),
-                &self.config.web_search,
-                &self.config.web_fetch,
-                media
-                    .iter()
-                    .any(|item| matches!(item, MediaInput::Audio { .. })),
+                ToolContext {
+                    search_provider,
+                    search_ready: search_api_key.is_some(),
+                    web_search: &self.config.web_search,
+                    web_fetch: &self.config.web_fetch,
+                    audio_attached: media
+                        .iter()
+                        .any(|item| matches!(item, MediaInput::Audio { .. })),
+                    openrouter_server_tools: model_provider == ModelProvider::Openrouter,
+                },
             );
             report_progress(&progress, "Waiting for the selected AI model");
 
             let value = self
-                .post_json("chat/completions", Value::Object(body), api_key)
+                .post_json_for(
+                    model_provider,
+                    "chat/completions",
+                    Value::Object(body),
+                    api_key,
+                )
                 .await?;
             let message = value
                 .pointer("/choices/0/message")
                 .cloned()
-                .context("OpenRouter returned no assistant message")?;
+                .wrap_err_with(|| {
+                    format!(
+                        "{} returned no assistant message",
+                        provider_name(model_provider)
+                    )
+                })?;
             let calls = message
                 .get("tool_calls")
                 .and_then(Value::as_array)
                 .cloned()
                 .unwrap_or_default();
             if calls.is_empty() {
-                let (text, media_urls) = extract_content(&message);
+                let (mut text, media_urls) = extract_content(&message);
+                if text.is_empty() {
+                    text = extract_refusal(&message).unwrap_or_default();
+                }
                 if text.is_empty() && media_urls.is_empty() {
-                    bail!("OpenRouter returned an empty response");
+                    bail!(
+                        "{} returned an empty response",
+                        provider_name(model_provider)
+                    );
                 }
                 let text = if text.chars().count() > 12_000 && capabilities.file {
                     generated_files.push(GeneratedFile {
@@ -248,9 +421,41 @@ impl OpenRouter {
                             .get("query")
                             .and_then(Value::as_str)
                             .unwrap_or(user_message);
-                        search
-                            .tool_output(search_provider, query, search_api_key.unwrap_or_default())
-                            .await
+                        if search_provider == SearchProvider::Openrouter {
+                            match self
+                                .config
+                                .models
+                                .first()
+                                .context("OpenRouter search has no configured model")
+                            {
+                                Ok(search_model) => match self
+                                    .search(
+                                        query,
+                                        search_model,
+                                        &ModelRouting::default(),
+                                        search_api_key.unwrap_or_default(),
+                                    )
+                                    .await
+                                {
+                                    Ok(answer) => json!({
+                                        "query": query,
+                                        "provider": "openrouter",
+                                        "answer": answer
+                                    })
+                                    .to_string(),
+                                    Err(error) => json!({"error": error.to_string()}).to_string(),
+                                },
+                                Err(error) => json!({"error": error.to_string()}).to_string(),
+                            }
+                        } else {
+                            search
+                                .tool_output(
+                                    search_provider,
+                                    query,
+                                    search_api_key.unwrap_or_default(),
+                                )
+                                .await
+                        }
                     }
                     "generate_image" if capabilities.image => {
                         report_progress(&progress, "Generating the image");
@@ -262,9 +467,9 @@ impl OpenRouter {
                             .generate_image_with_references(
                                 prompt,
                                 media,
-                                tool_models.image_generation,
-                                tool_models.image_routing,
-                                api_key,
+                                tool_models.image_generation.model,
+                                tool_models.image_generation.routing,
+                                tool_models.image_generation.api_key,
                             )
                             .await
                         {
@@ -285,9 +490,9 @@ impl OpenRouter {
                         match self
                             .generate_audio(
                                 input,
-                                tool_models.audio_generation,
-                                tool_models.audio_routing,
-                                api_key,
+                                tool_models.audio_generation.model,
+                                tool_models.audio_generation.routing,
+                                tool_models.audio_generation.api_key,
                             )
                             .await
                         {
@@ -308,9 +513,9 @@ impl OpenRouter {
                             .generate_video_with_references(
                                 prompt,
                                 media,
-                                tool_models.video_generation,
-                                tool_models.video_routing,
-                                api_key,
+                                tool_models.video_generation.model,
+                                tool_models.video_generation.routing,
+                                tool_models.video_generation.api_key,
                             )
                             .await
                         {
@@ -332,9 +537,9 @@ impl OpenRouter {
                                         data,
                                         format,
                                         language,
-                                        tool_models.transcription,
-                                        tool_models.transcription_routing,
-                                        api_key,
+                                        tool_models.transcription.model,
+                                        tool_models.transcription.routing,
+                                        tool_models.transcription.api_key,
                                     )
                                     .await
                                 {
@@ -372,7 +577,10 @@ impl OpenRouter {
                     .push(json!({ "role": "tool", "tool_call_id": call_id, "content": output }));
             }
         }
-        bail!("OpenRouter exceeded the maximum tool-call rounds")
+        bail!(
+            "{} exceeded the maximum tool-call rounds",
+            provider_name(model_provider)
+        )
     }
 
     pub async fn search(
@@ -430,7 +638,7 @@ impl OpenRouter {
         routing: &ModelRouting,
         api_key: &str,
     ) -> Result<Vec<GeneratedImage>> {
-        if self.config.image.model.is_empty() {
+        if model.is_empty() {
             bail!("Image generation model is not configured");
         }
         let mut body = self.config.image.extra.clone();
@@ -446,7 +654,11 @@ impl OpenRouter {
         {
             body.extend(choice.extra.clone());
         }
-        let routed_model = apply_routing(&mut body, model, routing, false);
+        let routed_model = if routing.model_provider == ModelProvider::Openrouter {
+            apply_routing(&mut body, model, routing, false)
+        } else {
+            model.to_owned()
+        };
         body.insert("model".into(), json!(routed_model));
         body.insert("prompt".into(), json!(prompt));
         let references = media
@@ -457,10 +669,25 @@ impl OpenRouter {
             })
             .collect::<Vec<_>>();
         if !references.is_empty() {
+            if routing.model_provider == ModelProvider::Aihub {
+                bail!(
+                    "AI Hub image generation does not support reference media through the OpenAI generations endpoint"
+                );
+            }
             body.insert("input_references".into(), Value::Array(references));
         }
+        let endpoint = if routing.model_provider == ModelProvider::Aihub {
+            "images/generations"
+        } else {
+            "images"
+        };
         let value = self
-            .post_json("images", Value::Object(body), api_key)
+            .post_json_for(
+                routing.model_provider,
+                endpoint,
+                Value::Object(body),
+                api_key,
+            )
             .await?;
         let mut images = Vec::new();
         for item in value
@@ -479,6 +706,32 @@ impl OpenRouter {
                         .and_then(Value::as_str)
                         .unwrap_or("image/png")
                         .to_owned(),
+                });
+            } else if let Some(url) = item.get("url").and_then(Value::as_str) {
+                let response = self
+                    .client
+                    .get(url)
+                    .timeout(Duration::from_secs(60))
+                    .send()
+                    .await
+                    .context("Failed to download generated image")?;
+                let status = response.status();
+                let media_type = response
+                    .headers()
+                    .get(reqwest::header::CONTENT_TYPE)
+                    .and_then(|value| value.to_str().ok())
+                    .unwrap_or("image/png")
+                    .to_owned();
+                if !status.is_success() {
+                    bail!("Generated image download returned {status}");
+                }
+                images.push(GeneratedImage {
+                    bytes: response
+                        .bytes()
+                        .await
+                        .context("Failed to read generated image")?
+                        .to_vec(),
+                    media_type,
                 });
             }
         }
@@ -511,15 +764,20 @@ impl OpenRouter {
         {
             body.extend(choice.extra.clone());
         }
-        let routed_model = apply_routing(&mut body, model, routing, false);
+        let routed_model = if routing.model_provider == ModelProvider::Openrouter {
+            apply_routing(&mut body, model, routing, false)
+        } else {
+            model.to_owned()
+        };
         body.insert("model".into(), json!(routed_model));
         body.insert("input".into(), json!(input));
         let response = self
-            .request(
+            .request_for(
+                routing.model_provider,
                 self.client
                     .post(format!(
                         "{}/audio/speech",
-                        self.config.base_url.trim_end_matches('/')
+                        self.base_url(routing.model_provider)
                     ))
                     .json(&body),
                 api_key,
@@ -575,18 +833,27 @@ impl OpenRouter {
         {
             body.extend(choice.extra.clone());
         }
-        let routed_model = apply_routing(&mut body, model, routing, false);
+        let routed_model = if routing.model_provider == ModelProvider::Openrouter {
+            apply_routing(&mut body, model, routing, false)
+        } else {
+            model.to_owned()
+        };
         body.insert("model".into(), json!(routed_model));
         body.insert(
             "input_audio".into(),
             json!({"data": data, "format": format}),
         );
-        self.post_json("audio/transcriptions", Value::Object(body), api_key)
-            .await?
-            .get("text")
-            .and_then(Value::as_str)
-            .map(str::to_owned)
-            .context("OpenRouter transcription returned no text")
+        self.post_json_for(
+            routing.model_provider,
+            "audio/transcriptions",
+            Value::Object(body),
+            api_key,
+        )
+        .await?
+        .get("text")
+        .and_then(Value::as_str)
+        .map(str::to_owned)
+        .context("OpenRouter transcription returned no text")
     }
 
     pub async fn generate_video(&self, prompt: &str, api_key: &str) -> Result<String> {
@@ -608,7 +875,10 @@ impl OpenRouter {
         routing: &ModelRouting,
         api_key: &str,
     ) -> Result<String> {
-        if self.config.video.model.is_empty() {
+        if routing.model_provider != ModelProvider::Openrouter {
+            bail!("AI Hub does not expose an OpenAI-compatible video generation endpoint");
+        }
+        if model.is_empty() {
             bail!("Video generation model is not configured");
         }
         let mut body = self.config.video.extra.clone();
@@ -690,21 +960,29 @@ impl OpenRouter {
     }
 
     async fn post_json(&self, endpoint: &str, body: Value, api_key: &str) -> Result<Value> {
+        self.post_json_for(ModelProvider::Openrouter, endpoint, body, api_key)
+            .await
+    }
+
+    async fn post_json_for(
+        &self,
+        model_provider: ModelProvider,
+        endpoint: &str,
+        body: Value,
+        api_key: &str,
+    ) -> Result<Value> {
         let response = self
-            .request(
+            .request_for(
+                model_provider,
                 self.client
-                    .post(format!(
-                        "{}/{}",
-                        self.config.base_url.trim_end_matches('/'),
-                        endpoint
-                    ))
+                    .post(format!("{}/{}", self.base_url(model_provider), endpoint))
                     .json(&body),
                 api_key,
             )
             .send()
             .await
-            .context("OpenRouter request failed")?;
-        checked_json(response).await
+            .wrap_err_with(|| format!("{} request failed", provider_name(model_provider)))?;
+        checked_json(response, provider_name(model_provider)).await
     }
 
     async fn get_json(&self, endpoint: &str, api_key: &str) -> Result<Value> {
@@ -720,10 +998,22 @@ impl OpenRouter {
             .send()
             .await
             .context("OpenRouter request failed")?;
-        checked_json(response).await
+        checked_json(response, "OpenRouter").await
     }
 
     fn request(&self, builder: reqwest::RequestBuilder, api_key: &str) -> reqwest::RequestBuilder {
+        self.request_for(ModelProvider::Openrouter, builder, api_key)
+    }
+
+    fn request_for(
+        &self,
+        model_provider: ModelProvider,
+        builder: reqwest::RequestBuilder,
+        api_key: &str,
+    ) -> reqwest::RequestBuilder {
+        if model_provider == ModelProvider::Aihub {
+            return builder.bearer_auth(api_key);
+        }
         let builder = builder
             .bearer_auth(api_key)
             .header("X-OpenRouter-Title", &self.config.app_name)
@@ -732,6 +1022,20 @@ impl OpenRouter {
             Some(site) => builder.header("HTTP-Referer", site),
             None => builder,
         }
+    }
+
+    fn base_url(&self, model_provider: ModelProvider) -> &str {
+        match model_provider {
+            ModelProvider::Openrouter => self.config.base_url.trim_end_matches('/'),
+            ModelProvider::Aihub => self.aihub.base_url.trim_end_matches('/'),
+        }
+    }
+}
+
+fn provider_name(model_provider: ModelProvider) -> &'static str {
+    match model_provider {
+        ModelProvider::Openrouter => "OpenRouter",
+        ModelProvider::Aihub => "AI Hub",
     }
 }
 
@@ -826,19 +1130,21 @@ fn apply_routing(
     }
 }
 
-fn add_tools(
-    body: &mut Map<String, Value>,
-    capabilities: &Capabilities,
+struct ToolContext<'a> {
     search_provider: SearchProvider,
     search_ready: bool,
-    web_search: &crate::config::OpenRouterWebSearchConfig,
-    web_fetch: &crate::config::OpenRouterWebFetchConfig,
+    web_search: &'a crate::config::OpenRouterWebSearchConfig,
+    web_fetch: &'a crate::config::OpenRouterWebFetchConfig,
     audio_attached: bool,
-) {
+    openrouter_server_tools: bool,
+}
+
+fn add_tools(body: &mut Map<String, Value>, capabilities: &Capabilities, context: ToolContext<'_>) {
     let mut additions = Vec::new();
-    if capabilities.search && search_ready {
-        if search_provider == SearchProvider::Openrouter {
-            additions.push(openrouter_web_search_tool(web_search));
+    if capabilities.search && context.search_ready {
+        if context.search_provider == SearchProvider::Openrouter && context.openrouter_server_tools
+        {
+            additions.push(openrouter_web_search_tool(context.web_search));
         } else {
             additions.push(json!({
                 "type": "function",
@@ -854,8 +1160,8 @@ fn add_tools(
             }));
         }
     }
-    if capabilities.web_fetch {
-        additions.push(openrouter_web_fetch_tool(web_fetch));
+    if capabilities.web_fetch && context.openrouter_server_tools {
+        additions.push(openrouter_web_fetch_tool(context.web_fetch));
     }
     if capabilities.image {
         additions.push(function_tool(
@@ -878,7 +1184,7 @@ fn add_tools(
             "prompt",
         ));
     }
-    if capabilities.transcription && audio_attached {
+    if capabilities.transcription && context.audio_attached {
         additions.push(json!({
             "type":"function",
             "function": {
@@ -926,35 +1232,29 @@ fn report_progress(progress: &Option<UnboundedSender<String>>, status: &str) {
     }
 }
 
-fn explicit_media_request(message: &str, capabilities: &Capabilities) -> Option<&'static str> {
-    let message = message.to_lowercase();
-    if capabilities.image
-        && [
-            "generate an image",
-            "generate image",
-            "create an image",
-            "create image",
-            "draw ",
-            "сгенер",
-        ]
-        .iter()
-        .any(|needle| message.contains(needle))
-        && ["image", "picture", "photo", "картин", "изображ", "фото"]
-            .iter()
-            .any(|needle| message.contains(needle))
-    {
-        Some("image")
-    } else if capabilities.video
-        && ["generate video", "create video", "сгенер"]
-            .iter()
-            .any(|needle| message.contains(needle))
-        && ["video", "видео", "ролик"]
-            .iter()
-            .any(|needle| message.contains(needle))
-    {
-        Some("video")
-    } else {
-        None
+fn enabled_planner_skills(capabilities: &Capabilities) -> Vec<&'static str> {
+    [
+        (capabilities.search, "search"),
+        (capabilities.web_fetch, "web_fetch"),
+        (capabilities.image, "image_generation"),
+        (capabilities.audio, "audio_generation"),
+        (capabilities.video, "video_generation"),
+        (capabilities.media, "image_understanding"),
+        (capabilities.media, "video_understanding"),
+        (capabilities.transcription, "transcription"),
+        (capabilities.file, "file_delivery"),
+    ]
+    .into_iter()
+    .filter_map(|(enabled, name)| enabled.then_some(name))
+    .collect()
+}
+
+fn planned_action_enabled(action: PlannedAction, capabilities: &Capabilities) -> bool {
+    match action {
+        PlannedAction::GenerateImage => capabilities.image,
+        PlannedAction::GenerateAudio => capabilities.audio,
+        PlannedAction::GenerateVideo => capabilities.video,
+        PlannedAction::Chat | PlannedAction::Refuse => true,
     }
 }
 
@@ -1128,19 +1428,41 @@ fn extract_content(message: &Value) -> (String, Vec<String>) {
     (text, urls)
 }
 
-async fn checked_json(response: reqwest::Response) -> Result<Value> {
+fn extract_refusal(message: &Value) -> Option<String> {
+    message
+        .get("refusal")
+        .and_then(Value::as_str)
+        .map(str::trim)
+        .filter(|value| !value.is_empty())
+        .map(str::to_owned)
+        .or_else(|| {
+            message
+                .get("content")
+                .and_then(Value::as_array)
+                .into_iter()
+                .flatten()
+                .find(|part| part.get("type").and_then(Value::as_str) == Some("refusal"))
+                .and_then(|part| part.get("refusal").or_else(|| part.get("text")))
+                .and_then(Value::as_str)
+                .map(str::trim)
+                .filter(|value| !value.is_empty())
+                .map(str::to_owned)
+        })
+}
+
+async fn checked_json(response: reqwest::Response, provider: &str) -> Result<Value> {
     let status = response.status();
     let bytes = response
         .bytes()
         .await
-        .context("Failed to read OpenRouter response")?;
+        .wrap_err_with(|| format!("Failed to read {provider} response"))?;
     if !status.is_success() {
         bail!(
-            "OpenRouter returned {status}: {}",
+            "{provider} returned {status}: {}",
             String::from_utf8_lossy(&bytes[..bytes.len().min(2000)])
         );
     }
-    serde_json::from_slice(&bytes).context("OpenRouter returned invalid JSON")
+    serde_json::from_slice(&bytes).wrap_err_with(|| format!("{provider} returned invalid JSON"))
 }
 
 #[cfg(test)]
@@ -1177,11 +1499,14 @@ mod tests {
         add_tools(
             &mut body,
             &capabilities,
-            SearchProvider::Brave,
-            true,
-            &crate::config::OpenRouterWebSearchConfig::default(),
-            &crate::config::OpenRouterWebFetchConfig::default(),
-            true,
+            ToolContext {
+                search_provider: SearchProvider::Brave,
+                search_ready: true,
+                web_search: &crate::config::OpenRouterWebSearchConfig::default(),
+                web_fetch: &crate::config::OpenRouterWebFetchConfig::default(),
+                audio_attached: true,
+                openrouter_server_tools: true,
+            },
         );
         let names = body["tools"]
             .as_array()
@@ -1204,6 +1529,28 @@ mod tests {
     }
 
     #[test]
+    fn non_openrouter_chat_omits_openrouter_server_tools() {
+        let mut body = Map::new();
+        add_tools(
+            &mut body,
+            &Capabilities::default(),
+            ToolContext {
+                search_provider: SearchProvider::Openrouter,
+                search_ready: true,
+                web_search: &crate::config::OpenRouterWebSearchConfig::default(),
+                web_fetch: &crate::config::OpenRouterWebFetchConfig::default(),
+                audio_attached: false,
+                openrouter_server_tools: false,
+            },
+        );
+        assert!(body["tools"].as_array().unwrap().iter().all(|tool| {
+            !tool["type"]
+                .as_str()
+                .is_some_and(|kind| kind.starts_with("openrouter:"))
+        }));
+    }
+
+    #[test]
     fn private_media_uses_multimodal_content() {
         let content = user_content(
             "Describe this",
@@ -1217,19 +1564,25 @@ mod tests {
     }
 
     #[test]
-    fn explicit_image_requests_are_detected_in_english_and_russian() {
-        let capabilities = Capabilities::default();
+    fn planner_actions_are_bounded_by_admin_capabilities() {
+        let capabilities = Capabilities {
+            image: false,
+            ..Default::default()
+        };
+        assert!(!planned_action_enabled(
+            PlannedAction::GenerateImage,
+            &capabilities
+        ));
+        assert!(planned_action_enabled(PlannedAction::Chat, &capabilities));
+        assert!(!enabled_planner_skills(&capabilities).contains(&"image_generation"));
+    }
+
+    #[test]
+    fn provider_refusal_is_extracted_without_phrase_guessing() {
+        let message = json!({"role":"assistant", "content":null, "refusal":"I can’t do that."});
         assert_eq!(
-            explicit_media_request("Please generate an image of a fox", &capabilities),
-            Some("image")
-        );
-        assert_eq!(
-            explicit_media_request("сгенерь картинку с белочкой", &capabilities),
-            Some("image")
-        );
-        assert_eq!(
-            explicit_media_request("describe this image", &capabilities),
-            None
+            extract_refusal(&message).as_deref(),
+            Some("I can’t do that.")
         );
     }
 

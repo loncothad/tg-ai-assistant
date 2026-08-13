@@ -24,8 +24,64 @@ pub struct Config {
     pub database: DatabaseConfig,
     pub telegram: TelegramConfig,
     pub openrouter: OpenRouterConfig,
+    #[serde(default)]
+    pub aihub: AiHubConfig,
     pub search: SearchConfig,
     pub bots: Vec<BotConfig>,
+}
+
+/// Deployment defaults for the AI Hub OpenAI-compatible API.
+#[derive(Clone, Debug, Deserialize, Serialize)]
+#[serde(deny_unknown_fields)]
+pub struct AiHubConfig {
+    /// Optional bootstrap key encrypted into each bot's isolated credential store.
+    #[serde(default)]
+    pub bootstrap_api_key: String,
+    #[serde(default = "default_aihub_url")]
+    pub base_url: String,
+    /// OpenAI-compatible request defaults applied only to AI Hub chat calls.
+    #[serde(default)]
+    pub defaults: OpenRouterOptions,
+}
+
+impl Default for AiHubConfig {
+    fn default() -> Self {
+        Self {
+            bootstrap_api_key: String::new(),
+            base_url: default_aihub_url(),
+            defaults: OpenRouterOptions::default(),
+        }
+    }
+}
+
+/// The upstream API responsible for a selected capability model.
+#[derive(Clone, Copy, Debug, Default, Deserialize, Serialize, PartialEq, Eq)]
+#[serde(rename_all = "snake_case")]
+pub enum ModelProvider {
+    #[default]
+    Openrouter,
+    Aihub,
+}
+
+impl ModelProvider {
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Self::Openrouter => "openrouter",
+            Self::Aihub => "aihub",
+        }
+    }
+}
+
+impl std::str::FromStr for ModelProvider {
+    type Err = eyre::Report;
+
+    fn from_str(value: &str) -> Result<Self> {
+        match value {
+            "openrouter" => Ok(Self::Openrouter),
+            "aihub" => Ok(Self::Aihub),
+            _ => bail!("Unknown model provider: {value}"),
+        }
+    }
 }
 
 #[derive(Clone, Debug, Deserialize, Serialize)]
@@ -95,10 +151,35 @@ pub struct OpenRouterConfig {
     pub web_fetch: OpenRouterWebFetchConfig,
     #[serde(default)]
     pub defaults: OpenRouterOptions,
+    /// Low-cost structured-output model used to plan natural-language requests.
+    #[serde(default)]
+    pub planner: PlannerConfig,
     pub image: MediaModelConfig,
     pub audio: AudioModelConfig,
     pub transcription: TranscriptionModelConfig,
     pub video: VideoModelConfig,
+}
+
+/// Configuration for the bounded request-planning call made before chat.
+#[derive(Clone, Debug, Deserialize, Serialize)]
+#[serde(deny_unknown_fields)]
+pub struct PlannerConfig {
+    #[serde(default = "default_planner_model")]
+    pub model: String,
+    #[serde(default = "default_planner_tokens")]
+    pub max_tokens: u64,
+    #[serde(default = "default_planner_timeout")]
+    pub timeout_seconds: u64,
+}
+
+impl Default for PlannerConfig {
+    fn default() -> Self {
+        Self {
+            model: default_planner_model(),
+            max_tokens: default_planner_tokens(),
+            timeout_seconds: default_planner_timeout(),
+        }
+    }
 }
 
 #[derive(Clone, Debug, Deserialize, Serialize)]
@@ -507,7 +588,17 @@ impl Config {
         if self.openrouter.models.is_empty() {
             bail!("OpenRouter models cannot be empty");
         }
-        validate_openrouter_options("defaults", &self.openrouter.defaults)?;
+        if self.openrouter.planner.model.trim().is_empty()
+            || !(64..=4096).contains(&self.openrouter.planner.max_tokens)
+            || !(1..=120).contains(&self.openrouter.planner.timeout_seconds)
+        {
+            bail!("OpenRouter planner model, token limit, or timeout is invalid");
+        }
+        validate_openrouter_options("OpenRouter defaults", &self.openrouter.defaults)?;
+        validate_openrouter_options("AI Hub defaults", &self.aihub.defaults)?;
+        if !self.aihub.base_url.starts_with("https://") {
+            bail!("AI Hub base_url must use HTTPS");
+        }
         for model in self
             .openrouter
             .models
@@ -515,7 +606,7 @@ impl Config {
             .chain(self.openrouter.understanding.image.models.iter())
             .chain(self.openrouter.understanding.video.models.iter())
         {
-            validate_openrouter_options(&model.id, &model.options)?;
+            validate_openrouter_options(&format!("OpenRouter model {}", model.id), &model.options)?;
         }
         if !matches!(
             self.openrouter.web_search.engine.as_str(),
@@ -697,6 +788,14 @@ impl Config {
             options: OpenRouterOptions::default(),
         })
     }
+    /// Resolves an AI Hub model using only its provider-specific defaults.
+    pub fn resolved_aihub_model(&self, id: &str) -> ModelConfig {
+        ModelConfig {
+            id: id.to_owned(),
+            label: None,
+            options: self.aihub.defaults.clone(),
+        }
+    }
     /// Resolves either the deployment's internal bot key or Telegram's numeric
     /// bot ID to the corresponding enabled bot configuration.
     pub fn bot(&self, reference: &str) -> Option<&BotConfig> {
@@ -718,7 +817,7 @@ fn validate_openrouter_options(name: &str, options: &OpenRouterOptions) -> Resul
         .max_tool_calls
         .is_some_and(|value| !(1..=30).contains(&value))
     {
-        bail!("OpenRouter {name} max_tool_calls must be between 1 and 30");
+        bail!("{name} max_tool_calls must be between 1 and 30");
     }
     Ok(())
 }
@@ -830,6 +929,9 @@ fn default_history_limit() -> usize {
 fn default_openrouter_url() -> String {
     "https://openrouter.ai/api/v1".into()
 }
+fn default_aihub_url() -> String {
+    "https://aihub.top/v1".into()
+}
 fn default_openrouter_search_engine() -> String {
     "auto".into()
 }
@@ -847,6 +949,15 @@ fn default_search_context_size() -> String {
 }
 fn default_app_name() -> String {
     "Teleforge".into()
+}
+fn default_planner_model() -> String {
+    "openrouter/free".into()
+}
+fn default_planner_tokens() -> u64 {
+    600
+}
+fn default_planner_timeout() -> u64 {
+    20
 }
 fn default_image_size() -> String {
     "1024x1024".into()

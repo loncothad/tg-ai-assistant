@@ -4,7 +4,7 @@
 //! selectable models. It reflects each bot API key's preferences, guardrails,
 //! privacy policy, and eligibility without maintaining a hard-coded allowlist.
 
-use crate::Result;
+use crate::{Result, config::ModelProvider};
 use eyre::{Context, ContextCompat, bail};
 use serde::{Deserialize, Serialize};
 use serde_json::{Map, Value};
@@ -20,6 +20,7 @@ const CATALOG_TTL: Duration = Duration::from_secs(10 * 60);
 /// Browser-safe model metadata used by the administration model picker.
 #[derive(Clone, Debug, Default, Deserialize, Serialize)]
 pub struct CatalogModel {
+    pub model_provider: ModelProvider,
     pub id: String,
     pub name: String,
     pub description: String,
@@ -74,17 +75,42 @@ pub struct ModelCatalogCache {
 }
 
 impl ModelCatalogCache {
-    /// Returns the current catalog, refreshing it at most once every ten minutes.
-    pub async fn get(
+    /// Returns the current OpenRouter catalog, refreshing it at most once every ten minutes.
+    pub async fn get_openrouter(
         &self,
         client: &reqwest::Client,
         base_url: &str,
         bot_id: &str,
         api_key: &str,
     ) -> Result<Arc<Vec<CatalogModel>>> {
+        self.get(client, base_url, bot_id, api_key, ModelProvider::Openrouter)
+            .await
+    }
+
+    /// Returns the current AI Hub catalog, refreshing it at most once every ten minutes.
+    pub async fn get_aihub(
+        &self,
+        client: &reqwest::Client,
+        base_url: &str,
+        bot_id: &str,
+        api_key: &str,
+    ) -> Result<Arc<Vec<CatalogModel>>> {
+        self.get(client, base_url, bot_id, api_key, ModelProvider::Aihub)
+            .await
+    }
+
+    async fn get(
+        &self,
+        client: &reqwest::Client,
+        base_url: &str,
+        bot_id: &str,
+        api_key: &str,
+        model_provider: ModelProvider,
+    ) -> Result<Arc<Vec<CatalogModel>>> {
+        let cache_key = format!("{}:{bot_id}", model_provider.as_str());
         {
             let guard = self.inner.read().await;
-            if let Some(cached) = guard.get(bot_id)
+            if let Some(cached) = guard.get(&cache_key)
                 && cached.loaded.elapsed() < CATALOG_TTL
             {
                 return Ok(cached.models.clone());
@@ -92,17 +118,21 @@ impl ModelCatalogCache {
         }
 
         let mut guard = self.inner.write().await;
-        if let Some(cached) = guard.get(bot_id)
+        if let Some(cached) = guard.get(&cache_key)
             && cached.loaded.elapsed() < CATALOG_TTL
         {
             return Ok(cached.models.clone());
         }
 
-        match fetch_catalog(client, base_url, api_key).await {
+        let fetched = match model_provider {
+            ModelProvider::Openrouter => fetch_openrouter_catalog(client, base_url, api_key).await,
+            ModelProvider::Aihub => fetch_aihub_catalog(client, base_url, api_key).await,
+        };
+        match fetched {
             Ok(models) => {
                 let models = Arc::new(models);
                 guard.insert(
-                    bot_id.to_owned(),
+                    cache_key.clone(),
                     CachedCatalog {
                         loaded: Instant::now(),
                         models: models.clone(),
@@ -113,7 +143,7 @@ impl ModelCatalogCache {
             Err(error) => {
                 // A stale catalog is preferable to making model administration
                 // unavailable during a transient OpenRouter outage.
-                if let Some(cached) = guard.get(bot_id) {
+                if let Some(cached) = guard.get(&cache_key) {
                     Ok(cached.models.clone())
                 } else {
                     Err(error)
@@ -123,7 +153,7 @@ impl ModelCatalogCache {
     }
 }
 
-async fn fetch_catalog(
+async fn fetch_openrouter_catalog(
     client: &reqwest::Client,
     base_url: &str,
     api_key: &str,
@@ -131,10 +161,25 @@ async fn fetch_catalog(
     let base = base_url.trim_end_matches('/');
     // This authenticated endpoint excludes models unavailable under the API
     // key's provider preferences, guardrails, privacy policy, and eligibility.
-    let general = fetch_data(client, &format!("{base}/models/user?sort=newest"), api_key).await?;
+    let general = fetch_data(
+        client,
+        &format!("{base}/models/user?sort=newest&output_modalities=all"),
+        api_key,
+        "OpenRouter",
+    )
+    .await?;
 
     let mut models = BTreeMap::<String, CatalogModel>::new();
     merge_values(&mut models, general);
+    // Dedicated media catalogs expose SKU pricing and generation constraints
+    // that the general catalog may omit. They enrich only user-visible models.
+    for endpoint in ["images/models", "videos/models"] {
+        if let Ok(values) =
+            fetch_data(client, &format!("{base}/{endpoint}"), api_key, "OpenRouter").await
+        {
+            enrich_values(&mut models, values);
+        }
+    }
     if models.is_empty() {
         bail!("OpenRouter returned an empty model catalog");
     }
@@ -154,28 +199,63 @@ async fn fetch_catalog(
     Ok(models)
 }
 
-async fn fetch_data(client: &reqwest::Client, url: &str, api_key: &str) -> Result<Vec<Value>> {
+async fn fetch_aihub_catalog(
+    client: &reqwest::Client,
+    base_url: &str,
+    api_key: &str,
+) -> Result<Vec<CatalogModel>> {
+    let values = fetch_data(
+        client,
+        &format!("{}/models", base_url.trim_end_matches('/')),
+        api_key,
+        "AI Hub",
+    )
+    .await?;
+    let mut models = values
+        .iter()
+        .filter_map(parse_aihub_model)
+        .collect::<Vec<_>>();
+    if models.is_empty() {
+        bail!("AI Hub returned an empty model catalog");
+    }
+    models.sort_by(|left, right| {
+        right
+            .created
+            .unwrap_or_default()
+            .cmp(&left.created.unwrap_or_default())
+            .then_with(|| left.name.cmp(&right.name))
+            .then_with(|| left.id.cmp(&right.id))
+    });
+    Ok(models)
+}
+
+async fn fetch_data(
+    client: &reqwest::Client,
+    url: &str,
+    api_key: &str,
+    provider: &str,
+) -> Result<Vec<Value>> {
     let response = client
         .get(url)
         .bearer_auth(api_key)
         .timeout(Duration::from_secs(15))
         .send()
         .await
-        .wrap_err_with(|| format!("Failed to fetch OpenRouter model catalog from {url}"))?;
+        .wrap_err_with(|| format!("Failed to fetch {provider} model catalog from {url}"))?;
     if !response.status().is_success() {
         bail!(
-            "OpenRouter model catalog returned HTTP {}",
+            "{provider} model catalog returned HTTP {}",
             response.status()
         );
     }
     let body: Value = response
         .json()
         .await
-        .wrap_err("OpenRouter returned an invalid model catalog")?;
+        .wrap_err_with(|| format!("{provider} returned an invalid model catalog"))?;
     body.get("data")
         .and_then(Value::as_array)
         .cloned()
-        .context("OpenRouter model catalog has no data array")
+        .wrap_err_with(|| format!("{provider} model catalog has no data array"))
 }
 
 fn merge_values(models: &mut BTreeMap<String, CatalogModel>, values: Vec<Value>) {
@@ -192,6 +272,16 @@ fn merge_values(models: &mut BTreeMap<String, CatalogModel>, values: Vec<Value>)
     }
 }
 
+fn enrich_values(models: &mut BTreeMap<String, CatalogModel>, values: Vec<Value>) {
+    for value in values {
+        if let Some(incoming) = parse_model(&value)
+            && let Some(current) = models.get_mut(&incoming.id)
+        {
+            merge_model(current, incoming);
+        }
+    }
+}
+
 fn parse_model(value: &Value) -> Option<CatalogModel> {
     let object = value.as_object()?;
     if requires_additional_identification(object) {
@@ -201,6 +291,7 @@ fn parse_model(value: &Value) -> Option<CatalogModel> {
     let architecture = object.get("architecture").and_then(Value::as_object);
     let top_provider = object.get("top_provider").and_then(Value::as_object);
     Some(CatalogModel {
+        model_provider: ModelProvider::Openrouter,
         name: string(object, "name").unwrap_or_else(|| id.clone()),
         description: string(object, "description").unwrap_or_default(),
         created: object.get("created").and_then(Value::as_i64),
@@ -222,6 +313,28 @@ fn parse_model(value: &Value) -> Option<CatalogModel> {
         supported_frame_images: strings(Some(object), "supported_frame_images"),
         generates_audio: object.get("generate_audio").and_then(Value::as_bool),
         id,
+    })
+}
+
+fn parse_aihub_model(value: &Value) -> Option<CatalogModel> {
+    let object = value.as_object()?;
+    let id = string(object, "id")?;
+    let is_image = id.to_ascii_lowercase().contains("image");
+    let created = string(object, "created_at").and_then(|value| {
+        chrono::DateTime::parse_from_rfc3339(&value)
+            .ok()
+            .map(|date| date.timestamp())
+    });
+    Some(CatalogModel {
+        model_provider: ModelProvider::Aihub,
+        name: string(object, "display_name").unwrap_or_else(|| id.clone()),
+        description: "AI Hub model. This catalog does not publish pricing or context metadata."
+            .to_owned(),
+        created,
+        input_modalities: vec!["text".to_owned()],
+        output_modalities: vec![if is_image { "image" } else { "text" }.to_owned()],
+        id,
+        ..CatalogModel::default()
     })
 }
 
@@ -398,6 +511,40 @@ mod tests {
         assert_eq!(parsed.max_completion_tokens, Some(8192));
         assert_eq!(parsed.pricing["prompt"], "0.000001");
         assert!(parsed.supports("image_understanding"));
+    }
+
+    #[test]
+    fn parses_aihub_chat_and_image_models_without_inventing_prices() {
+        let chat = parse_aihub_model(&serde_json::json!({
+            "id": "gpt-5.4-mini",
+            "display_name": "GPT 5.4 Mini",
+            "created_at": "2024-01-01T00:00:00Z"
+        }))
+        .unwrap();
+        assert_eq!(chat.model_provider, ModelProvider::Aihub);
+        assert!(chat.supports("chat"));
+        assert!(chat.pricing.is_empty());
+
+        let image = parse_aihub_model(&serde_json::json!({
+            "id": "gpt-image-2",
+            "display_name": "GPT Image 2"
+        }))
+        .unwrap();
+        assert!(image.supports("image_generation"));
+        assert!(!image.supports("chat"));
+    }
+
+    #[test]
+    fn preserves_media_sku_pricing() {
+        let parsed = parse_model(&serde_json::json!({
+            "id": "vendor/video",
+            "architecture": {"input_modalities": ["text"], "output_modalities": ["video"]},
+            "pricing": {"prompt": "0", "completion": "0"},
+            "pricing_skus": {"per-video-second": "0.50"}
+        }))
+        .unwrap();
+        assert_eq!(parsed.pricing["prompt"], "0");
+        assert_eq!(parsed.pricing["sku · per-video-second"], "0.50");
     }
 
     #[test]

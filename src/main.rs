@@ -11,6 +11,7 @@ use teleforge::{
     admin::{self, AdminState},
     config::Config,
     db::Store,
+    ephemeral_media,
     telegram::BotRunner,
 };
 use tokio::{
@@ -108,6 +109,7 @@ async fn spawn_health_server(
     let app = Router::new()
         .route("/healthz", get(|| async { Json(json!({ "status": "ok" })) }))
         .route("/readyz", get(move || async move { Json(json!({ "status": "ready", "bots": bot_count, "version": env!("CARGO_PKG_VERSION") })) }))
+        .route("/generated/{token}", get(ephemeral_media::serve))
         .merge(admin::router(admin_state))
         .layer(PropagateRequestIdLayer::x_request_id())
         .layer(SetRequestIdLayer::x_request_id(MakeRequestUuid))

@@ -11,10 +11,11 @@ use frankenstein::{
         InlineQueryResult, InlineQueryResultArticle, InputMessageContent, InputRichMessageContent,
     },
     input_file::FileUpload,
+    input_media::{InputMedia, InputMediaAudio, InputMediaPhoto, InputMediaVideo},
     methods::{
-        AnswerGuestQueryParams, DeleteMessageParams, GetFileParams, GetUpdatesParams,
-        SendAudioParams, SendChatActionParams, SendDocumentParams, SendPhotoParams,
-        SendRichMessageDraftParams, SendRichMessageParams, SendVideoParams,
+        AnswerGuestQueryParams, EditMessageMediaParams, EditMessageTextParams, GetFileParams,
+        GetUpdatesParams, SendAudioParams, SendChatActionParams, SendDocumentParams,
+        SendPhotoParams, SendRichMessageDraftParams, SendRichMessageParams, SendVideoParams,
     },
     rich_message::InputRichMessage,
     types::{
@@ -33,9 +34,11 @@ use tracing::{error, info, warn};
 
 use crate::{
     Result,
-    config::{BotConfig, Config, SearchProvider},
+    config::{BotConfig, Config, ModelProvider, SearchProvider},
     db::{ModelRouting, Store},
-    openrouter::{ChatRequest, MediaInput, OpenRouter, ToolModels},
+    openrouter::{
+        ChatRequest, MediaInput, OpenRouter, PlannedAction, PlanningRequest, ToolModel, ToolModels,
+    },
     rich,
     search::SearchService,
 };
@@ -83,7 +86,11 @@ impl BotRunner {
             .clone()
             .context("Configured Telegram bot has no username")?;
         info!(bot_id = %bot.id, telegram_username = %username, "Telegram bot authenticated");
-        let openrouter = OpenRouter::new(client.clone(), config.openrouter.clone());
+        let openrouter = OpenRouter::new(
+            client.clone(),
+            config.openrouter.clone(),
+            config.aihub.clone(),
+        );
         let search = SearchService::new(client.clone(), config.search.clone());
         let concurrency = config.server.max_concurrent_requests_per_bot;
         Ok(Self {
@@ -256,6 +263,54 @@ impl BotRunner {
         }
         let settings = self.store.settings(&self.bot.id).await?;
         let mut capabilities = settings.capabilities.clone();
+        let attachment_flags = attachment_flags(&message);
+        let planner_key = self.store.credential(&self.bot.id, "openrouter").await?;
+        let plan = if let Some(key) = planner_key.as_deref() {
+            match self
+                .openrouter
+                .plan_request(PlanningRequest {
+                    text: &text,
+                    capabilities: &capabilities,
+                    has_image: attachment_flags.0,
+                    has_video: attachment_flags.1,
+                    has_audio: attachment_flags.2,
+                    api_key: key,
+                })
+                .await
+            {
+                Ok(plan) => Some(plan),
+                Err(error) => {
+                    warn!(bot_id = %self.bot.id, user_id, error = %format!("{error:#}"), "request planner failed; continuing with normal chat");
+                    None
+                }
+            }
+        } else {
+            None
+        };
+        if let Some(plan) = plan.as_ref() {
+            let generation_command = match plan.action {
+                PlannedAction::GenerateImage => Some("image"),
+                PlannedAction::GenerateAudio => Some("audio"),
+                PlannedAction::GenerateVideo => Some("video"),
+                PlannedAction::Chat | PlannedAction::Refuse => None,
+            };
+            if let Some(command) = generation_command {
+                if let Err(error) = self
+                    .command(&message, mode, user_id, &scope, command, &text)
+                    .await
+                {
+                    error!(bot_id = %self.bot.id, user_id, error = %format!("{error:#}"), "planned generation command failed");
+                    self.respond(&message, mode, rich::compact_error(), None)
+                        .await?;
+                }
+                return Ok(());
+            }
+            if plan.action == PlannedAction::Refuse {
+                self.respond(&message, mode, &plan.refusal_message, None)
+                    .await?;
+                return Ok(());
+            }
+        }
         if mode == MessageMode::Guest {
             capabilities.image = false;
             capabilities.audio = false;
@@ -265,14 +320,9 @@ impl BotRunner {
             capabilities.file = false;
         }
         let provider = self.search_provider().await?;
-        let openrouter_key = self
-            .store
-            .credential(&self.bot.id, "openrouter")
-            .await?
-            .context("OpenRouter API key is not configured")?;
         let search_key = if capabilities.search {
             if provider == SearchProvider::Openrouter {
-                Some(openrouter_key.clone())
+                self.store.credential(&self.bot.id, "openrouter").await?
             } else {
                 self.store
                     .credential(&self.bot.id, provider.as_str())
@@ -281,6 +331,7 @@ impl BotRunner {
         } else {
             None
         };
+        capabilities.search &= search_key.is_some();
         let history = self.store.history(&self.bot.id, &scope).await?;
         let media = if capabilities.media
             || capabilities.transcription
@@ -312,19 +363,65 @@ impl BotRunner {
         } else {
             ("chat", &settings.selected_model)
         };
-        let model = self.config.resolved_model(model_capability, selected);
-        let author = caller_name(&message);
-        let contextual_text = format!("{author}: {text}{}", media_summary(&media));
-        let mut instructions = self.store.effective_instructions(&self.bot.id).await?;
-        instructions.push_str(&format!("\n\n# Current request context\nCurrent UTC date and time: {}\nBot: @{} (backend ID {})\nConversation mode: {:?}\nChat: {} (ID {})\nCaller: {} (ID {}, language {})\nTelegram message Unix time: {}\nEnabled capabilities and callable tools for this request: search={}, web_fetch={}, image_generation={}, audio_generation={}, video_generation={}, media_understanding={}, transcription={}, file_delivery={}. If a capability is true, never claim it is disabled; call its tool when the user explicitly requests that operation.", chrono::Utc::now().to_rfc3339(), self.username, self.bot.id, mode, message.chat.title.as_deref().unwrap_or("Private or untitled chat"), message.chat.id, author, user_id, message.guest_bot_caller_user.as_ref().or(message.from.as_ref()).and_then(|u| u.language_code.as_deref()).unwrap_or("unknown"), message.date, capabilities.search, capabilities.web_fetch, capabilities.image, capabilities.audio, capabilities.video, capabilities.media, capabilities.transcription, capabilities.file));
-        self.store
-            .append_message(&self.bot.id, &scope, "user", &contextual_text)
-            .await?;
         let default_routing = ModelRouting::default();
         let routing = settings
             .model_routing
             .get(model_capability)
             .unwrap_or(&default_routing);
+        let model = match routing.model_provider {
+            ModelProvider::Openrouter => self.config.resolved_model(model_capability, selected),
+            ModelProvider::Aihub => self.config.resolved_aihub_model(selected),
+        };
+        if routing.model_provider == ModelProvider::Aihub {
+            capabilities.web_fetch = false;
+        }
+        let api_key = self.model_api_key(routing.model_provider).await?;
+        let image_routing = settings
+            .model_routing
+            .get("image_generation")
+            .unwrap_or(&default_routing);
+        let audio_routing = settings
+            .model_routing
+            .get("audio_generation")
+            .unwrap_or(&default_routing);
+        let transcription_routing = settings
+            .model_routing
+            .get("transcription")
+            .unwrap_or(&default_routing);
+        let video_routing = settings
+            .model_routing
+            .get("video_generation")
+            .unwrap_or(&default_routing);
+        let image_key = self
+            .optional_model_api_key(image_routing.model_provider, capabilities.image)
+            .await?;
+        let audio_key = self
+            .optional_model_api_key(audio_routing.model_provider, capabilities.audio)
+            .await?;
+        let transcription_key = self
+            .optional_model_api_key(
+                transcription_routing.model_provider,
+                capabilities.transcription,
+            )
+            .await?;
+        let video_key = self
+            .optional_model_api_key(video_routing.model_provider, capabilities.video)
+            .await?;
+        capabilities.image &= !image_key.is_empty();
+        capabilities.audio &= !audio_key.is_empty();
+        capabilities.transcription &= !transcription_key.is_empty();
+        capabilities.video &= !video_key.is_empty();
+        let author = caller_name(&message);
+        let contextual_text = format!("{author}: {text}{}", media_summary(&media));
+        let mut instructions = self.store.effective_instructions(&self.bot.id).await?;
+        if let Some(plan) = plan.as_ref() {
+            instructions.push_str("\n\n# Structured request plan\n");
+            instructions.push_str(&plan.guidance());
+        }
+        instructions.push_str(&format!("\n\n# Current request context\nCurrent UTC date and time: {}\nBot: @{} (backend ID {})\nConversation mode: {:?}\nChat: {} (ID {})\nCaller: {} (ID {}, language {})\nTelegram message Unix time: {}\nEnabled capabilities and callable tools for this request: search={}, web_fetch={}, image_generation={}, audio_generation={}, video_generation={}, media_understanding={}, transcription={}, file_delivery={}. If a capability is true, never claim it is disabled; call its tool when the user explicitly requests that operation.", chrono::Utc::now().to_rfc3339(), self.username, self.bot.id, mode, message.chat.title.as_deref().unwrap_or("Private or untitled chat"), message.chat.id, author, user_id, message.guest_bot_caller_user.as_ref().or(message.from.as_ref()).and_then(|u| u.language_code.as_deref()).unwrap_or("unknown"), message.date, capabilities.search, capabilities.web_fetch, capabilities.image, capabilities.audio, capabilities.video, capabilities.media, capabilities.transcription, capabilities.file));
+        self.store
+            .append_message(&self.bot.id, &scope, "user", &contextual_text)
+            .await?;
         let session_id = format!("{}:{scope}", self.bot.id);
         let (progress, progress_task) = if mode == MessageMode::Guest {
             (None, None)
@@ -354,30 +451,31 @@ impl BotRunner {
                 search: &self.search,
                 search_provider: provider,
                 search_api_key: search_key.as_deref(),
-                api_key: &openrouter_key,
+                api_key: &api_key,
+                model_provider: routing.model_provider,
                 capabilities: &capabilities,
                 routing,
                 tool_models: ToolModels {
-                    image_generation: &settings.selected_image_generation_model,
-                    image_routing: settings
-                        .model_routing
-                        .get("image_generation")
-                        .unwrap_or(&default_routing),
-                    audio_generation: &settings.selected_audio_generation_model,
-                    audio_routing: settings
-                        .model_routing
-                        .get("audio_generation")
-                        .unwrap_or(&default_routing),
-                    transcription: &settings.selected_transcription_model,
-                    transcription_routing: settings
-                        .model_routing
-                        .get("transcription")
-                        .unwrap_or(&default_routing),
-                    video_generation: &settings.selected_video_generation_model,
-                    video_routing: settings
-                        .model_routing
-                        .get("video_generation")
-                        .unwrap_or(&default_routing),
+                    image_generation: ToolModel {
+                        model: &settings.selected_image_generation_model,
+                        routing: image_routing,
+                        api_key: &image_key,
+                    },
+                    audio_generation: ToolModel {
+                        model: &settings.selected_audio_generation_model,
+                        routing: audio_routing,
+                        api_key: &audio_key,
+                    },
+                    transcription: ToolModel {
+                        model: &settings.selected_transcription_model,
+                        routing: transcription_routing,
+                        api_key: &transcription_key,
+                    },
+                    video_generation: ToolModel {
+                        model: &settings.selected_video_generation_model,
+                        routing: video_routing,
+                        api_key: &video_key,
+                    },
                 },
                 progress,
             })
@@ -398,7 +496,7 @@ impl BotRunner {
                             message.message_thread_id,
                             &image.bytes,
                             &image.media_type,
-                            Some("Generated with OpenRouter"),
+                            Some("Generated by Teleforge"),
                         )
                         .await?;
                     }
@@ -416,7 +514,7 @@ impl BotRunner {
                             message.chat.id,
                             message.message_thread_id,
                             &video,
-                            Some("Generated with OpenRouter"),
+                            Some("Generated by Teleforge"),
                         )
                         .await?;
                     }
@@ -466,9 +564,23 @@ impl BotRunner {
                     .await?;
             }
             "model" => {
-                let model = self.store.selected_model(&self.bot.id).await?;
-                self.respond(message, mode, &format!("Current model: `{model}`"), None)
-                    .await?;
+                let settings = self.store.settings(&self.bot.id).await?;
+                let provider = settings
+                    .model_routing
+                    .get("chat")
+                    .map(|routing| routing.model_provider)
+                    .unwrap_or_default();
+                self.respond(
+                    message,
+                    mode,
+                    &format!(
+                        "Current model: `{}` via `{}`",
+                        settings.selected_model,
+                        provider.as_str()
+                    ),
+                    None,
+                )
+                .await?;
             }
             "searchprovider" => {
                 let provider = self.search_provider().await?;
@@ -493,12 +605,23 @@ impl BotRunner {
                         .credential(&self.bot.id, "openrouter")
                         .await?
                         .context("OpenRouter API key is not configured")?;
-                    let model = self.config.resolved_model("chat", &settings.selected_model);
-                    let routing = settings
+                    let selected_routing = settings
                         .model_routing
                         .get("chat")
                         .cloned()
                         .unwrap_or_default();
+                    let (model, routing) =
+                        if selected_routing.model_provider == ModelProvider::Openrouter {
+                            (
+                                self.config.resolved_model("chat", &settings.selected_model),
+                                selected_routing,
+                            )
+                        } else {
+                            (
+                                self.config.resolved_model("chat", &self.bot.default_model),
+                                ModelRouting::default(),
+                            )
+                        };
                     self.openrouter
                         .search(arguments, &model, &routing, &key)
                         .await?
@@ -529,43 +652,62 @@ impl BotRunner {
                 if !settings.capabilities.image {
                     bail!("Image generation is disabled by an administrator");
                 }
+                require_arguments(arguments, "/image <prompt>")?;
                 if mode == MessageMode::Guest {
-                    self.respond(
-                        message,
-                        mode,
-                        "Image generation is enabled, but Telegram guest queries cannot receive generated file uploads. Open this bot in a private chat or use it in a normal group, then send `-image <prompt>`.",
-                        None,
-                    )
-                    .await?;
+                    let inline_id = self
+                        .answer_guest_pending(message, "Generating the requested image")
+                        .await?;
+                    let routing = settings
+                        .model_routing
+                        .get("image_generation")
+                        .cloned()
+                        .unwrap_or_default();
+                    let result = async {
+                        let key = self.model_api_key(routing.model_provider).await?;
+                        let references = self.collect_media(message, arguments).await?;
+                        self.openrouter
+                            .generate_image_with_references(
+                                arguments,
+                                &references,
+                                &settings.selected_image_generation_model,
+                                &routing,
+                                &key,
+                            )
+                            .await
+                    }
+                    .await;
+                    match result {
+                        Ok(mut images) if !images.is_empty() => {
+                            let image = images.remove(0);
+                            if let Err(error) = self
+                                .edit_guest_image(&inline_id, image.bytes, &image.media_type)
+                                .await
+                            {
+                                error!(bot_id = %self.bot.id, user_id, error = %format!("{error:#}"), "guest image delivery failed");
+                                self.edit_guest_error(&inline_id).await;
+                            }
+                        }
+                        Ok(_) => self.edit_guest_error(&inline_id).await,
+                        Err(error) => {
+                            error!(bot_id = %self.bot.id, user_id, error = %format!("{error:#}"), "guest image generation failed");
+                            self.edit_guest_error(&inline_id).await;
+                        }
+                    }
                     return Ok(());
                 }
-                require_arguments(arguments, "/image <prompt>")?;
                 self.send_action(
                     message.chat.id,
                     message.message_thread_id,
                     ChatAction::UploadPhoto,
                 )
                 .await;
-                let key = self
-                    .store
-                    .credential(&self.bot.id, "openrouter")
-                    .await?
-                    .context("OpenRouter API key is not configured")?;
                 let references = self.collect_media(message, arguments).await?;
                 let routing = settings
                     .model_routing
                     .get("image_generation")
                     .cloned()
                     .unwrap_or_default();
-                let stub = self
-                    .send_generation_stub(
-                        message.chat.id,
-                        message.message_thread_id,
-                        i64::from(message.message_id),
-                        "Generating the requested image",
-                    )
-                    .await
-                    .ok();
+                let key = self.model_api_key(routing.model_provider).await?;
                 let result = self
                     .openrouter
                     .generate_image_with_references(
@@ -576,9 +718,6 @@ impl BotRunner {
                         &key,
                     )
                     .await;
-                if let Some(stub) = stub {
-                    self.delete_generation_stub(message.chat.id, stub).await;
-                }
                 match result {
                     Ok(images) => {
                         for image in images {
@@ -587,7 +726,7 @@ impl BotRunner {
                                 message.message_thread_id,
                                 &image.bytes,
                                 &image.media_type,
-                                Some("Generated with OpenRouter"),
+                                Some("Generated by Teleforge"),
                             )
                             .await?;
                         }
@@ -600,26 +739,49 @@ impl BotRunner {
                 }
             }
             "audio" => {
-                if mode == MessageMode::Guest {
-                    self.respond(
-                        message,
-                        mode,
-                        "Audio generation is enabled, but Telegram guest queries cannot receive generated file uploads. Open this bot in a private chat or normal group.",
-                        None,
-                    )
-                    .await?;
-                    return Ok(());
-                }
                 let settings = self.store.settings(&self.bot.id).await?;
                 if !settings.capabilities.audio {
                     bail!("Audio generation is disabled by an administrator");
                 }
                 require_arguments(arguments, "/audio <text>")?;
-                let key = self
-                    .store
-                    .credential(&self.bot.id, "openrouter")
-                    .await?
-                    .context("OpenRouter API key is not configured")?;
+                if mode == MessageMode::Guest {
+                    let inline_id = self
+                        .answer_guest_pending(message, "Generating the requested audio")
+                        .await?;
+                    let routing = settings
+                        .model_routing
+                        .get("audio_generation")
+                        .cloned()
+                        .unwrap_or_default();
+                    let result = async {
+                        let key = self.model_api_key(routing.model_provider).await?;
+                        self.openrouter
+                            .generate_audio(
+                                arguments,
+                                &settings.selected_audio_generation_model,
+                                &routing,
+                                &key,
+                            )
+                            .await
+                    }
+                    .await;
+                    match result {
+                        Ok(audio) => {
+                            if let Err(error) = self
+                                .edit_guest_audio(&inline_id, audio.bytes, &audio.media_type)
+                                .await
+                            {
+                                error!(bot_id = %self.bot.id, user_id, error = %format!("{error:#}"), "guest audio delivery failed");
+                                self.edit_guest_error(&inline_id).await;
+                            }
+                        }
+                        Err(error) => {
+                            error!(bot_id = %self.bot.id, user_id, error = %format!("{error:#}"), "guest audio generation failed");
+                            self.edit_guest_error(&inline_id).await;
+                        }
+                    }
+                    return Ok(());
+                }
                 self.send_action(
                     message.chat.id,
                     message.message_thread_id,
@@ -631,15 +793,7 @@ impl BotRunner {
                     .get("audio_generation")
                     .cloned()
                     .unwrap_or_default();
-                let stub = self
-                    .send_generation_stub(
-                        message.chat.id,
-                        message.message_thread_id,
-                        i64::from(message.message_id),
-                        "Generating the requested audio",
-                    )
-                    .await
-                    .ok();
+                let key = self.model_api_key(routing.model_provider).await?;
                 let result = self
                     .openrouter
                     .generate_audio(
@@ -649,9 +803,6 @@ impl BotRunner {
                         &key,
                     )
                     .await;
-                if let Some(stub) = stub {
-                    self.delete_generation_stub(message.chat.id, stub).await;
-                }
                 match result {
                     Ok(audio) => {
                         self.send_audio_bytes(
@@ -685,17 +836,13 @@ impl BotRunner {
                     bail!("Transcription is disabled by an administrator");
                 }
                 let media = self.collect_media(message, arguments).await?;
-                let key = self
-                    .store
-                    .credential(&self.bot.id, "openrouter")
-                    .await?
-                    .context("OpenRouter API key is not configured")?;
                 let mut transcripts = Vec::new();
                 let routing = settings
                     .model_routing
                     .get("transcription")
                     .cloned()
                     .unwrap_or_default();
+                let key = self.model_api_key(routing.model_provider).await?;
                 for input in &media {
                     if let MediaInput::Audio { data, format } = input {
                         transcripts.push(
@@ -728,43 +875,57 @@ impl BotRunner {
                 if !settings.capabilities.video {
                     bail!("Video generation is disabled by an administrator");
                 }
+                require_arguments(arguments, "/video <prompt>")?;
                 if mode == MessageMode::Guest {
-                    self.respond(
-                        message,
-                        mode,
-                        "Video generation is enabled, but Telegram guest queries cannot receive generated file uploads. Open this bot in a private chat or normal group.",
-                        None,
-                    )
-                    .await?;
+                    let inline_id = self
+                        .answer_guest_pending(message, "Generating the requested video")
+                        .await?;
+                    let routing = settings
+                        .model_routing
+                        .get("video_generation")
+                        .cloned()
+                        .unwrap_or_default();
+                    let result = async {
+                        let key = self.model_api_key(routing.model_provider).await?;
+                        let references = self.collect_media(message, arguments).await?;
+                        self.openrouter
+                            .generate_video_with_references(
+                                arguments,
+                                &references,
+                                &settings.selected_video_generation_model,
+                                &routing,
+                                &key,
+                            )
+                            .await
+                    }
+                    .await;
+                    match result {
+                        Ok(url) => {
+                            if let Err(error) = self.edit_guest_video(&inline_id, &url).await {
+                                error!(bot_id = %self.bot.id, user_id, error = %format!("{error:#}"), "guest video delivery failed");
+                                self.edit_guest_error(&inline_id).await;
+                            }
+                        }
+                        Err(error) => {
+                            error!(bot_id = %self.bot.id, user_id, error = %format!("{error:#}"), "guest video generation failed");
+                            self.edit_guest_error(&inline_id).await;
+                        }
+                    }
                     return Ok(());
                 }
-                require_arguments(arguments, "/video <prompt>")?;
                 self.send_action(
                     message.chat.id,
                     message.message_thread_id,
                     ChatAction::UploadVideo,
                 )
                 .await;
-                let key = self
-                    .store
-                    .credential(&self.bot.id, "openrouter")
-                    .await?
-                    .context("OpenRouter API key is not configured")?;
                 let references = self.collect_media(message, arguments).await?;
                 let routing = settings
                     .model_routing
                     .get("video_generation")
                     .cloned()
                     .unwrap_or_default();
-                let stub = self
-                    .send_generation_stub(
-                        message.chat.id,
-                        message.message_thread_id,
-                        i64::from(message.message_id),
-                        "Generating the requested video",
-                    )
-                    .await
-                    .ok();
+                let key = self.model_api_key(routing.model_provider).await?;
                 let result = self
                     .openrouter
                     .generate_video_with_references(
@@ -775,16 +936,13 @@ impl BotRunner {
                         &key,
                     )
                     .await;
-                if let Some(stub) = stub {
-                    self.delete_generation_stub(message.chat.id, stub).await;
-                }
                 match result {
                     Ok(url) => {
                         self.send_video_url(
                             message.chat.id,
                             message.message_thread_id,
                             &url,
-                            Some("Generated with OpenRouter"),
+                            Some("Generated by Teleforge"),
                         )
                         .await?
                     }
@@ -930,6 +1088,109 @@ impl BotRunner {
         .await
     }
 
+    async fn answer_guest_pending(&self, message: &Message, status: &str) -> Result<String> {
+        let query_id = message
+            .guest_query_id
+            .as_ref()
+            .context("Guest message has no guest_query_id")?;
+        let rich_message = InputRichMessage::builder()
+            .markdown(rich::to_telegram_markdown(&format!(
+                "⏳ **{status}…**\n\nThis result will update automatically."
+            )))
+            .build();
+        let input = InputRichMessageContent::builder()
+            .rich_message(rich_message)
+            .build();
+        let article = InlineQueryResultArticle::builder()
+            .id("generation")
+            .title(status)
+            .input_message_content(InputMessageContent::Rich(input))
+            .build();
+        let params = AnswerGuestQueryParams::builder()
+            .guest_query_id(query_id.clone())
+            .result(InlineQueryResult::Article(article))
+            .build();
+        Ok(self
+            .telegram
+            .answer_guest_query(&params)
+            .await?
+            .result
+            .inline_message_id)
+    }
+
+    async fn edit_guest_image(
+        &self,
+        inline_message_id: &str,
+        bytes: Vec<u8>,
+        media_type: &str,
+    ) -> Result<()> {
+        let token = crate::ephemeral_media::publish(bytes, media_type)?;
+        let url = format!(
+            "{}/generated/{token}",
+            self.config.server.public_url.trim_end_matches('/')
+        );
+        let media = InputMediaPhoto::builder()
+            .media(FileUpload::from(url))
+            .caption("✅ Generation completed")
+            .build();
+        let params = EditMessageMediaParams::builder()
+            .inline_message_id(inline_message_id)
+            .media(InputMedia::Photo(media))
+            .build();
+        self.telegram.edit_message_media(&params).await?;
+        Ok(())
+    }
+
+    async fn edit_guest_audio(
+        &self,
+        inline_message_id: &str,
+        bytes: Vec<u8>,
+        media_type: &str,
+    ) -> Result<()> {
+        let token = crate::ephemeral_media::publish(bytes, media_type)?;
+        let url = format!(
+            "{}/generated/{token}",
+            self.config.server.public_url.trim_end_matches('/')
+        );
+        let media = InputMediaAudio::builder()
+            .media(FileUpload::from(url))
+            .caption("✅ Generation completed")
+            .build();
+        let params = EditMessageMediaParams::builder()
+            .inline_message_id(inline_message_id)
+            .media(InputMedia::Audio(media))
+            .build();
+        self.telegram.edit_message_media(&params).await?;
+        Ok(())
+    }
+
+    async fn edit_guest_video(&self, inline_message_id: &str, url: &str) -> Result<()> {
+        let media = InputMediaVideo::builder()
+            .media(FileUpload::from(url.to_owned()))
+            .caption("✅ Generation completed")
+            .supports_streaming(true)
+            .build();
+        let params = EditMessageMediaParams::builder()
+            .inline_message_id(inline_message_id)
+            .media(InputMedia::Video(media))
+            .build();
+        self.telegram.edit_message_media(&params).await?;
+        Ok(())
+    }
+
+    async fn edit_guest_error(&self, inline_message_id: &str) {
+        let rich_message = InputRichMessage::builder()
+            .markdown(rich::to_telegram_markdown(rich::compact_error()))
+            .build();
+        let params = EditMessageTextParams::builder()
+            .inline_message_id(inline_message_id)
+            .rich_message(rich_message)
+            .build();
+        if let Err(error) = self.telegram.edit_message_text(&params).await {
+            warn!(bot_id = %self.bot.id, %error, "failed to update guest generation error");
+        }
+    }
+
     async fn send_rich(
         &self,
         chat_id: i64,
@@ -965,30 +1226,20 @@ impl BotRunner {
     ) {
         let started = tokio::time::Instant::now();
         let mut status = "Starting".to_owned();
-        let mut stub_message = None;
         let mut drafts_enabled = true;
         let mut ticker = tokio::time::interval(Duration::from_secs(3));
         ticker.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
         loop {
             tokio::select! {
                 update = updates.recv() => match update {
-                    Some(update) => {
-                        status = update;
-                        if stub_message.is_none()
-                            && (status.starts_with("Generating")
-                                || status.starts_with("Preparing a downloadable file"))
-                        {
-                            stub_message = self
-                                .send_generation_stub(chat_id, thread_id, draft_id, &status)
-                                .await
-                                .ok();
-                        }
-                    },
+                    Some(update) => status = update,
                     None => break,
                 },
                 _ = ticker.tick(), if drafts_enabled => {
                     let markdown = format!("⏳ **{status}…**\n\nElapsed: {}s", started.elapsed().as_secs());
-                    let rich_message = InputRichMessage::builder().markdown(markdown).build();
+                    let rich_message = InputRichMessage::builder()
+                        .markdown(rich::to_telegram_markdown(&markdown))
+                        .build();
                     let mut params = SendRichMessageDraftParams::builder()
                         .chat_id(chat_id)
                         .draft_id(draft_id)
@@ -1001,54 +1252,6 @@ impl BotRunner {
                     }
                 }
             }
-        }
-        if let Some(message_id) = stub_message {
-            self.delete_generation_stub(chat_id, message_id).await;
-        }
-    }
-
-    async fn send_generation_stub(
-        &self,
-        chat_id: i64,
-        thread_id: Option<i32>,
-        reply_to: i64,
-        status: &str,
-    ) -> Result<i32> {
-        let file = TempFileBuilder::new()
-            .prefix("teleforge-generation-in-progress-")
-            .suffix(".txt")
-            .tempfile()?;
-        tokio::fs::write(
-            file.path(),
-            format!("{status}…\n\nTeleforge will send the completed file when it is ready.\n"),
-        )
-        .await?;
-        let mut params = SendDocumentParams::builder()
-            .chat_id(chat_id)
-            .document(FileUpload::from(file.path().to_path_buf()))
-            .caption(format!("⏳ {status}…"))
-            .reply_parameters(
-                ReplyParameters::builder()
-                    .message_id(i32::try_from(reply_to).wrap_err("Invalid reply message ID")?)
-                    .build(),
-            )
-            .build();
-        params.message_thread_id = thread_id;
-        Ok(self
-            .telegram
-            .send_document(&params)
-            .await?
-            .result
-            .message_id)
-    }
-
-    async fn delete_generation_stub(&self, chat_id: i64, message_id: i32) {
-        let params = DeleteMessageParams::builder()
-            .chat_id(chat_id)
-            .message_id(message_id)
-            .build();
-        if let Err(error) = self.telegram.delete_message(&params).await {
-            warn!(bot_id = %self.bot.id, %error, "failed to remove generation stub");
         }
     }
 
@@ -1168,7 +1371,7 @@ impl BotRunner {
         let mut params = SendAudioParams::builder()
             .chat_id(chat_id)
             .audio(FileUpload::from(file.path().to_path_buf()))
-            .caption("Generated with OpenRouter")
+            .caption("Generated by Teleforge")
             .build();
         params.message_thread_id = thread_id;
         self.telegram.send_audio(&params).await?;
@@ -1354,6 +1557,33 @@ impl BotRunner {
             .and_then(|v| v.parse().ok())
             .unwrap_or_else(|| self.search.default_provider()))
     }
+
+    async fn model_api_key(&self, provider: ModelProvider) -> Result<String> {
+        let name = match provider {
+            ModelProvider::Openrouter => "OpenRouter",
+            ModelProvider::Aihub => "AI Hub",
+        };
+        self.store
+            .credential(&self.bot.id, provider.as_str())
+            .await?
+            .wrap_err_with(|| format!("{name} API key is not configured"))
+    }
+
+    async fn optional_model_api_key(
+        &self,
+        provider: ModelProvider,
+        required: bool,
+    ) -> Result<String> {
+        if required {
+            Ok(self
+                .store
+                .credential(&self.bot.id, provider.as_str())
+                .await?
+                .unwrap_or_default())
+        } else {
+            Ok(String::new())
+        }
+    }
 }
 
 fn parse_command(text: &str) -> Option<(String, &str)> {
@@ -1420,6 +1650,40 @@ fn message_has_media(message: &Message) -> bool {
                     || mime.starts_with("audio/")
             })
         })
+}
+
+fn attachment_flags(message: &Message) -> (bool, bool, bool) {
+    let sources = [Some(message), message.reply_to_message.as_deref()];
+    let image = sources.iter().flatten().any(|item| {
+        item.photo.is_some()
+            || item.document.as_ref().is_some_and(|document| {
+                document
+                    .mime_type
+                    .as_deref()
+                    .is_some_and(|mime| mime.starts_with("image/"))
+            })
+    });
+    let video = sources.iter().flatten().any(|item| {
+        item.video.is_some()
+            || item.video_note.is_some()
+            || item.document.as_ref().is_some_and(|document| {
+                document
+                    .mime_type
+                    .as_deref()
+                    .is_some_and(|mime| mime.starts_with("video/"))
+            })
+    });
+    let audio = sources.iter().flatten().any(|item| {
+        item.voice.is_some()
+            || item.audio.is_some()
+            || item.document.as_ref().is_some_and(|document| {
+                document
+                    .mime_type
+                    .as_deref()
+                    .is_some_and(|mime| mime.starts_with("audio/"))
+            })
+    });
+    (image, video, audio)
 }
 
 fn default_media_prompt(message: &Message) -> &'static str {

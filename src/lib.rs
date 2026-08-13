@@ -5,6 +5,7 @@ pub mod catalog;
 pub mod config;
 pub mod db;
 pub mod defaults;
+pub mod ephemeral_media;
 pub mod openrouter;
 pub mod rich;
 pub mod search;

@@ -15,7 +15,7 @@ use serde::{Deserialize, Serialize, de::DeserializeOwned};
 
 use crate::{
     Result,
-    config::{BotConfig, Config, DatabaseConfig},
+    config::{BotConfig, Config, DatabaseConfig, ModelProvider},
 };
 
 const STATE: TableDefinition<&str, &[u8]> = TableDefinition::new("state");
@@ -93,6 +93,8 @@ pub struct BotSettings {
 
 #[derive(Clone, Debug, Deserialize, Serialize, PartialEq, Eq)]
 pub struct ModelRouting {
+    #[serde(default)]
+    pub model_provider: ModelProvider,
     pub strategy: String,
     pub provider: Option<String>,
 }
@@ -100,6 +102,7 @@ pub struct ModelRouting {
 impl Default for ModelRouting {
     fn default() -> Self {
         Self {
+            model_provider: ModelProvider::Openrouter,
             strategy: "auto".into(),
             provider: None,
         }
@@ -216,6 +219,7 @@ impl Store {
         }
         for (provider, value) in [
             ("openrouter", config.openrouter.bootstrap_api_key.as_str()),
+            ("aihub", config.aihub.bootstrap_api_key.as_str()),
             ("brave", config.search.brave.bootstrap_api_key.as_str()),
             ("exa", config.search.exa.bootstrap_api_key.as_str()),
             ("serpapi", config.search.serpapi.bootstrap_api_key.as_str()),
@@ -570,7 +574,7 @@ fn secret_key(bot: &str, provider: &str) -> String {
     format!("{bot}|{provider}")
 }
 fn validate_provider(value: &str) -> Result<()> {
-    if matches!(value, "openrouter" | "brave" | "exa" | "serpapi") {
+    if matches!(value, "openrouter" | "aihub" | "brave" | "exa" | "serpapi") {
         Ok(())
     } else {
         bail!("Unknown credential provider")
@@ -653,6 +657,13 @@ mod tests {
                 .windows(b"super-secret-value".len())
                 .any(|window| window == b"super-secret-value")
         );
+    }
+
+    #[test]
+    fn legacy_model_routing_defaults_to_openrouter() {
+        let routing: ModelRouting =
+            serde_json::from_str(r#"{"strategy":"auto","provider":null}"#).unwrap();
+        assert_eq!(routing.model_provider, ModelProvider::Openrouter);
     }
 
     #[tokio::test]

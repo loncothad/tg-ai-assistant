@@ -1,9 +1,9 @@
 [package]
 name = "teleforge"
-version = "0.2.0"
+version = "0.3.0"
 edition = "2024"
 rust-version = "1.85"
-description = "Production multi-tenant Telegram AI assistant powered by OpenRouter"
+description = "Production multi-tenant Telegram AI assistant for OpenRouter and AI Hub"
 license = "MIT"
 
 [dependencies]

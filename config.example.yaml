@@ -21,6 +21,17 @@ telegram:
   # Tokens are assigned to enabled bot entries below in the same order.
   tokens: "${TELEGRAM_BOT_TOKENS}"
 
+# AI Hub is an independent OpenAI-compatible model provider. Its live model
+# list is loaded from /v1/models and is kept separate from OpenRouter in the UI.
+aihub:
+  bootstrap_api_key: "${AIHUB_API_KEY:-}"
+  base_url: "${AIHUB_BASE_URL:-https://aihub.top/v1}"
+  defaults:
+    max_completion_tokens: null
+    temperature: null
+    tools: []
+    extra: {}
+
 openrouter:
   # Optional bootstrap value. On first start it is encrypted separately for every
   # bot; administrators can then replace/remove it in the Mini App.
@@ -114,6 +125,13 @@ openrouter:
             max_tokens: 4096
 
   # Applied first; the selected model's options override these fields.
+  # A separate bounded call classifies natural-language requests. openrouter/free
+  # filters its zero-cost pool for structured-output support automatically.
+  planner:
+    model: "openrouter/free"
+    max_tokens: 600
+    timeout_seconds: 20
+
   defaults:
     models: []
     provider:

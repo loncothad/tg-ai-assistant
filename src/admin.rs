@@ -3,7 +3,7 @@
 use crate::{
     Result,
     catalog::ModelCatalogCache,
-    config::Config,
+    config::{Config, ModelProvider},
     db::{ModelRouting, Store},
 };
 use axum::{
@@ -76,8 +76,8 @@ async fn shell(Path(bot_id): Path<String>, State(state): State<AdminState>) -> R
 <header class="topbar"><div class="logo"><svg viewBox="0 0 24 24" fill="none" aria-hidden="true"><path d="m4 12 5 5L20 6" stroke="currentColor" stroke-width="2.5" stroke-linecap="round" stroke-linejoin="round"/></svg></div><div><h1>Teleforge</h1><div class="subtitle">Secure bot administration · {bot_id}</div></div></header>
 <div id="panel"><div class="loading"><div><div class="spinner"></div>Authenticating…</div></div></div>
 </main>
-<dialog id="model-dialog"><div class="picker-layout"><div class="picker-list"><div class="picker-head"><div><h2>Choose a model</h2><div id="picker-subtitle" class="subtitle">Live OpenRouter catalog</div></div><button id="model-close" class="icon-button" type="button" aria-label="Close">×</button></div><div class="search-wrap"><svg viewBox="0 0 24 24" fill="none"><circle cx="11" cy="11" r="7" stroke="currentColor" stroke-width="2"/><path d="m16 16 4 4" stroke="currentColor" stroke-width="2" stroke-linecap="round"/></svg><input id="model-search" type="search" autocomplete="off" placeholder="Fuzzy search names, IDs, descriptions…"></div><div id="model-count" class="result-count"></div><div id="model-results" class="model-results"></div></div><div id="model-detail" class="picker-detail"></div></div></dialog>
-<template id="model-settings"><label>Provider routing<select name="routing"><option value="auto">Auto · OpenRouter default</option><option value="cheapest">Cheapest provider</option><option value="throughput">Highest throughput</option><option value="latency">Lowest latency</option><option value="exacto">Exacto tool quality</option></select></label><label>Provider override<select name="provider"><option value="">Auto · any compatible provider</option></select></label><small class=provider-help>Loading the providers that currently serve this model…</small><button type="button" data-save-model id="model-save">Use this model</button></template>
+<dialog id="model-dialog"><div class="picker-layout"><div class="picker-list"><div class="picker-head"><div><h2>Choose a model</h2><div id="picker-subtitle" class="subtitle">Live provider catalogs</div></div><button id="model-close" class="icon-button" type="button" aria-label="Close">×</button></div><div id="model-provider-tabs" class="provider-tabs" role="tablist" aria-label="Model provider"></div><div class="search-wrap"><svg viewBox="0 0 24 24" fill="none"><circle cx="11" cy="11" r="7" stroke="currentColor" stroke-width="2"/><path d="m16 16 4 4" stroke="currentColor" stroke-width="2" stroke-linecap="round"/></svg><input id="model-search" type="search" autocomplete="off" placeholder="Fuzzy search names, IDs, descriptions…"></div><div id="model-count" class="result-count"></div><div id="model-results" class="model-results"></div></div><div id="model-detail" class="picker-detail"></div></div></dialog>
+<template id="model-settings"><div class="openrouter-routing"><label>OpenRouter routing<select name="routing"><option value="auto">Auto · OpenRouter default</option><option value="cheapest">Cheapest provider</option><option value="throughput">Highest throughput</option><option value="latency">Lowest latency</option><option value="exacto">Exacto tool quality</option></select></label><label>OpenRouter endpoint<select name="provider"><option value="">Auto · any compatible provider</option></select></label><small class=provider-help>Loading the providers that currently serve this model…</small></div><div class="direct-provider-note muted">AI Hub models are sent directly to AI Hub; OpenRouter routing controls do not apply.</div><button type="button" data-save-model id="model-save">Use this model</button></template>
 <script nonce="{nonce}">{js}</script></body></html>"#,
         css = include_str!("../assets/admin.css"),
         js = include_str!("../assets/admin.js"),
@@ -117,17 +117,49 @@ async fn models(
         Ok(auth) => auth,
         Err(error) => return auth_error(error),
     };
-    match catalog_for(&state, &bot).await {
-        Ok(models) => {
-            no_store(Json(serde_json::json!({ "models": models.as_ref() })).into_response())
+    let mut models = Vec::new();
+    let mut providers = Vec::new();
+    for (provider, label) in [
+        (ModelProvider::Openrouter, "OpenRouter"),
+        (ModelProvider::Aihub, "AI Hub"),
+    ] {
+        if !state
+            .store
+            .credential_configured(&bot, provider.as_str())
+            .await
+            .unwrap_or(false)
+        {
+            providers.push(serde_json::json!({
+                "id": provider.as_str(), "label": label, "available": false,
+                "message": "API key is not configured"
+            }));
+            continue;
         }
-        Err(error) => internal(error),
+        match catalog_for(&state, &bot, provider).await {
+            Ok(catalog) => {
+                models.extend(catalog.iter().cloned());
+                providers.push(serde_json::json!({
+                    "id": provider.as_str(), "label": label, "available": true,
+                    "models": catalog.len()
+                }));
+            }
+            Err(error) => {
+                tracing::warn!(bot_id = %bot, provider = provider.as_str(), error = %format!("{error:#}"), "model catalog unavailable");
+                providers.push(serde_json::json!({
+                    "id": provider.as_str(), "label": label, "available": false,
+                    "message": "Catalog is temporarily unavailable"
+                }));
+            }
+        }
     }
+    no_store(Json(serde_json::json!({ "models": models, "providers": providers })).into_response())
 }
 
 #[derive(Deserialize)]
 struct ModelProvidersQuery {
     model: String,
+    model_provider: ModelProvider,
+    capability: String,
 }
 
 async fn model_providers(
@@ -140,14 +172,21 @@ async fn model_providers(
         Ok(auth) => auth,
         Err(error) => return auth_error(error),
     };
-    let catalog = match catalog_for(&state, &bot).await {
+    if query.model_provider != ModelProvider::Openrouter {
+        return no_store(Json(serde_json::json!({ "providers": [] })).into_response());
+    }
+    let catalog = match catalog_for(&state, &bot, query.model_provider).await {
         Ok(catalog) => catalog,
         Err(error) => return internal(error),
     };
     if !catalog.iter().any(|model| model.id == query.model) {
         return message(StatusCode::BAD_REQUEST, "Unknown model");
     }
-    let endpoint_url = match model_endpoints_url(&state.config.openrouter.base_url, &query.model) {
+    let endpoint_url = match model_endpoints_url(
+        &state.config.openrouter.base_url,
+        &query.model,
+        &query.capability,
+    ) {
         Ok(url) => url,
         Err(error) => return internal(error),
     };
@@ -177,12 +216,13 @@ async fn model_providers(
     };
     let mut providers = value
         .pointer("/data/endpoints")
+        .or_else(|| value.get("endpoints"))
         .and_then(Value::as_array)
         .into_iter()
         .flatten()
         .filter_map(|endpoint| {
             Some(serde_json::json!({
-                "tag": endpoint.get("tag")?.as_str()?,
+                "tag": endpoint.get("tag").or_else(|| endpoint.get("provider_tag")).or_else(|| endpoint.get("provider_slug"))?.as_str()?,
                 "name": endpoint.get("provider_name")?.as_str()?,
                 "context_length": endpoint.get("context_length"),
                 "max_completion_tokens": endpoint.get("max_completion_tokens"),
@@ -202,13 +242,16 @@ async fn model_providers(
     no_store(Json(serde_json::json!({ "providers": providers })).into_response())
 }
 
-fn model_endpoints_url(base_url: &str, model: &str) -> Result<url::Url> {
+fn model_endpoints_url(base_url: &str, model: &str, capability: &str) -> Result<url::Url> {
     let mut url = url::Url::parse(base_url).wrap_err("Invalid OpenRouter base URL")?;
     {
         let mut segments = url
             .path_segments_mut()
             .map_err(|_| eyre::eyre!("OpenRouter base URL cannot contain path segments"))?;
         segments.pop_if_empty().push("models");
+        if capability == "image_generation" {
+            segments.pop().push("images").push("models");
+        }
         for segment in model.split('/') {
             segments.push(segment);
         }
@@ -225,21 +268,42 @@ async fn openrouter_key(state: &AdminState, bot: &str) -> Result<String> {
         .context("OpenRouter API key is not configured")
 }
 
+async fn aihub_key(state: &AdminState, bot: &str) -> Result<String> {
+    state
+        .store
+        .credential(bot, "aihub")
+        .await?
+        .context("AI Hub API key is not configured")
+}
+
 async fn catalog_for(
     state: &AdminState,
     bot: &str,
+    model_provider: ModelProvider,
 ) -> Result<Arc<Vec<crate::catalog::CatalogModel>>> {
-    let key = openrouter_key(state, bot).await?;
-    state
-        .catalog
-        .get(&state.client, &state.config.openrouter.base_url, bot, &key)
-        .await
+    match model_provider {
+        ModelProvider::Openrouter => {
+            let key = openrouter_key(state, bot).await?;
+            state
+                .catalog
+                .get_openrouter(&state.client, &state.config.openrouter.base_url, bot, &key)
+                .await
+        }
+        ModelProvider::Aihub => {
+            let key = aihub_key(state, bot).await?;
+            state
+                .catalog
+                .get_aihub(&state.client, &state.config.aihub.base_url, bot, &key)
+                .await
+        }
+    }
 }
 
 #[derive(Deserialize)]
 struct ModelForm {
     capability: String,
     model: String,
+    model_provider: ModelProvider,
     routing: String,
     provider: Option<String>,
 }
@@ -253,18 +317,33 @@ async fn set_model(
         Ok(auth) => auth,
         Err(e) => return auth_error(e),
     };
-    let allowed = catalog_for(&state, &bot)
+    let allowed = catalog_for(&state, &bot, form.model_provider)
         .await
         .map(|models| {
             models
                 .iter()
                 .any(|model| model.id == form.model && model.supports(&form.capability))
         })
-        .unwrap_or_else(|_| model_allowed_fallback(&state.config, &form.capability, &form.model));
+        .unwrap_or_else(|_| {
+            form.model_provider == ModelProvider::Openrouter
+                && model_allowed_fallback(&state.config, &form.capability, &form.model)
+        });
     if !allowed {
         return message(
             StatusCode::BAD_REQUEST,
             "Unknown model or model does not support this capability",
+        );
+    }
+    if form.model_provider == ModelProvider::Aihub
+        && (form.routing != "auto"
+            || form
+                .provider
+                .as_deref()
+                .is_some_and(|value| !value.is_empty()))
+    {
+        return message(
+            StatusCode::BAD_REQUEST,
+            "AI Hub does not support OpenRouter endpoint routing controls",
         );
     }
     if !matches!(
@@ -301,6 +380,7 @@ async fn set_model(
             &form.capability,
             &form.model,
             ModelRouting {
+                model_provider: form.model_provider,
                 strategy: form.routing,
                 provider,
             },
@@ -369,15 +449,28 @@ async fn set_capability(
         Err(error) => return auth_error(error),
     };
     if form.enabled {
+        let settings = match state.store.settings(&bot).await {
+            Ok(settings) => settings,
+            Err(error) => return internal(error),
+        };
+        if form.capability == "web_fetch"
+            && model_provider_for_capability(&settings, "chat") != ModelProvider::Openrouter
+        {
+            return message(
+                StatusCode::BAD_REQUEST,
+                "Web Fetch requires an OpenRouter chat model because it is an OpenRouter server tool",
+            );
+        }
         let required_provider = if form.capability == "search" {
-            match state.store.settings(&bot).await {
-                Ok(settings) => settings
-                    .search_provider
-                    .unwrap_or_else(|| state.config.search.default_provider.as_str().to_owned()),
-                Err(error) => return internal(error),
-            }
-        } else {
+            settings
+                .search_provider
+                .unwrap_or_else(|| state.config.search.default_provider.as_str().to_owned())
+        } else if form.capability == "web_fetch" {
             "openrouter".to_owned()
+        } else {
+            model_provider_for_skill(&settings, &form.capability)
+                .as_str()
+                .to_owned()
         };
         match state
             .store
@@ -682,10 +775,12 @@ async fn render(state: &AdminState, bot: &str) -> Response {
 async fn render_html(state: &AdminState, bot: &str) -> Result<String> {
     let settings = state.store.settings(bot).await?;
     let mut configured = BTreeMap::new();
-    for p in ["openrouter", "brave", "exa", "serpapi"] {
+    for p in ["openrouter", "aihub", "brave", "exa", "serpapi"] {
         configured.insert(p, state.store.credential_configured(bot, p).await?);
     }
     let openrouter_ready = configured.get("openrouter").copied().unwrap_or(false);
+    let aihub_ready = configured.get("aihub").copied().unwrap_or(false);
+    let any_model_provider_ready = openrouter_ready || aihub_ready;
     let route = |capability: &str| {
         settings
             .model_routing
@@ -699,49 +794,56 @@ async fn render_html(state: &AdminState, bot: &str) -> Result<String> {
             "chat",
             &settings.selected_model,
             &route("chat"),
-            openrouter_ready,
+            &configured,
+            any_model_provider_ready,
         ),
         model_form(
             "Image understanding",
             "image_understanding",
             &settings.selected_image_understanding_model,
             &route("image_understanding"),
-            openrouter_ready,
+            &configured,
+            any_model_provider_ready,
         ),
         model_form(
             "Video understanding",
             "video_understanding",
             &settings.selected_video_understanding_model,
             &route("video_understanding"),
-            openrouter_ready,
+            &configured,
+            any_model_provider_ready,
         ),
         model_form(
             "Image generation",
             "image_generation",
             &settings.selected_image_generation_model,
             &route("image_generation"),
-            openrouter_ready,
+            &configured,
+            any_model_provider_ready,
         ),
         model_form(
             "Speech generation",
             "audio_generation",
             &settings.selected_audio_generation_model,
             &route("audio_generation"),
-            openrouter_ready,
+            &configured,
+            any_model_provider_ready,
         ),
         model_form(
             "Transcription",
             "transcription",
             &settings.selected_transcription_model,
             &route("transcription"),
-            openrouter_ready,
+            &configured,
+            any_model_provider_ready,
         ),
         model_form(
             "Video generation",
             "video_generation",
             &settings.selected_video_generation_model,
             &route("video_generation"),
-            openrouter_ready,
+            &configured,
+            any_model_provider_ready,
         ),
     ]
     .join("");
@@ -765,17 +867,26 @@ async fn render_html(state: &AdminState, bot: &str) -> Result<String> {
         .iter()
         .map(|skill| {
             let on = enabled(skill.id);
-            let available = if skill.id == "search" {
-                search_available
-            } else {
-                openrouter_ready
+            let selected_model_provider = model_provider_for_skill(&settings, skill.id);
+            let available = match skill.id {
+                "search" => search_available,
+                "web_fetch" => {
+                    model_provider_for_capability(&settings, "chat") == ModelProvider::Openrouter
+                        && openrouter_ready
+                }
+                _ => configured
+                    .get(selected_model_provider.as_str())
+                    .copied()
+                    .unwrap_or(false),
             };
             let availability = if available {
                 "Available"
             } else if skill.id == "search" {
                 "Unavailable: the selected search provider has no configured API key"
+            } else if skill.id == "web_fetch" {
+                "Unavailable: Web Fetch requires an OpenRouter chat model and API key"
             } else {
-                "Unavailable: OPENROUTER_API_KEY was not provided and no OpenRouter key has been saved"
+                "Unavailable: the API key for this skill's selected model provider is missing"
             };
             format!(
                 "<form hx-post=\"capability\" hx-target=\"#panel\"><input type=hidden name=capability value=\"{}\"><input type=hidden name=enabled value=\"{}\"><button {}>{}: {}</button><small>{}<br>{}</small></form>",
@@ -799,7 +910,7 @@ async fn render_html(state: &AdminState, bot: &str) -> Result<String> {
     };
     Ok(format!(
         "<nav class=\"jump-nav\"><button type=button data-jump=\"models\">Models</button><button type=button data-jump=\"skills\">Skills</button><button type=button data-jump=\"credentials\">Credentials</button><button type=button data-jump=\"instructions\">Instructions</button><button type=button data-jump=\"access\">Access</button></nav>
-        <section id=\"models\"><div class=\"section-head\"><div><h2>Models by capability</h2><p>Every compatible model in OpenRouter's live catalog is searchable.</p></div><span class=\"badge\">Live catalog</span></div><div class=\"grid model-grid\">{model_forms}</div><form hx-post=\"search\" hx-target=\"#panel\" hx-swap=\"innerHTML transition:true\"><label>Web search provider<select name=provider>{}</select></label><button>Save search provider</button></form></section>
+        <section id=\"models\"><div class=\"section-head\"><div><h2>Models by capability</h2><p>OpenRouter and AI Hub catalogs are loaded separately and selected per capability.</p></div><span class=\"badge\">Live catalogs</span></div><div class=\"grid model-grid\">{model_forms}</div><form hx-post=\"search\" hx-target=\"#panel\" hx-swap=\"innerHTML transition:true\"><label>Web search provider<select name=provider>{}</select></label><button>Save search provider</button></form></section>
         <section id=\"skills\"><div class=\"section-head\"><div><h2>Built-in skills</h2><p>Enable only the callable APIs and instructions this bot should expose.</p></div></div><div class=grid>{caps}</div></section>
         <section id=\"credentials\"><div class=\"section-head\"><div><h2>API credentials</h2><p>Encrypted at rest and never returned to the browser.</p></div></div><div class=grid>{creds}</div></section>
         <section id=\"instructions\"><div class=\"section-head\"><div><h2>System prompt</h2><p>Override or restore the prompt compiled into this binary.</p></div></div>{}</section>
@@ -824,34 +935,68 @@ fn model_form(
     capability: &str,
     selected: &str,
     routing: &ModelRouting,
-    available: bool,
+    configured: &BTreeMap<&str, bool>,
+    chooser_available: bool,
 ) -> String {
+    let selected_provider = routing.model_provider.as_str();
+    let selected_available = configured.get(selected_provider).copied().unwrap_or(false);
     format!(
-        "<article class=\"card model-card\" data-capability=\"{}\" data-model=\"{}\"><h3>{}</h3><div class=model-name>{}</div><div class=model-id>{}</div><p class=model-summary>Loading metadata from OpenRouter…</p><div class=\"chips model-chips\"></div><div class=route-line><span>Routing: {}</span><span>Provider: {}</span></div><button type=button class=model-picker data-capability=\"{}\" data-model=\"{}\" data-routing=\"{}\" data-provider=\"{}\" {disabled}>{button}</button><small class=\"{status_class}\">{status}</small></article>",
+        "<article class=\"card model-card\" data-capability=\"{}\" data-model=\"{}\" data-model-provider=\"{}\"><h3>{}</h3><div class=model-name>{}</div><div class=model-id>{}</div><p class=model-summary>Loading provider metadata…</p><div class=\"chips model-chips\"></div><div class=route-line><span>API: {}</span><span>Routing: {}</span><span>Endpoint: {}</span></div><button type=button class=model-picker data-capability=\"{}\" data-model=\"{}\" data-model-provider=\"{}\" data-routing=\"{}\" data-provider=\"{}\" {disabled}>{button}</button><small class=\"{status_class}\">{status}</small></article>",
         esc(capability),
         esc(selected),
+        esc(selected_provider),
         esc(label),
         esc(selected),
         esc(selected),
+        esc(selected_provider),
         esc(&routing.strategy),
         esc(routing.provider.as_deref().unwrap_or("auto")),
         esc(capability),
         esc(selected),
+        esc(selected_provider),
         esc(&routing.strategy),
         esc(routing.provider.as_deref().unwrap_or("")),
-        disabled = if available { "" } else { "disabled" },
-        button = if available {
+        disabled = if chooser_available { "" } else { "disabled" },
+        button = if chooser_available {
             "Choose model"
         } else {
-            "OpenRouter key required"
+            "Provider key required"
         },
-        status_class = if available { "status-ok" } else { "status-off" },
-        status = if available {
+        status_class = if selected_available {
+            "status-ok"
+        } else {
+            "status-off"
+        },
+        status = if selected_available {
             "Ready"
         } else {
-            "Unavailable: no OpenRouter API key is configured"
+            "Unavailable: selected model provider API key is not configured"
         }
     )
+}
+
+fn model_provider_for_capability(
+    settings: &crate::db::BotSettings,
+    capability: &str,
+) -> ModelProvider {
+    settings
+        .model_routing
+        .get(capability)
+        .map(|routing| routing.model_provider)
+        .unwrap_or_default()
+}
+
+fn model_provider_for_skill(settings: &crate::db::BotSettings, skill: &str) -> ModelProvider {
+    let capability = match skill {
+        "image" => "image_generation",
+        "audio" => "audio_generation",
+        "video" => "video_generation",
+        "transcription" => "transcription",
+        "media" => "image_understanding",
+        "file" => "chat",
+        _ => "chat",
+    };
+    model_provider_for_capability(settings, capability)
 }
 
 fn model_allowed_fallback(config: &Config, capability: &str, id: &str) -> bool {
@@ -1045,14 +1190,17 @@ mod tests {
 
     #[test]
     fn model_card_uses_picker_instead_of_a_large_select() {
+        let configured = BTreeMap::from([("openrouter", true), ("aihub", false)]);
         let html = model_form(
             "General chat",
             "chat",
             "vendor/model",
             &ModelRouting {
+                model_provider: ModelProvider::Openrouter,
                 strategy: "cheapest".into(),
                 provider: None,
             },
+            &configured,
             true,
         );
         assert!(html.contains("class=model-picker"));
@@ -1062,10 +1210,21 @@ mod tests {
 
     #[test]
     fn model_endpoint_url_encodes_untrusted_path_segments() {
-        let url = model_endpoints_url("https://openrouter.ai/api/v1", "vendor/a?b").unwrap();
+        let url =
+            model_endpoints_url("https://openrouter.ai/api/v1", "vendor/a?b", "chat").unwrap();
         assert_eq!(
             url.as_str(),
             "https://openrouter.ai/api/v1/models/vendor/a%3Fb/endpoints"
+        );
+        let image = model_endpoints_url(
+            "https://openrouter.ai/api/v1",
+            "vendor/image",
+            "image_generation",
+        )
+        .unwrap();
+        assert_eq!(
+            image.as_str(),
+            "https://openrouter.ai/api/v1/images/models/vendor/image/endpoints"
         );
     }
 }

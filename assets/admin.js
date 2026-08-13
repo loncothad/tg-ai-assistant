@@ -11,13 +11,17 @@ const results = document.getElementById('model-results');
 const count = document.getElementById('model-count');
 const detail = document.getElementById('model-detail');
 const pickerSubtitle = document.getElementById('picker-subtitle');
+const providerTabs = document.getElementById('model-provider-tabs');
 let catalogPromise;
 let catalog = [];
+let catalogProviders = [];
+let activeModelProvider = 'openrouter';
 let capability = '';
 let chosen = null;
 let selectedRouting = 'auto';
 let selectedProvider = '';
 let originalModel = '';
+let originalModelProvider = 'openrouter';
 const providerCache = new Map();
 const capabilityNames = {
   chat: 'General chat', image_understanding: 'Image understanding', video_understanding: 'Video understanding',
@@ -70,17 +74,37 @@ const fuzzyScore = (model, rawQuery) => {
 
 const compactNumber = value => value ? new Intl.NumberFormat(undefined, { notation: 'compact' }).format(value) : '—';
 const price = value => {
-  if (value === undefined) return '—';
+  if (value === undefined || value === null || value === '') return 'Not published';
   const numeric = Number(value) * 1_000_000;
   return Number.isFinite(numeric) ? `$${numeric.toLocaleString(undefined, { maximumFractionDigits: 4 })} / 1M` : value;
 };
 const date = value => value ? new Date(value * 1000).toLocaleDateString() : 'Not published';
 const unitPrice = (key, value) => {
-  if (['prompt', 'completion', 'input_cache_read', 'input_cache_write', 'audio', 'internal_reasoning'].includes(key)) {
+  const mediaEndpoint = ['image_generation', 'audio_generation', 'transcription', 'video_generation'].includes(capability);
+  if (['prompt', 'completion'].includes(key) && mediaEndpoint) {
+    const numeric = Number(value);
+    if (numeric === 0) return `${key}: not billed on this field`;
+    return `${key}: ${Number.isFinite(numeric) ? `$${numeric.toLocaleString(undefined, { maximumFractionDigits: 6 })} / published billing unit` : value}`;
+  }
+  if (['prompt', 'completion', 'input_cache_read', 'input_cache_write', 'internal_reasoning', 'audio', 'audio_output'].includes(key)) {
     return `${key}: ${price(value)}`;
   }
   const numeric = Number(value);
-  return `${key}: ${Number.isFinite(numeric) ? `$${numeric.toLocaleString(undefined, { maximumFractionDigits: 6 })}` : value}`;
+  return `${key}: ${Number.isFinite(numeric) ? `$${numeric.toLocaleString(undefined, { maximumFractionDigits: 6 })} / unit` : value}`;
+};
+
+const meaningfulTokenPrice = value => {
+  if (value === undefined || value === null || value === '') return 'Not published';
+  return Number(value) === 0 ? 'Not token-priced' : price(value);
+};
+
+const primaryRate = value => {
+  if (value === undefined || value === null || value === '') return 'Not published';
+  if (Number(value) === 0) return 'Not billed on this field';
+  if (['image_generation', 'audio_generation', 'transcription', 'video_generation'].includes(capability)) {
+    return `$${Number(value).toLocaleString(undefined, { maximumFractionDigits: 6 })} / published unit`;
+  }
+  return meaningfulTokenPrice(value);
 };
 
 const chips = values => {
@@ -102,19 +126,28 @@ const providerLabel = endpoint => {
   return parts.filter(Boolean).join(' · ');
 };
 
-const loadProviders = async (modelId, select, help, selected, saveButton) => {
+const loadProviders = async (model, select, help, selected, saveButton) => {
+  if (model.model_provider !== 'openrouter') {
+    select.replaceChildren(new Option('Direct · AI Hub', ''));
+    select.disabled = true;
+    help.textContent = 'No secondary endpoint routing is exposed by AI Hub.';
+    saveButton.disabled = false;
+    return;
+  }
+  const modelId = model.id;
   select.disabled = true;
   saveButton.disabled = true;
   try {
-    if (!providerCache.has(modelId)) {
-      providerCache.set(modelId, fetch(`model-providers?model=${encodeURIComponent(modelId)}`, {
+    const cacheKey = `${capability}:${modelId}`;
+    if (!providerCache.has(cacheKey)) {
+      providerCache.set(cacheKey, fetch(`model-providers?model=${encodeURIComponent(modelId)}&model_provider=openrouter&capability=${encodeURIComponent(capability)}`, {
         headers: { 'X-Telegram-Init-Data': initData }
       }).then(async response => {
         if (!response.ok) throw new Error(await response.text());
         return (await response.json()).providers || [];
       }));
     }
-    const endpoints = await providerCache.get(modelId);
+    const endpoints = await providerCache.get(cacheKey);
     const unique = new Map(endpoints.map(endpoint => [endpoint.tag, endpoint]));
     select.replaceChildren(new Option('Auto · any compatible provider', ''));
     unique.forEach(endpoint => select.add(new Option(providerLabel(endpoint), endpoint.tag)));
@@ -134,15 +167,16 @@ const loadProviders = async (modelId, select, help, selected, saveButton) => {
 const showDetail = model => {
   chosen = model;
   detail.replaceChildren();
-  detail.append(text('h2', model.name), text('div', model.id, 'model-id'));
+  const providerName = model.model_provider === 'aihub' ? 'AI Hub' : 'OpenRouter';
+  detail.append(text('h2', model.name), text('div', `${providerName} · ${model.id}`, 'model-id'));
   detail.append(chips([...(model.input_modalities || []).map(item => `in: ${item}`), ...(model.output_modalities || []).map(item => `out: ${item}`)]));
-  detail.append(text('p', model.description || 'No description is supplied by OpenRouter.', 'description'));
+  detail.append(text('p', model.description || `No description is supplied by ${providerName}.`, 'description'));
   const facts = text('div', '', 'facts');
   facts.append(
     fact('Context', compactNumber(model.context_length)),
     fact('Max output', compactNumber(model.max_completion_tokens)),
-    fact('Input price', price(model.pricing?.prompt)),
-    fact('Output price', price(model.pricing?.completion)),
+    fact('Input rate', primaryRate(model.pricing?.prompt)),
+    fact('Output rate', primaryRate(model.pricing?.completion)),
     fact('Knowledge cutoff', model.knowledge_cutoff || 'Not published'),
     fact('Tokenizer', model.tokenizer || 'Not published'),
     fact('Released', date(model.created)),
@@ -170,16 +204,19 @@ const showDetail = model => {
   }
   detail.append(document.getElementById('model-settings').content.cloneNode(true));
   const routing = detail.querySelector('[name=routing]');
-  routing.value = selectedRouting;
-  if (!['chat', 'image_understanding', 'video_understanding'].includes(capability)) {
-    routing.querySelector('[value=exacto]')?.remove();
-  }
+  const openrouterControls = detail.querySelector('.openrouter-routing');
+  const directNote = detail.querySelector('.direct-provider-note');
+  const isOpenRouter = model.model_provider === 'openrouter';
+  openrouterControls.hidden = !isOpenRouter;
+  directNote.hidden = isOpenRouter;
+  routing.value = isOpenRouter ? selectedRouting : 'auto';
+  if (!['chat', 'image_understanding', 'video_understanding'].includes(capability)) routing.querySelector('[value=exacto]')?.remove();
   const saveButton = detail.querySelector('[data-save-model]');
   loadProviders(
-    model.id,
+    model,
     detail.querySelector('[name=provider]'),
     detail.querySelector('.provider-help'),
-    model.id === originalModel ? selectedProvider : '',
+    model.id === originalModel && model.model_provider === originalModelProvider ? selectedProvider : '',
     saveButton
   );
   saveButton.addEventListener('click', saveModel);
@@ -189,11 +226,13 @@ const showDetail = model => {
 const renderResults = () => {
   const query = search.value;
   const filtered = catalog
+    .filter(model => model.model_provider === activeModelProvider)
     .filter(model => supports(model, capability))
     .map(model => ({ model, score: fuzzyScore(model, query) }))
     .filter(item => item.score > 0)
     .sort((a, b) => b.score - a.score || (b.model.created || 0) - (a.model.created || 0) || a.model.name.localeCompare(b.model.name));
-  count.textContent = `${filtered.length.toLocaleString()} matching models · showing ${Math.min(60, filtered.length)}`;
+  const provider = catalogProviders.find(item => item.id === activeModelProvider);
+  count.textContent = `${provider?.label || activeModelProvider} · ${filtered.length.toLocaleString()} matching models · showing ${Math.min(60, filtered.length)}`;
   results.replaceChildren();
   filtered.slice(0, 60).forEach(({ model }) => {
     const button = text('button', '', 'model-result');
@@ -206,23 +245,48 @@ const renderResults = () => {
   if (!filtered.length) results.append(text('div', 'No models match this search.', 'muted'));
 };
 
+const renderProviderTabs = () => {
+  providerTabs.replaceChildren();
+  catalogProviders.forEach(provider => {
+    const button = text('button', `${provider.label}${provider.available ? ` · ${provider.models || 0}` : ' · unavailable'}`);
+    button.type = 'button';
+    button.role = 'tab';
+    button.disabled = !provider.available;
+    button.classList.toggle('selected', provider.id === activeModelProvider);
+    button.addEventListener('click', () => {
+      activeModelProvider = provider.id;
+      chosen = null;
+      renderProviderTabs();
+      renderResults();
+      detail.replaceChildren(text('div', `Choose a ${provider.label} model to inspect it.`, 'muted'));
+      pickerSubtitle.textContent = `${capabilityNames[capability] || capability} · ${provider.label}`;
+    });
+    providerTabs.append(button);
+  });
+};
+
 const loadCatalog = () => {
   catalogPromise ||= fetch('models', { headers: { 'X-Telegram-Init-Data': initData } })
     .then(async response => {
       if (!response.ok) throw new Error(await response.text());
       return response.json();
     })
-    .then(body => { catalog = body.models || []; enrichCards(); return catalog; });
+    .then(body => {
+      catalog = body.models || [];
+      catalogProviders = body.providers || [];
+      enrichCards();
+      return catalog;
+    });
   return catalogPromise;
 };
 
 const enrichCards = () => {
   document.querySelectorAll('.model-card').forEach(card => {
-    const model = catalog.find(item => item.id === card.dataset.model);
+    const model = catalog.find(item => item.id === card.dataset.model && item.model_provider === card.dataset.modelProvider);
     if (!model) return;
     card.querySelector('.model-name').textContent = model.name;
     const summary = card.querySelector('.model-summary');
-    summary.textContent = model.description ? `${model.description.slice(0, 155)}${model.description.length > 155 ? '…' : ''}` : 'OpenRouter model metadata is not available.';
+    summary.textContent = model.description ? `${model.description.slice(0, 155)}${model.description.length > 155 ? '…' : ''}` : 'Provider metadata is not available.';
     const target = card.querySelector('.model-chips');
     target.replaceChildren(...[
       `context ${compactNumber(model.context_length)}`,
@@ -234,22 +298,28 @@ const enrichCards = () => {
 
 const openPicker = async button => {
   capability = button.dataset.capability;
-  pickerSubtitle.textContent = `${capabilityNames[capability] || capability} · live OpenRouter catalog`;
+  activeModelProvider = button.dataset.modelProvider || 'openrouter';
+  pickerSubtitle.textContent = `${capabilityNames[capability] || capability} · provider catalogs`;
   selectedRouting = button.dataset.routing || 'auto';
   selectedProvider = button.dataset.provider || '';
   originalModel = button.dataset.model;
+  originalModelProvider = button.dataset.modelProvider || 'openrouter';
   search.value = '';
   detail.replaceChildren(text('div', 'Loading model details…', 'loading'));
   dialog.showModal();
   try {
     await loadCatalog();
+    if (!catalogProviders.some(provider => provider.id === activeModelProvider && provider.available)) {
+      activeModelProvider = catalogProviders.find(provider => provider.available)?.id || activeModelProvider;
+    }
+    renderProviderTabs();
     renderResults();
-    const selected = catalog.find(model => model.id === button.dataset.model && supports(model, capability));
+    const selected = catalog.find(model => model.id === button.dataset.model && model.model_provider === button.dataset.modelProvider && supports(model, capability));
     if (selected) showDetail(selected);
-    else detail.replaceChildren(text('div', 'The saved model is no longer in the current OpenRouter catalog. Choose a replacement.', 'catalog-error'));
+    else detail.replaceChildren(text('div', 'The saved model is no longer in its current provider catalog. Choose a replacement.', 'catalog-error'));
     search.focus();
   } catch (error) {
-    detail.replaceChildren(text('div', `Could not load OpenRouter models: ${error.message}`, 'catalog-error'));
+    detail.replaceChildren(text('div', `Could not load model catalogs: ${error.message}`, 'catalog-error'));
   }
 };
 
@@ -262,8 +332,9 @@ const saveModel = async event => {
   const body = new URLSearchParams({
     capability,
     model: chosen.id,
-    routing: settings.querySelector('[name=routing]').value,
-    provider: settings.querySelector('[name=provider]').value
+    model_provider: chosen.model_provider,
+    routing: chosen.model_provider === 'openrouter' ? settings.querySelector('[name=routing]').value : 'auto',
+    provider: chosen.model_provider === 'openrouter' ? settings.querySelector('[name=provider]').value : ''
   });
   try {
     const response = await fetch('model', {
@@ -294,7 +365,12 @@ document.addEventListener('click', event => {
 document.getElementById('model-close').addEventListener('click', () => dialog.close());
 dialog.addEventListener('click', event => { if (event.target === dialog) dialog.close(); });
 search.addEventListener('input', renderResults);
-document.addEventListener('htmx:afterSwap', enrichCards);
+document.addEventListener('htmx:afterSwap', event => {
+  if (event.detail.target !== panel) return;
+  catalogPromise = null;
+  providerCache.clear();
+  loadCatalog().catch(() => {});
+});
 
 const adminPath = location.pathname.replace(/\/+$/, '');
 window.htmx.ajax('GET', `${adminPath}/panel`, { target: '#panel', swap: 'innerHTML transition:true' });
