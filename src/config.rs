@@ -99,8 +99,10 @@ pub struct ServerConfig {
     pub public_url: String,
     #[serde(default = "default_request_timeout")]
     pub request_timeout_seconds: u64,
-    #[serde(default = "default_concurrency")]
-    pub max_concurrent_requests_per_bot: usize,
+    /// Accepted only so older deployments can upgrade without editing YAML.
+    /// Update processing is intentionally unbounded and does not use this value.
+    #[serde(default, skip_serializing, rename = "max_concurrent_requests_per_bot")]
+    pub deprecated_concurrency_limit: Option<usize>,
     #[serde(default = "default_auth_ttl")]
     pub admin_init_data_ttl_seconds: i64,
     #[serde(default = "default_media_bytes")]
@@ -114,7 +116,7 @@ impl Default for ServerConfig {
             listen: default_listen(),
             public_url: String::new(),
             request_timeout_seconds: default_request_timeout(),
-            max_concurrent_requests_per_bot: default_concurrency(),
+            deprecated_concurrency_limit: None,
             admin_init_data_ttl_seconds: default_auth_ttl(),
             max_input_media_bytes: default_media_bytes(),
             json_logs: false,
@@ -760,8 +762,8 @@ impl Config {
                 bail!("Bot {} requires an administrator", bot.id);
             }
         }
-        if self.server.max_concurrent_requests_per_bot == 0 || self.search.max_results == 0 {
-            bail!("Concurrency and search result limits must be greater than zero");
+        if self.search.max_results == 0 {
+            bail!("Search result limit must be greater than zero");
         }
         if self.server.max_input_media_bytes == 0 {
             bail!("Server max_input_media_bytes must be greater than zero");
@@ -918,9 +920,6 @@ fn default_listen() -> String {
 }
 fn default_request_timeout() -> u64 {
     180
-}
-fn default_concurrency() -> usize {
-    8
 }
 fn default_auth_ttl() -> i64 {
     900

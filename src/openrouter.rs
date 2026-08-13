@@ -329,7 +329,6 @@ impl OpenRouter {
                 ],
                 "temperature": 0,
                 "max_tokens": self.config.planner.max_tokens,
-                "reasoning": {"effort":"none", "exclude":true},
                 "plugins": [{"id":"response-healing"}],
                 "provider": {
                     "require_parameters": true,
@@ -1662,6 +1661,13 @@ fn extract_refusal(message: &Value) -> Option<String> {
 }
 
 fn parse_planner_response(value: &Value) -> Result<RequestPlan> {
+    if let Some(message) = value
+        .pointer("/error/message")
+        .and_then(Value::as_str)
+        .filter(|message| !message.trim().is_empty())
+    {
+        bail!("OpenRouter request planner returned an error: {message}");
+    }
     let message = value
         .pointer("/choices/0/message")
         .context("OpenRouter request planner returned no message")?;

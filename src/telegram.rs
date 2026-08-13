@@ -28,7 +28,7 @@ use frankenstein::{
 };
 use tempfile::Builder as TempFileBuilder;
 use tokio::{
-    sync::{Semaphore, mpsc, watch},
+    sync::{mpsc, watch},
     task::JoinSet,
     time::sleep,
 };
@@ -36,11 +36,12 @@ use tracing::{error, info, warn};
 
 use crate::{
     Result,
+    catalog::ModelCatalogCache,
     config::{BotConfig, Config, ModelProvider, SearchProvider},
     db::{ModelRouting, Store},
     openrouter::{
         ChatRequest, MediaInput, OpenRouter, PlannedAction, PlannedSkill, PlanningRequest,
-        ProgressUpdate, ToolModel, ToolModels,
+        ProgressUpdate, RequestPlan, ToolModel, ToolModels,
     },
     rich,
     search::SearchService,
@@ -55,7 +56,7 @@ pub struct BotRunner {
     openrouter: OpenRouter,
     search: SearchService,
     client: reqwest::Client,
-    semaphore: Arc<Semaphore>,
+    catalog: ModelCatalogCache,
     bot_user_id: u64,
     username: String,
 }
@@ -95,7 +96,6 @@ impl BotRunner {
             config.aihub.clone(),
         );
         let search = SearchService::new(client.clone(), config.search.clone());
-        let concurrency = config.server.max_concurrent_requests_per_bot;
         Ok(Self {
             telegram,
             bot,
@@ -104,7 +104,7 @@ impl BotRunner {
             openrouter,
             search,
             client,
-            semaphore: Arc::new(Semaphore::new(concurrency)),
+            catalog: ModelCatalogCache::default(),
             bot_user_id: identity.id,
             username,
         })
@@ -113,6 +113,7 @@ impl BotRunner {
     pub async fn run(self, mut shutdown: watch::Receiver<bool>) -> Result<()> {
         let mut offset = self.store.offset(&self.bot.id).await?;
         let mut backoff = 1u64;
+        let mut jobs = JoinSet::new();
         loop {
             if *shutdown.borrow() {
                 break;
@@ -124,6 +125,12 @@ impl BotRunner {
                 .build();
             let response = tokio::select! {
                 _ = shutdown.changed() => break,
+                result = jobs.join_next(), if !jobs.is_empty() => {
+                    if let Some(result) = result {
+                        self.log_update_result(result);
+                    }
+                    continue;
+                }
                 response = self.telegram.get_updates(&params) => response,
             };
             let updates = match response {
@@ -146,35 +153,28 @@ impl BotRunner {
                 .map(|u| i64::from(u.update_id) + 1)
                 .max()
                 .expect("non-empty updates");
-            let mut jobs = JoinSet::new();
             for update in updates {
                 let runner = self.clone();
-                jobs.spawn(async move {
-                    let permit = runner
-                        .semaphore
-                        .clone()
-                        .acquire_owned()
-                        .await
-                        .context("Bot concurrency semaphore closed")?;
-                    let result = runner.process(update).await;
-                    drop(permit);
-                    result
-                });
-            }
-            while let Some(result) = jobs.join_next().await {
-                match result {
-                    Ok(Ok(())) => {}
-                    Ok(Err(error)) => {
-                        error!(bot_id = %self.bot.id, error = %format!("{error:#}"), "update processing failed")
-                    }
-                    Err(error) => error!(bot_id = %self.bot.id, %error, "update task panicked"),
-                }
+                jobs.spawn(async move { runner.process(update).await });
             }
             self.store.set_offset(&self.bot.id, next_offset).await?;
             offset = Some(next_offset);
         }
+        while let Some(result) = jobs.join_next().await {
+            self.log_update_result(result);
+        }
         info!(bot_id = %self.bot.id, "Telegram bot stopped");
         Ok(())
+    }
+
+    fn log_update_result(&self, result: std::result::Result<Result<()>, tokio::task::JoinError>) {
+        match result {
+            Ok(Ok(())) => {}
+            Ok(Err(error)) => {
+                error!(bot_id = %self.bot.id, error = %format!("{error:#}"), "update processing failed")
+            }
+            Err(error) => error!(bot_id = %self.bot.id, %error, "update task panicked"),
+        }
     }
 
     async fn process(&self, update: Update) -> Result<()> {
@@ -315,31 +315,44 @@ impl BotRunner {
         } else {
             None
         };
-        if let Some(plan) = plan.as_ref() {
-            let generation_command = match plan.direct_generation() {
-                Some(PlannedAction::GenerateImage) => Some("image"),
-                Some(PlannedAction::GenerateAudio) => Some("audio"),
-                Some(PlannedAction::GenerateVideo) => Some("video"),
-                _ => None,
-            };
-            if let Some(command) = generation_command {
-                if let Err(error) = self
-                    .command(
-                        &message,
-                        mode,
-                        user_id,
-                        command,
-                        &text,
-                        model_override.as_ref(),
-                    )
-                    .await
-                {
-                    error!(bot_id = %self.bot.id, user_id, error = %format!("{error:#}"), "planned generation command failed");
-                    self.respond(&message, mode, rich::compact_error(), None)
-                        .await?;
+        let override_generation = if let Some(override_) = model_override.as_ref() {
+            match self.media_only_override_action(override_).await {
+                Ok(action) => action,
+                Err(error) => {
+                    warn!(bot_id = %self.bot.id, user_id, error = %format!("{error:#}"), "failed to inspect overridden model capabilities");
+                    None
                 }
-                return Ok(());
             }
+        } else {
+            None
+        };
+        let generation_command = match override_generation
+            .or_else(|| plan.as_ref().and_then(RequestPlan::direct_generation))
+        {
+            Some(PlannedAction::GenerateImage) => Some("image"),
+            Some(PlannedAction::GenerateAudio) => Some("audio"),
+            Some(PlannedAction::GenerateVideo) => Some("video"),
+            _ => None,
+        };
+        if let Some(command) = generation_command {
+            if let Err(error) = self
+                .command(
+                    &message,
+                    mode,
+                    user_id,
+                    command,
+                    &text,
+                    model_override.as_ref(),
+                )
+                .await
+            {
+                error!(bot_id = %self.bot.id, user_id, error = %format!("{error:#}"), "planned generation command failed");
+                self.respond(&message, mode, rich::compact_error(), None)
+                    .await?;
+            }
+            return Ok(());
+        }
+        if let Some(plan) = plan.as_ref() {
             if plan.action == PlannedAction::Refuse {
                 self.respond(&message, mode, &plan.refusal_message, None)
                     .await?;
@@ -669,6 +682,54 @@ impl BotRunner {
             }
         }
         Ok(())
+    }
+
+    async fn media_only_override_action(
+        &self,
+        override_: &MessageModelOverride,
+    ) -> Result<Option<PlannedAction>> {
+        let key = self.model_api_key(override_.model_provider).await?;
+        let models = match override_.model_provider {
+            ModelProvider::Openrouter => {
+                self.catalog
+                    .get_openrouter(
+                        &self.client,
+                        &self.config.openrouter.base_url,
+                        &self.bot.id,
+                        &key,
+                    )
+                    .await?
+            }
+            ModelProvider::Aihub => {
+                self.catalog
+                    .get_aihub(
+                        &self.client,
+                        &self.config.aihub.base_url,
+                        &self.bot.id,
+                        &key,
+                    )
+                    .await?
+            }
+        };
+        let Some(model) = models.iter().find(|model| model.id == override_.model) else {
+            return Ok(None);
+        };
+        if model.supports("chat") {
+            return Ok(None);
+        }
+        let actions = [
+            ("image_generation", PlannedAction::GenerateImage),
+            ("audio_generation", PlannedAction::GenerateAudio),
+            ("video_generation", PlannedAction::GenerateVideo),
+        ]
+        .into_iter()
+        .filter_map(|(capability, action)| model.supports(capability).then_some(action))
+        .collect::<Vec<_>>();
+        if actions.len() == 1 {
+            Ok(actions.first().copied())
+        } else {
+            Ok(None)
+        }
     }
 
     async fn command(
@@ -1355,20 +1416,27 @@ impl BotRunner {
         model: &str,
         prompt: &str,
     ) -> Result<()> {
-        let token = crate::ephemeral_media::publish(bytes, media_type)?;
-        let url = format!(
-            "{}/generated/{token}",
-            self.config.server.public_url.trim_end_matches('/')
-        );
+        let url = self.host_guest_media(bytes, media_type, None).await?;
         let media = InputMediaPhoto::builder()
-            .media(FileUpload::from(url))
+            .media(FileUpload::from(url.clone()))
             .caption(generation_caption(model, prompt))
             .build();
         let params = EditMessageMediaParams::builder()
             .inline_message_id(inline_message_id)
             .media(InputMedia::Photo(media))
             .build();
-        self.telegram.edit_message_media(&params).await?;
+        if let Err(error) = self.telegram.edit_message_media(&params).await {
+            warn!(bot_id = %self.bot.id, %error, "photo delivery failed; retrying generated image as a document");
+            let media = InputMediaDocument::builder()
+                .media(FileUpload::from(url))
+                .caption(generation_caption(model, prompt))
+                .build();
+            let params = EditMessageMediaParams::builder()
+                .inline_message_id(inline_message_id)
+                .media(InputMedia::Document(media))
+                .build();
+            self.telegram.edit_message_media(&params).await?;
+        }
         Ok(())
     }
 
@@ -1380,11 +1448,7 @@ impl BotRunner {
         model: &str,
         prompt: &str,
     ) -> Result<()> {
-        let token = crate::ephemeral_media::publish(bytes, media_type)?;
-        let url = format!(
-            "{}/generated/{token}",
-            self.config.server.public_url.trim_end_matches('/')
-        );
+        let url = self.host_guest_media(bytes, media_type, None).await?;
         let media = InputMediaAudio::builder()
             .media(FileUpload::from(url))
             .caption(generation_caption(model, prompt))
@@ -1404,8 +1468,10 @@ impl BotRunner {
         model: &str,
         prompt: &str,
     ) -> Result<()> {
+        let (bytes, media_type) = self.download_generated_asset(url, "video/mp4").await?;
+        let url = self.host_guest_media(bytes, &media_type, None).await?;
         let media = InputMediaVideo::builder()
-            .media(FileUpload::from(url.to_owned()))
+            .media(FileUpload::from(url.clone()))
             .caption(generation_caption(model, prompt))
             .supports_streaming(true)
             .build();
@@ -1413,7 +1479,18 @@ impl BotRunner {
             .inline_message_id(inline_message_id)
             .media(InputMedia::Video(media))
             .build();
-        self.telegram.edit_message_media(&params).await?;
+        if let Err(error) = self.telegram.edit_message_media(&params).await {
+            warn!(bot_id = %self.bot.id, %error, "video delivery failed; retrying generated video as a document");
+            let media = InputMediaDocument::builder()
+                .media(FileUpload::from(url))
+                .caption(generation_caption(model, prompt))
+                .build();
+            let params = EditMessageMediaParams::builder()
+                .inline_message_id(inline_message_id)
+                .media(InputMedia::Document(media))
+                .build();
+            self.telegram.edit_message_media(&params).await?;
+        }
         Ok(())
     }
 
@@ -1423,12 +1500,9 @@ impl BotRunner {
         bytes: Vec<u8>,
         filename: &str,
     ) -> Result<()> {
-        let token =
-            crate::ephemeral_media::publish_named(bytes, "application/octet-stream", filename)?;
-        let url = format!(
-            "{}/generated/{token}",
-            self.config.server.public_url.trim_end_matches('/')
-        );
+        let url = self
+            .host_guest_media(bytes, "application/octet-stream", Some(filename))
+            .await?;
         let media = InputMediaDocument::builder()
             .media(FileUpload::from(url))
             .caption(format!("Generated file: {filename}"))
@@ -1439,6 +1513,98 @@ impl BotRunner {
             .build();
         self.telegram.edit_message_media(&params).await?;
         Ok(())
+    }
+
+    async fn host_guest_media(
+        &self,
+        bytes: Vec<u8>,
+        media_type: &str,
+        filename: Option<&str>,
+    ) -> Result<String> {
+        let token = if let Some(filename) = filename {
+            crate::ephemeral_media::publish_named(bytes, media_type, filename)?
+        } else {
+            crate::ephemeral_media::publish(bytes, media_type)?
+        };
+        let url = format!(
+            "{}/generated/{token}",
+            self.config.server.public_url.trim_end_matches('/')
+        );
+        let response = self
+            .client
+            .get(&url)
+            .header(reqwest::header::RANGE, "bytes=0-0")
+            .timeout(Duration::from_secs(15))
+            .send()
+            .await
+            .wrap_err("Generated-media public URL is unreachable from the backend")?;
+        if !response.status().is_success() {
+            bail!(
+                "Generated-media public URL returned {}; check the reverse proxy for /generated/*",
+                response.status()
+            );
+        }
+        Ok(url)
+    }
+
+    async fn download_generated_asset(
+        &self,
+        raw_url: &str,
+        fallback_media_type: &str,
+    ) -> Result<(Vec<u8>, String)> {
+        const MAX_BYTES: usize = 50 * 1024 * 1024;
+        let parsed = url::Url::parse(raw_url).context("Generated media returned an invalid URL")?;
+        if parsed.scheme() != "https" {
+            bail!("Generated media URL must use HTTPS");
+        }
+        if parsed.host_str().is_none_or(generated_media_host_blocked) {
+            bail!("Generated media URL has an invalid host");
+        }
+        let mut response = self
+            .client
+            .get(parsed)
+            .send()
+            .await
+            .context("Failed to download generated media")?
+            .error_for_status()
+            .context("Generated media download returned an error status")?;
+        if response
+            .content_length()
+            .is_some_and(|length| length > MAX_BYTES as u64)
+        {
+            bail!("Generated media exceeds the 50 MiB Telegram delivery limit");
+        }
+        let mut media_type = response
+            .headers()
+            .get(reqwest::header::CONTENT_TYPE)
+            .and_then(|value| value.to_str().ok())
+            .map(|value| value.split(';').next().unwrap_or(value).trim().to_owned())
+            .filter(|value| !value.is_empty() && value != "application/octet-stream")
+            .unwrap_or_else(|| fallback_media_type.to_owned());
+        let mut bytes = Vec::new();
+        while let Some(chunk) = response
+            .chunk()
+            .await
+            .context("Generated media download failed")?
+        {
+            if bytes.len() + chunk.len() > MAX_BYTES {
+                bail!("Generated media exceeds the 50 MiB Telegram delivery limit");
+            }
+            bytes.extend_from_slice(&chunk);
+        }
+        if bytes.is_empty() {
+            bail!("Generated media download was empty");
+        }
+        if fallback_media_type.starts_with("video/") && !media_type.starts_with("video/") {
+            media_type = if bytes.get(4..8) == Some(b"ftyp") {
+                "video/mp4".to_owned()
+            } else if bytes.starts_with(&[0x1a, 0x45, 0xdf, 0xa3]) {
+                "video/webm".to_owned()
+            } else {
+                bail!("Generated video URL returned unsupported content type {media_type}");
+            };
+        }
+        Ok((bytes, media_type))
     }
 
     async fn edit_guest_text(&self, inline_message_id: &str, markdown: &str) -> Result<()> {
@@ -1581,20 +1747,26 @@ impl BotRunner {
                         .rich_message(progress_rich_message(&steps))
                         .build();
                     if let Err(error) = self.telegram.edit_message_text(&params).await {
-                        warn!(bot_id = %self.bot.id, %error, "failed to update progress message");
-                        break;
+                        if !message_not_modified(&error) {
+                            warn!(bot_id = %self.bot.id, %error, "failed to update progress message");
+                            break;
+                        }
                     }
                     dirty = false;
                 }
             }
         }
-        let params = EditMessageTextParams::builder()
-            .chat_id(chat_id)
-            .message_id(message_id)
-            .rich_message(progress_rich_message(&steps))
-            .build();
-        if let Err(error) = self.telegram.edit_message_text(&params).await {
-            warn!(bot_id = %self.bot.id, %error, "failed to complete progress message");
+        if dirty {
+            let params = EditMessageTextParams::builder()
+                .chat_id(chat_id)
+                .message_id(message_id)
+                .rich_message(progress_rich_message(&steps))
+                .build();
+            if let Err(error) = self.telegram.edit_message_text(&params).await
+                && !message_not_modified(&error)
+            {
+                warn!(bot_id = %self.bot.id, %error, "failed to complete progress message");
+            }
         }
     }
 
@@ -1622,8 +1794,10 @@ impl BotRunner {
                         .rich_message(progress_rich_message(&steps))
                         .build();
                     if let Err(error) = self.telegram.edit_message_text(&params).await {
-                        warn!(bot_id = %self.bot.id, %error, "failed to update guest progress message");
-                        break;
+                        if !message_not_modified(&error) {
+                            warn!(bot_id = %self.bot.id, %error, "failed to update guest progress message");
+                            break;
+                        }
                     }
                     dirty = false;
                 }
@@ -1635,7 +1809,9 @@ impl BotRunner {
                 .rich_message(progress_rich_message(&steps))
                 .build();
             if let Err(error) = self.telegram.edit_message_text(&params).await {
-                warn!(bot_id = %self.bot.id, %error, "failed to complete guest progress message");
+                if !message_not_modified(&error) {
+                    warn!(bot_id = %self.bot.id, %error, "failed to complete guest progress message");
+                }
             }
         }
     }
@@ -1786,16 +1962,38 @@ impl BotRunner {
         caption: Option<&str>,
         reply_to: Option<i32>,
     ) -> Result<()> {
+        let (bytes, media_type) = self.download_generated_asset(url, "video/mp4").await?;
+        let suffix = match media_type.as_str() {
+            "video/webm" => ".webm",
+            "video/quicktime" => ".mov",
+            _ => ".mp4",
+        };
+        let file = TempFileBuilder::new()
+            .prefix("teleforge-video-")
+            .suffix(suffix)
+            .tempfile()?;
+        tokio::fs::write(file.path(), bytes).await?;
         let mut params = SendVideoParams::builder()
             .chat_id(chat_id)
-            .video(FileUpload::from(url.to_owned()))
+            .video(FileUpload::from(file.path().to_path_buf()))
             .build();
         params.message_thread_id = thread_id;
         params.caption = caption.map(str::to_owned);
         params.supports_streaming = Some(true);
         params.reply_parameters =
             reply_to.map(|message_id| ReplyParameters::builder().message_id(message_id).build());
-        self.telegram.send_video(&params).await?;
+        if let Err(error) = self.telegram.send_video(&params).await {
+            warn!(bot_id = %self.bot.id, %error, "video upload failed; retrying generated video as a document");
+            let mut params = SendDocumentParams::builder()
+                .chat_id(chat_id)
+                .document(FileUpload::from(file.path().to_path_buf()))
+                .build();
+            params.message_thread_id = thread_id;
+            params.caption = caption.map(str::to_owned);
+            params.reply_parameters = reply_to
+                .map(|message_id| ReplyParameters::builder().message_id(message_id).build());
+            self.telegram.send_document(&params).await?;
+        }
         Ok(())
     }
 
@@ -2058,6 +2256,35 @@ fn push_progress_step(steps: &mut Vec<ProgressUpdate>, update: ProgressUpdate) {
     if steps.len() > 12 {
         steps.remove(0);
     }
+}
+
+fn message_not_modified(error: &impl std::fmt::Display) -> bool {
+    error.to_string().contains("message is not modified")
+}
+
+fn generated_media_host_blocked(host: &str) -> bool {
+    if host.eq_ignore_ascii_case("localhost")
+        || host.ends_with(".localhost")
+        || host.ends_with(".local")
+    {
+        return true;
+    }
+    host.parse::<std::net::IpAddr>()
+        .is_ok_and(|address| match address {
+            std::net::IpAddr::V4(address) => {
+                address.is_private()
+                    || address.is_loopback()
+                    || address.is_link_local()
+                    || address.is_unspecified()
+                    || address.is_broadcast()
+            }
+            std::net::IpAddr::V6(address) => {
+                address.is_loopback()
+                    || address.is_unspecified()
+                    || address.is_unique_local()
+                    || address.is_unicast_link_local()
+            }
+        })
 }
 
 fn progress_rich_message(steps: &[ProgressUpdate]) -> InputRichMessage {

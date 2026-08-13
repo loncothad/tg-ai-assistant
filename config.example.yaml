@@ -5,7 +5,7 @@ server:
   # Public HTTPS origin used by Telegram to open the authenticated Mini App.
   public_url: "${TELEFORGE_PUBLIC_URL}"
   request_timeout_seconds: 180
-  max_concurrent_requests_per_bot: 8
+  # Updates are dispatched concurrently without a per-bot concurrency semaphore.
   admin_init_data_ttl_seconds: 900
   max_input_media_bytes: 20971520
   json_logs: true

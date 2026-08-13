@@ -13,7 +13,7 @@ use std::{
 use axum::{
     body::Body,
     extract::Path,
-    http::{HeaderValue, Response, StatusCode, header},
+    http::{HeaderMap, HeaderValue, Method, Response, StatusCode, header},
 };
 use base64::{Engine, engine::general_purpose::URL_SAFE_NO_PAD};
 use rand::RngExt;
@@ -64,7 +64,11 @@ fn publish_inner(bytes: Vec<u8>, content_type: String, filename: Option<String>)
     }
     let mut random = [0_u8; 32];
     rand::rng().fill(&mut random);
-    let token = URL_SAFE_NO_PAD.encode(random);
+    let token = format!(
+        "{}.{}",
+        URL_SAFE_NO_PAD.encode(random),
+        extension_for_content_type(&content_type)
+    );
     let mut media = MEDIA.write().expect("ephemeral media lock poisoned");
     media.retain(|_, item| item.expires > Instant::now());
     while media.values().map(|item| item.bytes.len()).sum::<usize>() + bytes.len() > MAX_TOTAL_BYTES
@@ -90,8 +94,12 @@ fn publish_inner(bytes: Vec<u8>, content_type: String, filename: Option<String>)
     Ok(token)
 }
 
-/// Serves a non-cacheable generated asset to Telegram's media fetcher.
-pub async fn serve(Path(token): Path<String>) -> Response<Body> {
+/// Serves a short-lived generated asset with byte-range support for Telegram.
+pub async fn serve(
+    Path(token): Path<String>,
+    method: Method,
+    request_headers: HeaderMap,
+) -> Response<Body> {
     let item = MEDIA
         .read()
         .expect("ephemeral media lock poisoned")
@@ -110,7 +118,21 @@ pub async fn serve(Path(token): Path<String>) -> Response<Body> {
             .body(Body::empty())
             .expect("static response");
     };
-    let mut response = Response::new(Body::from(bytes.as_ref().clone()));
+    let total = bytes.len();
+    let range = request_headers
+        .get(header::RANGE)
+        .and_then(|value| value.to_str().ok())
+        .and_then(|value| parse_range(value, total));
+    let (status, start, end) = range.map_or((StatusCode::OK, 0, total), |(start, end)| {
+        (StatusCode::PARTIAL_CONTENT, start, end)
+    });
+    let body = if method == Method::HEAD {
+        Body::empty()
+    } else {
+        Body::from(bytes[start..end].to_vec())
+    };
+    let mut response = Response::new(body);
+    *response.status_mut() = status;
     response.headers_mut().insert(
         header::CONTENT_TYPE,
         HeaderValue::from_str(&content_type)
@@ -125,11 +147,69 @@ pub async fn serve(Path(token): Path<String>) -> Response<Body> {
     }
     response.headers_mut().insert(
         header::CACHE_CONTROL,
-        HeaderValue::from_static("private, max-age=600"),
+        HeaderValue::from_static("public, max-age=600, immutable"),
     );
+    response
+        .headers_mut()
+        .insert(header::ACCEPT_RANGES, HeaderValue::from_static("bytes"));
+    if let Ok(value) = HeaderValue::from_str(&(end - start).to_string()) {
+        response.headers_mut().insert(header::CONTENT_LENGTH, value);
+    }
+    if status == StatusCode::PARTIAL_CONTENT
+        && let Ok(value) = HeaderValue::from_str(&format!("bytes {start}-{}/{total}", end - 1))
+    {
+        response.headers_mut().insert(header::CONTENT_RANGE, value);
+    }
     response.headers_mut().insert(
         header::X_CONTENT_TYPE_OPTIONS,
         HeaderValue::from_static("nosniff"),
     );
     response
+}
+
+fn extension_for_content_type(content_type: &str) -> &'static str {
+    match content_type.split(';').next().unwrap_or_default().trim() {
+        "image/png" => "png",
+        "image/jpeg" => "jpg",
+        "image/webp" => "webp",
+        "image/gif" => "gif",
+        "audio/mpeg" => "mp3",
+        "audio/ogg" => "ogg",
+        "audio/wav" | "audio/x-wav" => "wav",
+        "video/webm" => "webm",
+        "video/quicktime" => "mov",
+        "video/mp4" => "mp4",
+        "application/pdf" => "pdf",
+        _ => "bin",
+    }
+}
+
+fn parse_range(value: &str, total: usize) -> Option<(usize, usize)> {
+    let value = value.strip_prefix("bytes=")?;
+    if value.contains(',') || total == 0 {
+        return None;
+    }
+    let (start, end) = value.split_once('-')?;
+    let start = start.parse::<usize>().ok()?;
+    let end = if end.is_empty() {
+        total
+    } else {
+        end.parse::<usize>().ok()?.checked_add(1)?.min(total)
+    };
+    (start < end && start < total).then_some((start, end))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn hosted_tokens_have_media_extensions_and_ranges_are_bounded() {
+        let token = publish(vec![1, 2, 3], "image/png").unwrap();
+        assert!(token.ends_with(".png"));
+        assert_eq!(parse_range("bytes=0-0", 3), Some((0, 1)));
+        assert_eq!(parse_range("bytes=1-", 3), Some((1, 3)));
+        assert_eq!(parse_range("bytes=3-4", 3), None);
+        assert_eq!(parse_range("bytes=0-1,2-2", 3), None);
+    }
 }
