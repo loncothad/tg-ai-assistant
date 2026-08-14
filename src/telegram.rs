@@ -1,6 +1,6 @@
 //! Multi-token Frankenstein long-polling runtime and rich-message delivery.
 
-use std::{sync::Arc, time::Duration};
+use std::{collections::HashMap, sync::Arc, time::Duration};
 
 use base64::{Engine, engine::general_purpose::STANDARD};
 use eyre::{Context, ContextCompat, bail};
@@ -17,7 +17,7 @@ use frankenstein::{
     methods::{
         AnswerGuestQueryParams, EditMessageMediaParams, EditMessageTextParams, GetFileParams,
         GetUpdatesParams, SendAudioParams, SendChatActionParams, SendDocumentParams,
-        SendPhotoParams, SendRichMessageParams, SendVideoParams,
+        SendPhotoParams, SendRichMessageParams, SendVideoParams, SetMessageReactionParams,
     },
     rich_message::InputRichMessage,
     types::{
@@ -32,6 +32,7 @@ use tokio::{
     task::JoinSet,
     time::sleep,
 };
+use tokio_util::sync::CancellationToken;
 use tracing::{error, info, warn};
 use uuid::Uuid;
 
@@ -61,6 +62,65 @@ pub struct BotRunner {
     catalog: ModelCatalogCache,
     bot_user_id: u64,
     username: String,
+    active: ActiveRequests,
+}
+
+type MessageKey = (i64, i32);
+
+#[derive(Clone, Default)]
+struct ActiveRequests {
+    inner: Arc<tokio::sync::Mutex<ActiveRequestState>>,
+}
+
+#[derive(Default)]
+struct ActiveRequestState {
+    by_message: HashMap<MessageKey, Uuid>,
+    tokens: HashMap<Uuid, CancellationToken>,
+}
+
+struct ActiveRequest {
+    id: Uuid,
+    token: CancellationToken,
+}
+
+impl ActiveRequests {
+    async fn start(&self, key: MessageKey) -> ActiveRequest {
+        let id = Uuid::now_v7();
+        let token = CancellationToken::new();
+        let mut state = self.inner.lock().await;
+        if let Some(previous) = state.by_message.insert(key, id)
+            && let Some(previous) = state.tokens.get(&previous)
+        {
+            previous.cancel();
+        }
+        state.tokens.insert(id, token.clone());
+        ActiveRequest { id, token }
+    }
+
+    async fn link(&self, request: MessageKey, progress: MessageKey) {
+        let mut state = self.inner.lock().await;
+        if let Some(id) = state.by_message.get(&request).copied() {
+            state.by_message.insert(progress, id);
+        }
+    }
+
+    async fn cancel(&self, key: MessageKey) -> bool {
+        let state = self.inner.lock().await;
+        state
+            .by_message
+            .get(&key)
+            .and_then(|id| state.tokens.get(id))
+            .is_some_and(|token| {
+                token.cancel();
+                true
+            })
+    }
+
+    async fn finish(&self, id: Uuid) {
+        let mut state = self.inner.lock().await;
+        state.tokens.remove(&id);
+        state.by_message.retain(|_, request_id| *request_id != id);
+    }
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -116,6 +176,7 @@ impl BotRunner {
             catalog: ModelCatalogCache::default(),
             bot_user_id: identity.id,
             username,
+            active: ActiveRequests::default(),
         })
     }
 
@@ -130,7 +191,11 @@ impl BotRunner {
             let params = GetUpdatesParams::builder()
                 .maybe_offset(offset)
                 .timeout(30)
-                .allowed_updates(vec![AllowedUpdate::Message, AllowedUpdate::GuestMessage])
+                .allowed_updates(vec![
+                    AllowedUpdate::Message,
+                    AllowedUpdate::GuestMessage,
+                    AllowedUpdate::DeletedBusinessMessages,
+                ])
                 .build();
             let response = tokio::select! {
                 _ = shutdown.changed() => break,
@@ -189,13 +254,36 @@ impl BotRunner {
     async fn process(&self, update: Update) -> Result<()> {
         match update.content {
             UpdateContent::Message(message) => {
-                self.process_message(*message, MessageMode::Private).await
+                self.process_tracked_message(*message, MessageMode::Private)
+                    .await
             }
             UpdateContent::GuestMessage(message) => {
-                self.process_message(*message, MessageMode::Guest).await
+                self.process_tracked_message(*message, MessageMode::Guest)
+                    .await
+            }
+            UpdateContent::DeletedBusinessMessages(deleted) => {
+                for message_id in deleted.message_ids {
+                    self.active.cancel((deleted.chat.id, message_id)).await;
+                }
+                Ok(())
             }
             _ => Ok(()),
         }
+    }
+
+    async fn process_tracked_message(&self, message: Message, mode: MessageMode) -> Result<()> {
+        let key = (message.chat.id, message.message_id);
+        let active = self.active.start(key).await;
+        let result = tokio::select! {
+            biased;
+            _ = active.token.cancelled() => {
+                info!(bot_id = %self.bot.id, chat_id = key.0, message_id = key.1, "message processing cancelled after deletion");
+                Ok(())
+            }
+            result = self.process_message(message, mode) => result,
+        };
+        self.active.finish(active.id).await;
+        result
     }
 
     async fn process_message(&self, message: Message, hinted_mode: MessageMode) -> Result<()> {
@@ -327,17 +415,26 @@ impl BotRunner {
         let (sender, receiver) = mpsc::unbounded_channel();
         let runner = self.clone();
         let progress_task = if let Some(inline_id) = guest_pending_id.clone() {
+            let request_key = (message.chat.id, message.message_id);
             tokio::spawn(async move {
-                runner.update_guest_progress(inline_id, receiver).await;
+                runner
+                    .update_guest_progress(request_key, inline_id, receiver)
+                    .await;
             })
         } else {
             let progress_message_id = self
                 .send_progress_message(&message, "Reading the request")
                 .await?;
             let chat_id = message.chat.id;
+            let request_message_id = message.message_id;
             tokio::spawn(async move {
                 runner
-                    .update_progress_message(chat_id, progress_message_id, receiver)
+                    .update_progress_message(
+                        chat_id,
+                        request_message_id,
+                        progress_message_id,
+                        receiver,
+                    )
                     .await;
             })
         };
@@ -1006,8 +1103,11 @@ impl BotRunner {
                                 .await?
                         }
                     };
-                    let (progress, progress_task) =
-                        self.begin_guest_progress(&inline_id, "Parsed image-generation request");
+                    let (progress, progress_task) = self.begin_guest_progress(
+                        message,
+                        &inline_id,
+                        "Parsed image-generation request",
+                    );
                     let result = async {
                         let references = self.collect_media(message, arguments).await?;
                         let effective_prompt = self
@@ -1185,6 +1285,7 @@ impl BotRunner {
                         }
                     };
                     let (progress, progress_task) = self.begin_guest_progress(
+                        message,
                         &inline_id,
                         if is_music {
                             "Parsed music-generation request"
@@ -1352,7 +1453,7 @@ impl BotRunner {
                         }
                     };
                     let (progress, progress_task) =
-                        self.begin_guest_progress(&inline_id, "Reading attached audio");
+                        self.begin_guest_progress(message, &inline_id, "Reading attached audio");
                     let result = async {
                         let media = self.collect_media(message, arguments).await?;
                         let _ = progress.send(ProgressUpdate::step("Transcribing audio"));
@@ -1417,8 +1518,11 @@ impl BotRunner {
                                 .await?
                         }
                     };
-                    let (progress, progress_task) =
-                        self.begin_guest_progress(&inline_id, "Parsed video-generation request");
+                    let (progress, progress_task) = self.begin_guest_progress(
+                        message,
+                        &inline_id,
+                        "Parsed video-generation request",
+                    );
                     let result = async {
                         let _ = progress.send(ProgressUpdate::generation(
                             "video",
@@ -1536,6 +1640,33 @@ impl BotRunner {
                 )
                 .await?;
             }
+            "remove" | "removeallow" | "unallow" if self.is_admin(user_id) => {
+                let target = parse_user_id(arguments)?;
+                if self.is_admin(target) {
+                    bail!("Configured administrators cannot be removed from the allowlist");
+                }
+                if self
+                    .store
+                    .remove_user_allowed(&self.bot.id, target, user_id)
+                    .await?
+                {
+                    self.respond(
+                        message,
+                        mode,
+                        &format!("User `{target}` was removed from this bot's allowlist."),
+                        None,
+                    )
+                    .await?;
+                } else {
+                    self.respond(
+                        message,
+                        mode,
+                        &format!("User `{target}` is not present in this bot's allowlist."),
+                        None,
+                    )
+                    .await?;
+                }
+            }
             "deny" if self.is_admin(user_id) => {
                 let target = parse_user_id(arguments)?;
                 if self.is_admin(target) {
@@ -1569,7 +1700,7 @@ impl BotRunner {
                 )
                 .await?;
             }
-            "admin" | "allow" | "deny" | "allowed" => {
+            "admin" | "allow" | "remove" | "removeallow" | "unallow" | "deny" | "allowed" => {
                 self.respond(message, mode, "Administrator access required.", None)
                     .await?
             }
@@ -1645,8 +1776,15 @@ impl BotRunner {
     }
 
     async fn process_text_output(&self, message: &Message, text: &str) -> String {
+        if output_needs_no_model_edit(text) {
+            return text.to_owned();
+        }
         self.run_output_processor(message, text, false)
             .await
+            .and_then(|processed| {
+                processed_output_preserves_source(text, &processed)?;
+                Ok(processed)
+            })
             .unwrap_or_else(|error| {
                 warn!(bot_id = %self.bot.id, error = %format!("{error:#}"), "text output processor failed");
                 text.to_owned()
@@ -2114,12 +2252,19 @@ impl BotRunner {
                 .message_id(message.message_id)
                 .build(),
         );
-        Ok(self
+        let progress_message_id = self
             .telegram
             .send_rich_message(&params)
             .await?
             .result
-            .message_id)
+            .message_id;
+        self.active
+            .link(
+                (message.chat.id, message.message_id),
+                (message.chat.id, progress_message_id),
+            )
+            .await;
+        Ok(progress_message_id)
     }
 
     async fn begin_chat_progress(
@@ -2134,9 +2279,10 @@ impl BotRunner {
         let (sender, receiver) = mpsc::unbounded_channel();
         let runner = self.clone();
         let chat_id = message.chat.id;
+        let request_message_id = message.message_id;
         let task = tokio::spawn(async move {
             runner
-                .update_progress_message(chat_id, message_id, receiver)
+                .update_progress_message(chat_id, request_message_id, message_id, receiver)
                 .await;
         });
         let _ = sender.send(ProgressUpdate::step(status));
@@ -2145,6 +2291,7 @@ impl BotRunner {
 
     fn begin_guest_progress(
         &self,
+        message: &Message,
         inline_message_id: &str,
         status: &str,
     ) -> (
@@ -2153,10 +2300,11 @@ impl BotRunner {
     ) {
         let (sender, receiver) = mpsc::unbounded_channel();
         let runner = self.clone();
+        let request_key = (message.chat.id, message.message_id);
         let inline_message_id = inline_message_id.to_owned();
         let task = tokio::spawn(async move {
             runner
-                .update_guest_progress(inline_message_id, receiver)
+                .update_guest_progress(request_key, inline_message_id, receiver)
                 .await;
         });
         let _ = sender.send(ProgressUpdate::step(status));
@@ -2166,11 +2314,13 @@ impl BotRunner {
     async fn update_progress_message(
         &self,
         chat_id: i64,
+        request_message_id: i32,
         message_id: i32,
         mut updates: mpsc::UnboundedReceiver<ProgressUpdate>,
     ) {
         let mut steps = Vec::new();
         let mut dirty = false;
+        let mut heartbeat_ticks = 0u8;
         let mut ticker = tokio::time::interval(Duration::from_secs(1));
         ticker.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
         loop {
@@ -2182,16 +2332,38 @@ impl BotRunner {
                     },
                     None => break,
                 },
-                _ = ticker.tick(), if dirty => {
+                _ = ticker.tick(), if !steps.is_empty() => {
+                    heartbeat_ticks = heartbeat_ticks.wrapping_add(1);
+                    let heartbeat = heartbeat_ticks % 5 == 0;
+                    if !dirty && !heartbeat {
+                        continue;
+                    }
+                    if heartbeat {
+                        let params = SetMessageReactionParams::builder()
+                            .chat_id(chat_id)
+                            .message_id(request_message_id)
+                            .reaction(Vec::new())
+                            .build();
+                        if let Err(error) = self.telegram.set_message_reaction(&params).await
+                            && message_unavailable(&error)
+                        {
+                            self.active.cancel((chat_id, request_message_id)).await;
+                            info!(bot_id = %self.bot.id, chat_id, message_id = request_message_id, "caller message was deleted; cancelling request");
+                            break;
+                        }
+                    }
                     let params = EditMessageTextParams::builder()
                         .chat_id(chat_id)
                         .message_id(message_id)
                         .rich_message(progress_rich_message(&steps))
                         .build();
                     if let Err(error) = self.telegram.edit_message_text(&params).await {
-                        if !message_not_modified(&error) {
-                            warn!(bot_id = %self.bot.id, %error, "failed to update progress message");
+                        if message_unavailable(&error) {
+                            self.active.cancel((chat_id, message_id)).await;
+                            info!(bot_id = %self.bot.id, chat_id, message_id, "progress message was deleted; cancelling request");
                             break;
+                        } else if !message_not_modified(&error) {
+                            warn!(bot_id = %self.bot.id, %error, "failed to update progress message");
                         }
                     }
                     dirty = false;
@@ -2204,21 +2376,25 @@ impl BotRunner {
                 .message_id(message_id)
                 .rich_message(progress_rich_message(&steps))
                 .build();
-            if let Err(error) = self.telegram.edit_message_text(&params).await
-                && !message_not_modified(&error)
-            {
-                warn!(bot_id = %self.bot.id, %error, "failed to complete progress message");
+            if let Err(error) = self.telegram.edit_message_text(&params).await {
+                if message_unavailable(&error) {
+                    self.active.cancel((chat_id, message_id)).await;
+                } else if !message_not_modified(&error) {
+                    warn!(bot_id = %self.bot.id, %error, "failed to complete progress message");
+                }
             }
         }
     }
 
     async fn update_guest_progress(
         &self,
+        request_key: MessageKey,
         inline_message_id: String,
         mut updates: mpsc::UnboundedReceiver<ProgressUpdate>,
     ) {
         let mut steps = Vec::new();
         let mut dirty = false;
+        let mut heartbeat_ticks = 0u8;
         let mut ticker = tokio::time::interval(Duration::from_secs(1));
         ticker.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
         loop {
@@ -2230,13 +2406,21 @@ impl BotRunner {
                     },
                     None => break,
                 },
-                _ = ticker.tick(), if dirty => {
+                _ = ticker.tick(), if !steps.is_empty() => {
+                    heartbeat_ticks = heartbeat_ticks.wrapping_add(1);
+                    if !dirty && heartbeat_ticks % 5 != 0 {
+                        continue;
+                    }
                     let params = EditMessageTextParams::builder()
                         .inline_message_id(inline_message_id.clone())
                         .rich_message(progress_rich_message(&steps))
                         .build();
                     if let Err(error) = self.telegram.edit_message_text(&params).await {
-                        if !message_not_modified(&error) {
+                        if message_unavailable(&error) {
+                            self.active.cancel(request_key).await;
+                            info!(bot_id = %self.bot.id, chat_id = request_key.0, message_id = request_key.1, "guest progress message was deleted; cancelling request");
+                            break;
+                        } else if !message_not_modified(&error) {
                             warn!(bot_id = %self.bot.id, %error, "failed to update guest progress message");
                             break;
                         }
@@ -2251,7 +2435,9 @@ impl BotRunner {
                 .rich_message(progress_rich_message(&steps))
                 .build();
             if let Err(error) = self.telegram.edit_message_text(&params).await {
-                if !message_not_modified(&error) {
+                if message_unavailable(&error) {
+                    self.active.cancel(request_key).await;
+                } else if !message_not_modified(&error) {
                     warn!(bot_id = %self.bot.id, %error, "failed to complete guest progress message");
                 }
             }
@@ -2914,6 +3100,55 @@ fn message_not_modified(error: &impl std::fmt::Display) -> bool {
     error.to_string().contains("message is not modified")
 }
 
+fn message_unavailable(error: &impl std::fmt::Display) -> bool {
+    let error = error.to_string().to_ascii_lowercase();
+    error.contains("message to edit not found")
+        || error.contains("message to react not found")
+        || error.contains("message_id_invalid")
+        || error.contains("message not found")
+}
+
+fn output_needs_no_model_edit(text: &str) -> bool {
+    let text = text.trim();
+    text.chars().count() <= 280
+        && !text.contains("```")
+        && !text.lines().any(|line| {
+            let line = line.trim_start();
+            line.starts_with('#') || line.starts_with("- ") || line.starts_with("* ")
+        })
+}
+
+fn processed_output_preserves_source(source: &str, processed: &str) -> Result<()> {
+    let source_tokens = source
+        .split(|character: char| !character.is_alphanumeric())
+        .filter(|token| token.chars().count() >= 3)
+        .map(str::to_lowercase)
+        .collect::<std::collections::BTreeSet<_>>();
+    if source_tokens.len() < 4 {
+        return Ok(());
+    }
+    let processed_lower = processed.to_lowercase();
+    let retained = source_tokens
+        .iter()
+        .filter(|token| processed_lower.contains(token.as_str()))
+        .count();
+    if retained * 10 < source_tokens.len() * 7 {
+        bail!("Output-processing model replaced the source answer instead of formatting it");
+    }
+    for url in source
+        .split_whitespace()
+        .filter(|value| value.starts_with("https://") || value.starts_with("http://"))
+    {
+        let url = url.trim_end_matches(|character: char| {
+            matches!(character, ')' | ']' | '}' | ',' | '.' | ';' | ':')
+        });
+        if !processed.contains(url) {
+            bail!("Output-processing model removed a source URL");
+        }
+    }
+    Ok(())
+}
+
 fn generated_media_host_blocked(host: &str) -> bool {
     if host.eq_ignore_ascii_case("localhost")
         || host.ends_with(".localhost")
@@ -3349,6 +3584,7 @@ const HELP: &str = r#"# AI Assistant
 
 Ask me a question directly. I can use live web search when the selected model decides it is needed.
 
+- `/start`, `/help` — show this command list and usage
 - `/new` — clear this conversation
 - `/model` — show the active model
 - `-model [openrouter:|aihub:]<model-id> <request>` — use a model for one request (administrators only)
@@ -3360,8 +3596,12 @@ Ask me a question directly. I can use live web search when the selected model de
 - `/transcribe` — transcribe an attached/replied-to voice note or audio file
 - `/video <prompt>` — generate a video
 - `/admin` — open the admin panel (administrators only)
+- `/allow <id>` — add a user to this bot's answer allowlist (administrators only)
+- `/deny <id>` — deny a user while retaining a disabled entry (administrators only)
+- `/remove <id>` — remove a user from this bot's allowlist; `/removeallow` and `/unallow` are aliases (administrators only)
+- `/allowed` — list users currently allowed for this bot (administrators only)
 
-In groups, mention the bot or reply to one of its messages unless mention-only mode is disabled."#;
+Commands also accept the `-COMMAND` form, are case-insensitive, and may include `@botusername`. In groups, mention the bot or reply to one of its messages unless mention-only mode is disabled."#;
 
 #[cfg(test)]
 mod tests {
@@ -3376,6 +3616,36 @@ mod tests {
             parse_command("-SEARCH current news"),
             Some(("search".to_owned(), "current news"))
         );
+    }
+
+    #[test]
+    fn startup_help_lists_all_commands_and_allowlist_removal_aliases() {
+        for command in [
+            "/start",
+            "/help",
+            "/new",
+            "/model",
+            "/search",
+            "/searchprovider",
+            "/image",
+            "/speech",
+            "/audio",
+            "/music",
+            "/transcribe",
+            "/video",
+            "/admin",
+            "/allow",
+            "/deny",
+            "/remove",
+            "/removeallow",
+            "/unallow",
+            "/allowed",
+        ] {
+            assert!(
+                HELP.contains(command),
+                "missing {command} from startup help"
+            );
+        }
     }
 
     #[test]
@@ -3434,6 +3704,44 @@ mod tests {
             &crate::db::Capabilities::default(),
             Some(&plan),
         ));
+    }
+
+    #[test]
+    fn concise_plain_answers_bypass_the_ai_output_editor() {
+        assert!(output_needs_no_model_edit("Ракета"));
+        assert!(output_needs_no_model_edit("A short factual answer."));
+        assert!(!output_needs_no_model_edit("## Result\n\n- one\n- two"));
+    }
+
+    #[test]
+    fn output_editor_cannot_replace_an_answer_with_request_metadata() {
+        let source = "The selected rocket uses methane engines and carries 20 tonnes to orbit.";
+        assert!(
+            processed_output_preserves_source(
+                source,
+                "The selected **rocket** uses methane engines and carries **20 tonnes** to orbit."
+            )
+            .is_ok()
+        );
+        assert!(
+            processed_output_preserves_source(
+                source,
+                "## Request Information\n\nCommand: say a rocket\nLanguage hint: en"
+            )
+            .is_err()
+        );
+    }
+
+    #[tokio::test]
+    async fn deleting_a_linked_progress_message_cancels_its_request() {
+        let requests = ActiveRequests::default();
+        let request = requests.start((10, 20)).await;
+        requests.link((10, 20), (10, 21)).await;
+        assert!(requests.cancel((10, 21)).await);
+        assert!(request.token.is_cancelled());
+        requests.finish(request.id).await;
+        assert!(!requests.cancel((10, 20)).await);
+        assert!(!requests.cancel((10, 21)).await);
     }
 
     #[test]

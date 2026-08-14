@@ -482,6 +482,32 @@ impl Store {
         )
         .await
     }
+
+    /// Removes a user entry from this bot's allowlist entirely. This differs
+    /// from denying a user: the next configured YAML allowlist seed can add
+    /// the user again if the entry is absent.
+    pub async fn remove_user_allowed(
+        &self,
+        bot_id: &str,
+        user_id: u64,
+        actor: u64,
+    ) -> Result<bool> {
+        let _guard = self.mutation_lock.lock().await;
+        let key = access_key(bot_id, user_id);
+        if self.get_u8(&key)?.is_none() {
+            return Ok(false);
+        }
+        self.remove_u8(&key)?;
+        self.audit(
+            bot_id,
+            Some(actor),
+            "access.remove",
+            Some(&user_id.to_string()),
+        )
+        .await?;
+        Ok(true)
+    }
+
     pub async fn list_allowed_users(&self, bot_id: &str) -> Result<Vec<u64>> {
         let prefix = format!("{bot_id}|");
         let read = self.db.begin_read()?;
@@ -596,6 +622,14 @@ impl Store {
         let write = self.db.begin_write()?;
         {
             write.open_table(ACCESS)?.insert(key, value)?;
+        }
+        write.commit()?;
+        Ok(())
+    }
+    fn remove_u8(&self, key: &str) -> Result<()> {
+        let write = self.db.begin_write()?;
+        {
+            write.open_table(ACCESS)?.remove(key)?;
         }
         write.commit()?;
         Ok(())
@@ -742,5 +776,15 @@ mod tests {
         let instructions = store.effective_instructions("a").await.unwrap();
         assert!(!instructions.contains("# Image generation skill"));
         assert!(instructions.contains("# Web research skill"));
+    }
+
+    #[tokio::test]
+    async fn removing_allowlist_entry_is_idempotent_and_deletes_the_entry() {
+        let (_directory, store) = test_store().await;
+        store.set_user_allowed("a", 42, true, 1).await.unwrap();
+        assert_eq!(store.user_allowed("a", 42).await.unwrap(), Some(true));
+        assert!(store.remove_user_allowed("a", 42, 1).await.unwrap());
+        assert_eq!(store.user_allowed("a", 42).await.unwrap(), None);
+        assert!(!store.remove_user_allowed("a", 42, 1).await.unwrap());
     }
 }

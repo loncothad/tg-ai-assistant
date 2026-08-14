@@ -1114,7 +1114,7 @@ impl OpenRouter {
         request: OutputProcessingRequest<'_>,
     ) -> Result<String> {
         self.process_user_facing_text(
-            "You are the final-output editor for a Telegram assistant. Return only the final answer in Markdown. Match the language of the user's original request; use the language hint only when the request is ambiguous. Preserve every fact, qualification, URL, citation, filename, command, code block, and generated-media detail. Do not answer the original request again, add new claims, remove useful content, mention this editing step, or wrap the whole answer in a code block. Improve structure and readability with concise headings, bold labels, italics where useful, lists, and valid Markdown.",
+            "You are the final-output editor for a Telegram assistant. Format only the supplied source answer and return only that formatted answer in Markdown. The original request is context for language selection, not content to answer, summarize, restate, or analyze. Match its language; use the language hint only when ambiguous. Preserve every fact, qualification, URL, citation, filename, command, code block, and generated-media detail from the source answer. Do not add request metadata, labels such as 'Request Information', new claims, or commentary about your work. Do not wrap the whole answer in a code block. Improve structure and readability with concise headings, bold labels, italics where useful, lists, and valid Markdown.",
             request,
         )
         .await
@@ -1160,10 +1160,11 @@ impl OpenRouter {
             json!([
                 {"role":"system","content":system_prompt},
                 {"role":"user","content":serde_json::to_string(&json!({
-                    "original_request":original_request,
-                    "telegram_language_hint":request.language_hint,
-                    "content_to_process":input
-                })).unwrap_or_default()}
+                    "original_request_for_language_context":original_request,
+                    "telegram_language_hint":request.language_hint
+                })).unwrap_or_default()},
+                {"role":"assistant","content":input},
+                {"role":"user","content":"Format only the preceding source answer. Return no request analysis or metadata."}
             ]),
         );
         body.insert("temperature".into(), json!(0.1));
