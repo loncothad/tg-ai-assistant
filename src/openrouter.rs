@@ -610,10 +610,22 @@ impl OpenRouter {
             plan.action = PlannedAction::Chat;
             plan.refusal_message.clear();
         }
+        // Cheap planners occasionally label unrelated informational requests
+        // as code generation. Require code evidence in the user's own text;
+        // planner-produced filenames are never evidence of user intent.
+        if plan.action == PlannedAction::GenerateCode
+            && !explicit_code_artifact_requested(request.text)
+        {
+            plan.action = PlannedAction::Chat;
+            plan.skills
+                .retain(|skill| *skill != PlannedSkill::GenerateCode);
+        }
         // The planner may classify intent, but it may not turn ordinary prose
-        // into a file. Oversized prose is handled deterministically against
-        // Telegram's Rich Message limits immediately before delivery.
+        // or an inline code answer into a file. Oversized prose is handled
+        // deterministically against Telegram's Rich Message limits immediately
+        // before delivery.
         if plan.action != PlannedAction::GenerateCode
+            || !explicit_code_file_requested(request.text)
             || plan.delivery != PlannedDelivery::File
             || !request.capabilities.file
         {
@@ -2207,6 +2219,103 @@ fn planned_action_enabled(action: PlannedAction, capabilities: &Capabilities) ->
     }
 }
 
+/// Requires evidence of a software artifact in the caller's own request.
+/// Planner-generated metadata is intentionally excluded from this decision.
+fn explicit_code_artifact_requested(request: &str) -> bool {
+    let value = request.to_lowercase();
+    let tokens = value
+        .split(|character: char| !(character.is_alphanumeric() || matches!(character, '#' | '+')))
+        .filter(|token| !token.is_empty())
+        .collect::<std::collections::HashSet<_>>();
+    let phrases = [
+        "source code",
+        "landing page",
+        "web page",
+        "api endpoint",
+        "исходный код",
+        "веб-страниц",
+        "веб страниц",
+    ];
+    let code_tokens = [
+        "code",
+        "script",
+        "program",
+        "webpage",
+        "website",
+        "html",
+        "css",
+        "javascript",
+        "typescript",
+        "python",
+        "rust",
+        "golang",
+        "java",
+        "c#",
+        "c++",
+        "sql",
+        "dockerfile",
+        "caddyfile",
+        "nginx",
+        "config",
+        "configuration",
+        "код",
+        "скрипт",
+        "сайт",
+        "исходник",
+    ];
+    let code_prefixes = ["программ", "страниц", "конфиг", "скрипт"];
+    phrases.iter().any(|phrase| value.contains(phrase))
+        || code_tokens.iter().any(|token| tokens.contains(token))
+        || tokens
+            .iter()
+            .any(|token| code_prefixes.iter().any(|prefix| token.starts_with(prefix)))
+        || contains_code_filename(&value)
+}
+
+/// Allows planner-selected file delivery only when the request explicitly asks
+/// for a file or names a conventional source/configuration filename.
+fn explicit_code_file_requested(request: &str) -> bool {
+    if !explicit_code_artifact_requested(request) {
+        return false;
+    }
+    let value = request.to_lowercase();
+    let file_request = [
+        " file",
+        " files",
+        "download",
+        "attachment",
+        "attach it",
+        "save as",
+        "файл",
+        "скач",
+        "вложени",
+        "прикреп",
+        "отправь документ",
+    ];
+    file_request.iter().any(|term| value.contains(term)) || contains_code_filename(&value)
+}
+
+fn contains_code_filename(value: &str) -> bool {
+    let extensions = [
+        ".html", ".htm", ".css", ".js", ".jsx", ".ts", ".tsx", ".py", ".rs", ".go", ".java", ".c",
+        ".h", ".cpp", ".hpp", ".cs", ".sh", ".sql", ".json", ".yaml", ".yml", ".toml",
+    ];
+    value
+        .split_whitespace()
+        .map(|token| {
+            token.trim_matches(|character: char| {
+                !(character.is_alphanumeric() || matches!(character, '.' | '-' | '_'))
+            })
+        })
+        .any(|token| {
+            extensions
+                .iter()
+                .any(|extension| token.ends_with(extension))
+        })
+        || value.contains("dockerfile")
+        || value.contains("caddyfile")
+}
+
 fn file_from_arguments(arguments: &Value) -> Result<GeneratedFile> {
     const MAX_FILE_BYTES: usize = 20 * 1024 * 1024;
     let raw_name = arguments
@@ -3052,6 +3161,26 @@ mod tests {
 
         assert_eq!(answer.text, "A normal prose answer");
         assert!(answer.generated_files.is_empty());
+    }
+
+    #[test]
+    fn code_file_policy_uses_only_explicit_user_intent() {
+        let information_request = "инфа коротко Every Student Succeeds Act";
+        assert!(!explicit_code_artifact_requested(information_request));
+        assert!(!explicit_code_file_requested(information_request));
+
+        assert!(explicit_code_artifact_requested(
+            "Explain what this Python function does"
+        ));
+        assert!(!explicit_code_file_requested(
+            "Explain what this Python function does"
+        ));
+        assert!(explicit_code_file_requested(
+            "Create the implementation and attach it as main.py"
+        ));
+        assert!(explicit_code_file_requested(
+            "Напиши код и отправь его файлом"
+        ));
     }
 
     #[test]
