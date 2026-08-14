@@ -2462,14 +2462,112 @@ fn extract_content(message: &Value) -> (String, Vec<String>) {
                 citation.get("url")?.as_str()?,
             ))
         })
-        .collect::<std::collections::BTreeSet<_>>();
-    if !citations.is_empty() {
-        text.push_str("\n\n### Sources\n");
-        for (title, url) in citations {
-            text.push_str(&format!("- [{title}]({url})\n"));
-        }
-    }
+        .map(|(title, url)| (title.to_owned(), url.to_owned()))
+        .collect::<Vec<_>>();
+    text = merge_source_sections(&text, citations);
     (text, urls)
+}
+
+/// Merges model-rendered source lists with provider annotations. Providers may
+/// expose the same citations in both places, often with different titles, so
+/// identity is based on a normalized URL rather than the complete link tuple.
+fn merge_source_sections(
+    text: &str,
+    annotation_citations: impl IntoIterator<Item = (String, String)>,
+) -> String {
+    let lines = text.lines().collect::<Vec<_>>();
+    let mut body = Vec::with_capacity(lines.len());
+    let mut citations = Vec::<(String, String)>::new();
+    let mut index = 0;
+    while index < lines.len() {
+        if is_source_heading(lines[index]) {
+            let mut cursor = index + 1;
+            while cursor < lines.len() && lines[cursor].trim().is_empty() {
+                cursor += 1;
+            }
+            let start = cursor;
+            while cursor < lines.len() {
+                let Some(citation) = markdown_source_link(lines[cursor]) else {
+                    break;
+                };
+                citations.push(citation);
+                cursor += 1;
+            }
+            if cursor > start {
+                index = cursor;
+                continue;
+            }
+        }
+        body.push(lines[index]);
+        index += 1;
+    }
+    citations.extend(annotation_citations);
+
+    let mut unique = Vec::new();
+    let mut seen = std::collections::HashSet::new();
+    for (title, url) in citations {
+        let title = title.trim();
+        let url = url.trim();
+        if title.is_empty() || url.is_empty() || !seen.insert(normalized_citation_url(url)) {
+            continue;
+        }
+        unique.push((title.to_owned(), url.to_owned()));
+    }
+
+    while body.last().is_some_and(|line| line.trim().is_empty()) {
+        body.pop();
+    }
+    let mut merged = body.join("\n");
+    if !unique.is_empty() {
+        if !merged.is_empty() {
+            merged.push_str("\n\n");
+        }
+        merged.push_str("### Sources\n");
+        for (title, url) in unique {
+            merged.push_str(&format!("- [{title}]({url})\n"));
+        }
+        merged.pop();
+    }
+    merged
+}
+
+fn is_source_heading(line: &str) -> bool {
+    let heading = line.trim().trim_start_matches('#').trim();
+    matches!(
+        heading.to_ascii_lowercase().as_str(),
+        "sources" | "source" | "references" | "источники"
+    )
+}
+
+fn markdown_source_link(line: &str) -> Option<(String, String)> {
+    let line = line.trim();
+    let item = line
+        .strip_prefix("- ")
+        .or_else(|| line.strip_prefix("* "))
+        .or_else(|| {
+            let (number, remainder) = line.split_once(". ")?;
+            number
+                .chars()
+                .all(|character| character.is_ascii_digit())
+                .then_some(remainder)
+        })?;
+    let item = item.strip_prefix('[')?;
+    let separator = item.find("](")?;
+    let title = &item[..separator];
+    let url = item[separator + 2..].strip_suffix(')')?;
+    (!title.trim().is_empty() && !url.trim().is_empty())
+        .then(|| (title.trim().to_owned(), url.trim().to_owned()))
+}
+
+fn normalized_citation_url(raw: &str) -> String {
+    let Ok(mut url) = url::Url::parse(raw) else {
+        return raw.trim().to_owned();
+    };
+    url.set_fragment(None);
+    if url.path() == "/" {
+        url.set_path("");
+    }
+    url.to_string()
 }
 
 fn extract_refusal(message: &Value) -> Option<String> {
@@ -2795,6 +2893,40 @@ mod tests {
             extract_refusal(&message).as_deref(),
             Some("I can’t do that.")
         );
+    }
+
+    #[test]
+    fn provider_annotations_merge_with_existing_source_sections_by_url() {
+        let message = json!({
+            "content": concat!(
+                "Answer with an [inline citation](https://example.com/a).\n\n",
+                "### Sources\n",
+                "- [First title](https://example.com/a#details)\n",
+                "- [Second](https://example.com/b)\n\n",
+                "## Sources\n",
+                "1. [Duplicate title](https://example.com/a)\n",
+                "2. [Third](https://example.com/c)"
+            ),
+            "annotations": [
+                {"url_citation":{"title":"Provider title", "url":"https://example.com/a"}},
+                {"url_citation":{"title":"Fourth", "url":"https://example.com/d"}}
+            ]
+        });
+        let (text, _) = extract_content(&message);
+        assert_eq!(text.matches("### Sources").count(), 1);
+        assert_eq!(text.matches("https://example.com/a").count(), 2);
+        assert_eq!(text.matches("https://example.com/b").count(), 1);
+        assert_eq!(text.matches("https://example.com/c").count(), 1);
+        assert_eq!(text.matches("https://example.com/d").count(), 1);
+        assert!(text.contains("[inline citation](https://example.com/a)"));
+        assert!(!text.contains("Duplicate title"));
+        assert!(!text.contains("Provider title"));
+    }
+
+    #[test]
+    fn prose_heading_named_sources_is_preserved_without_a_link_list() {
+        let input = "### Sources\nThis section discusses historical sources.";
+        assert_eq!(merge_source_sections(input, []), input);
     }
 
     #[test]
