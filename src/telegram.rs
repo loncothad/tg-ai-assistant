@@ -42,9 +42,9 @@ use crate::{
     config::{BotConfig, Config, ModelProvider, SearchProvider},
     db::{ModelRouting, Store},
     openrouter::{
-        ChatRequest, GenerationPromptContext, MediaInput, OpenRouter, OutputProcessingRequest,
-        PlannedAction, PlannedSkill, PlanningRequest, ProgressUpdate, RequestPlan, ToolModel,
-        ToolModels,
+        AssistantResponse, ChatRequest, GeneratedFile, GenerationPromptContext, MediaInput,
+        OpenRouter, OutputProcessingRequest, PlannedAction, PlannedSkill, PlanningRequest,
+        ProgressUpdate, RequestPlan, ToolModel, ToolModels,
     },
     rich,
     search::SearchService,
@@ -663,6 +663,13 @@ impl BotRunner {
         if routing.model_provider == ModelProvider::Aihub {
             capabilities.web_fetch = false;
         }
+        // Expose file creation to the answering model only for a planner-
+        // classified code artifact. Ordinary prose remains inline; oversized
+        // prose is converted locally after Rich Markdown formatting.
+        capabilities.file &= plan.as_ref().is_some_and(|plan| {
+            plan.action == PlannedAction::GenerateCode
+                && plan.delivery == crate::openrouter::PlannedDelivery::File
+        });
         let api_key = self.model_api_key(routing.model_provider).await?;
         let image_routing = settings
             .model_routing
@@ -793,6 +800,7 @@ impl BotRunner {
                 if !answer.text.trim().is_empty() {
                     answer.text = self.process_text_output(&message, &answer.text).await;
                 }
+                materialize_oversized_text(&mut answer);
                 self.store
                     .append_message(&self.bot.id, &scope, "assistant", &answer.text)
                     .await?;
@@ -3098,6 +3106,26 @@ fn document_media_type(filename: &str) -> &'static str {
     }
 }
 
+/// Converts prose that cannot fit in one Telegram Rich Message into a plain
+/// text attachment. This is a deterministic transport safeguard, not an AI or
+/// planner decision.
+fn materialize_oversized_text(answer: &mut AssistantResponse) {
+    if answer.text.trim().is_empty()
+        || !answer.generated_files.is_empty()
+        || rich::fits_single_message(&answer.text)
+    {
+        return;
+    }
+    let bytes = answer.text.as_bytes().to_vec();
+    answer.generated_files.push(GeneratedFile {
+        filename: "answer.txt".to_owned(),
+        bytes,
+    });
+    answer.text =
+        "The complete answer exceeded Telegram's Rich Message limit and is attached as `answer.txt`."
+            .to_owned();
+}
+
 fn push_progress_step(steps: &mut Vec<ProgressUpdate>, update: ProgressUpdate) {
     if steps.last() == Some(&update) {
         return;
@@ -3703,6 +3731,28 @@ mod tests {
             document_media_type("archive.bin"),
             "application/octet-stream"
         );
+    }
+
+    #[test]
+    fn oversized_prose_becomes_a_plain_text_file_programmatically() {
+        let original = "large prose line\n".repeat(2_000);
+        let mut answer = AssistantResponse {
+            text: original.clone(),
+            media_urls: Vec::new(),
+            generation_id: None,
+            usage: None,
+            generated_images: Vec::new(),
+            generated_audio: Vec::new(),
+            generated_videos: Vec::new(),
+            generated_files: Vec::new(),
+        };
+
+        materialize_oversized_text(&mut answer);
+
+        assert_eq!(answer.generated_files.len(), 1);
+        assert_eq!(answer.generated_files[0].filename, "answer.txt");
+        assert_eq!(answer.generated_files[0].bytes, original.as_bytes());
+        assert!(answer.text.contains("Rich Message limit"));
     }
 
     #[test]

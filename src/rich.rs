@@ -10,6 +10,16 @@
 const SAFE_RICH_CHARS: usize = 31_900;
 const SAFE_BLOCKS: usize = 450;
 
+/// Returns whether converted Markdown fits in one Telegram Rich Message.
+///
+/// Callers use this before delivery to turn oversized prose into a text file
+/// instead of silently truncating guest-mode output or splitting one answer
+/// across several messages.
+pub fn fits_single_message(input: &str) -> bool {
+    let converted = to_telegram_markdown(input);
+    converted.chars().count() <= SAFE_RICH_CHARS && converted.lines().count() <= SAFE_BLOCKS
+}
+
 /// Converts ordinary model-produced Markdown into Telegram Rich Markdown.
 ///
 /// The conversion is intentionally conservative: GFM constructs already
@@ -354,9 +364,16 @@ mod tests {
     #[test]
     fn split_is_unicode_safe() {
         let value = "🦀".repeat(32_001);
+        assert!(!fits_single_message(&value));
         let pieces = chunks(&value);
         assert_eq!(pieces.concat(), value);
         assert!(pieces.iter().all(|p| p.chars().count() <= SAFE_RICH_CHARS));
+    }
+
+    #[test]
+    fn single_message_fit_accounts_for_block_limit() {
+        assert!(fits_single_message("short answer"));
+        assert!(!fits_single_message(&"line\n".repeat(SAFE_BLOCKS + 1)));
     }
 
     #[test]
