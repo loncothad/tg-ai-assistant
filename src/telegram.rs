@@ -524,13 +524,12 @@ impl BotRunner {
         } else {
             ("chat", &settings.selected_model)
         };
-        if model_override.is_none()
-            && model_capability == "chat"
-            && capabilities.model_upgrade
-            && plan
-                .as_ref()
-                .is_some_and(|plan| plan.skills.contains(&PlannedSkill::ModelUpgrade))
-        {
+        if should_route_to_upgrade_model(
+            model_override.is_some(),
+            model_capability,
+            &capabilities,
+            plan.as_ref(),
+        ) {
             model_capability = "model_upgrade";
             selected = &settings.selected_upgrade_model;
         }
@@ -3257,6 +3256,18 @@ fn attachment_flags(message: &Message) -> (bool, bool, bool) {
     (image, video, audio)
 }
 
+fn should_route_to_upgrade_model(
+    has_admin_override: bool,
+    current_capability: &str,
+    capabilities: &crate::db::Capabilities,
+    plan: Option<&RequestPlan>,
+) -> bool {
+    !has_admin_override
+        && current_capability == "chat"
+        && capabilities.model_upgrade
+        && plan.is_some_and(|plan| plan.skills.contains(&PlannedSkill::ModelUpgrade))
+}
+
 fn default_media_prompt(message: &Message) -> &'static str {
     let sources = [Some(message), message.reply_to_message.as_deref()];
     if sources.iter().flatten().any(|item| {
@@ -3391,6 +3402,38 @@ mod tests {
         assert_eq!(override_.model_provider, ModelProvider::Openrouter);
         assert_eq!(override_.model, "openai/gpt-5.4:free");
         assert_eq!(prompt, "write code");
+    }
+
+    #[test]
+    fn planner_upgrade_skill_routes_chat_to_the_advanced_model() {
+        let plan = RequestPlan {
+            action: PlannedAction::Chat,
+            skills: vec![PlannedSkill::ModelUpgrade],
+            delivery: crate::openrouter::PlannedDelivery::Inline,
+            filename: String::new(),
+            refusal_message: String::new(),
+            core_prompt: String::new(),
+            reply_excerpt: String::new(),
+            prompt_sources: Vec::new(),
+        };
+        assert!(should_route_to_upgrade_model(
+            false,
+            "chat",
+            &crate::db::Capabilities::default(),
+            Some(&plan),
+        ));
+        assert!(!should_route_to_upgrade_model(
+            true,
+            "chat",
+            &crate::db::Capabilities::default(),
+            Some(&plan),
+        ));
+        assert!(!should_route_to_upgrade_model(
+            false,
+            "image_understanding",
+            &crate::db::Capabilities::default(),
+            Some(&plan),
+        ));
     }
 
     #[test]

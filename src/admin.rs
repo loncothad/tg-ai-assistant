@@ -1290,6 +1290,14 @@ mod tests {
     }
 
     #[test]
+    fn browser_catalog_filter_includes_processing_capabilities() {
+        let javascript = include_str!("../assets/admin.js");
+        assert!(javascript.contains("'output_processing', 'error_processing'"));
+        assert!(javascript.contains("output_processing: 'Text output processing'"));
+        assert!(javascript.contains("error_processing: 'Error explanation'"));
+    }
+
+    #[test]
     fn model_endpoint_url_encodes_untrusted_path_segments() {
         let url =
             model_endpoints_url("https://openrouter.ai/api/v1", "vendor/a?b", "chat").unwrap();

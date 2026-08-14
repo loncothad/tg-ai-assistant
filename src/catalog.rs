@@ -534,6 +534,8 @@ mod tests {
         assert!(model(&["text"], &["audio"]).supports("music_generation"));
         assert!(model(&["text", "video"], &["text"]).supports("video_understanding"));
         assert!(model(&["text", "image"], &["video"]).supports("video_generation"));
+        assert!(model(&["text"], &["text"]).supports("output_processing"));
+        assert!(model(&["text"], &["text"]).supports("error_processing"));
         let mut planner = model(&["text"], &["text"]);
         planner
             .supported_parameters
