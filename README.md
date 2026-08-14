@@ -79,6 +79,7 @@ Leave `openrouter.defaults.provider.require_parameters` set to `false` when usin
 | `/new` | Clear the current isolated conversation |
 | `/model`, `/searchprovider` | Show current selections |
 | `-model [openrouter:\|aihub:]<model-id> <request>` | Use that model for one request (administrators only) |
+| `-smart <request>` | Force the configured advanced model (`-upgrade` is an alias) |
 | `/search <query>` | Force live web search |
 | `/image <prompt>` | Generate and upload an image |
 | `/speech <text>` | Generate and upload spoken audio (`/audio` is an alias) |

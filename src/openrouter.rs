@@ -500,8 +500,7 @@ impl OpenRouter {
                 "skills": {
                     "type": "array",
                     "items": {"type":"string", "enum": ["generate_code", "search", "web_fetch", "image_generation", "speech_generation", "music_generation", "audio_generation", "video_generation", "image_understanding", "video_understanding", "transcription", "file_delivery", "model_upgrade"]},
-                    "description": "Include model_upgrade whenever the user explicitly asks to use the smarter, advanced, intelligent, stronger, better, or upgrade model, even if the underlying request is routine. Otherwise include it only when the request genuinely benefits from deeper reasoning.",
-                    "uniqueItems": true
+                    "description": "Include model_upgrade whenever the user explicitly asks to use the smarter, advanced, intelligent, stronger, better, or upgrade model, even if the underlying request is routine. Otherwise include it only when the request genuinely benefits from deeper reasoning."
                 },
                 "delivery": {
                     "type": "string",
@@ -601,8 +600,10 @@ impl OpenRouter {
         truncate_utf8(&mut plan.refusal_message, 2_000);
         truncate_utf8(&mut plan.core_prompt, 8_000);
         truncate_utf8(&mut plan.reply_excerpt, 8_000);
-        plan.skills
-            .retain(|skill| enabled.contains(&skill.as_str()));
+        let mut seen_skills = std::collections::HashSet::new();
+        plan.skills.retain(|skill| {
+            enabled.contains(&skill.as_str()) && seen_skills.insert(skill.as_str())
+        });
         if !planned_action_enabled(plan.action, request.capabilities) {
             plan.action = PlannedAction::Chat;
             plan.refusal_message.clear();
@@ -652,8 +653,7 @@ impl OpenRouter {
                 },
                 "prompt_sources":{
                     "type":"array",
-                    "items":{"type":"string","enum":["current_request","replied_message","telegram_quote","attachment"]},
-                    "uniqueItems":true
+                    "items":{"type":"string","enum":["current_request","replied_message","telegram_quote","attachment"]}
                 }
             },
             "required":["core_prompt","reply_excerpt","prompt_sources"],

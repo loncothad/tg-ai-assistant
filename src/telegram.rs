@@ -340,6 +340,14 @@ impl BotRunner {
         } else {
             self.strip_address(raw_text)
         };
+        let force_upgrade = if let Some((command, arguments)) = parse_command(&text)
+            && matches!(command.as_str(), "smart" | "upgrade")
+        {
+            text = arguments.to_owned();
+            true
+        } else {
+            false
+        };
         let reply_context = reply_context(&message);
         let replied_text = replied_message_text(&message);
         let telegram_quote = telegram_quote_text(&message);
@@ -474,7 +482,10 @@ impl BotRunner {
         } else {
             None
         };
-        let _ = sender.send(ProgressUpdate::step(if plan.is_some() {
+        let explicit_upgrade = force_upgrade || explicit_model_upgrade_requested(&text);
+        let _ = sender.send(ProgressUpdate::step(if explicit_upgrade {
+            "Explicit advanced-model request detected"
+        } else if plan.is_some() {
             "Classified request"
         } else {
             "Applied standard routing"
@@ -626,6 +637,7 @@ impl BotRunner {
             model_capability,
             &capabilities,
             plan.as_ref(),
+            explicit_upgrade,
         ) {
             model_capability = "model_upgrade";
             selected = &settings.selected_upgrade_model;
@@ -3496,11 +3508,40 @@ fn should_route_to_upgrade_model(
     current_capability: &str,
     capabilities: &crate::db::Capabilities,
     plan: Option<&RequestPlan>,
+    explicit_request: bool,
 ) -> bool {
     !has_admin_override
         && current_capability == "chat"
         && capabilities.model_upgrade
-        && plan.is_some_and(|plan| plan.skills.contains(&PlannedSkill::ModelUpgrade))
+        && (explicit_request
+            || plan.is_some_and(|plan| plan.skills.contains(&PlannedSkill::ModelUpgrade)))
+}
+
+fn explicit_model_upgrade_requested(text: &str) -> bool {
+    let text = text.to_lowercase();
+    let english_phrase = [
+        "smart model",
+        "smarter model",
+        "advanced model",
+        "stronger model",
+        "intelligent model",
+        "better model",
+        "upgrade model",
+        "high-quality model",
+        "smart one",
+        "smarter one",
+        "advanced one",
+    ]
+    .iter()
+    .any(|phrase| text.contains(phrase));
+    let russian_model = text.contains("модел")
+        && ["умн", "продвинут", "сильн", "мощн", "интеллектуал"]
+            .iter()
+            .any(|stem| text.contains(stem));
+    let russian_implicit = ["умнее модель", "умной моделькой", "умную модель"]
+        .iter()
+        .any(|phrase| text.contains(phrase));
+    english_phrase || russian_model || russian_implicit
 }
 
 fn default_media_prompt(message: &Message) -> &'static str {
@@ -3588,6 +3629,7 @@ Ask me a question directly. I can use live web search when the selected model de
 - `/new` — clear this conversation
 - `/model` — show the active model
 - `-model [openrouter:|aihub:]<model-id> <request>` — use a model for one request (administrators only)
+- `-smart <request>` — force the configured advanced model (`-upgrade` is an alias)
 - `/search <query>` — force a live web search
 - `/searchprovider` — show the active search provider
 - `/image <prompt>` — generate an image
@@ -3625,6 +3667,8 @@ mod tests {
             "/help",
             "/new",
             "/model",
+            "-smart",
+            "-upgrade",
             "/search",
             "/searchprovider",
             "/image",
@@ -3691,19 +3735,42 @@ mod tests {
             "chat",
             &crate::db::Capabilities::default(),
             Some(&plan),
+            false,
         ));
         assert!(!should_route_to_upgrade_model(
             true,
             "chat",
             &crate::db::Capabilities::default(),
             Some(&plan),
+            false,
         ));
         assert!(!should_route_to_upgrade_model(
             false,
             "image_understanding",
             &crate::db::Capabilities::default(),
             Some(&plan),
+            false,
         ));
+    }
+
+    #[test]
+    fn explicit_advanced_model_requests_survive_planner_failure() {
+        for request in [
+            "ответь умной моделькой",
+            "use the smarter model and answer briefly",
+            "используй продвинутую модель",
+            "answer with the advanced one",
+        ] {
+            assert!(explicit_model_upgrade_requested(request), "{request}");
+            assert!(should_route_to_upgrade_model(
+                false,
+                "chat",
+                &crate::db::Capabilities::default(),
+                None,
+                true,
+            ));
+        }
+        assert!(!explicit_model_upgrade_requested("answer briefly"));
     }
 
     #[test]
