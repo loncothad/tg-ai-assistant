@@ -1,0 +1,2 @@
+d /etc/teleforge 0750 root teleforge -
+d /var/lib/teleforge 0750 teleforge teleforge -

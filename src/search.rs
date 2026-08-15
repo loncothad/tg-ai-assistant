@@ -3,6 +3,7 @@
 use crate::{
     Result,
     config::{ProviderConfig, SearchConfig, SearchProvider},
+    http::HttpClient,
 };
 use eyre::{Context, bail};
 use serde::{Deserialize, Serialize};
@@ -10,7 +11,7 @@ use serde_json::{Map, Value, json};
 
 #[derive(Clone)]
 pub struct SearchService {
-    client: reqwest::Client,
+    client: HttpClient,
     config: SearchConfig,
 }
 #[derive(Clone, Debug, Deserialize, Serialize, PartialEq, Eq)]
@@ -21,7 +22,7 @@ pub struct SearchResult {
 }
 
 impl SearchService {
-    pub fn new(client: reqwest::Client, config: SearchConfig) -> Self {
+    pub fn new(client: HttpClient, config: SearchConfig) -> Self {
         Self { client, config }
     }
     pub fn default_provider(&self) -> SearchProvider {

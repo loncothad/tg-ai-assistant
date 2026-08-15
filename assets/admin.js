@@ -50,15 +50,15 @@ const supports = (model, cap) => {
   }
   if (cap === 'intent_planning' || cap === 'intent_planning_fallback') {
     const parameters = model.supported_parameters || [];
-    return input.includes('text') && output.includes('text') &&
+    return input.includes('text') && input.includes('image') && output.includes('text') &&
       (parameters.includes('response_format') || parameters.includes('structured_outputs'));
   }
   if (cap === 'image_understanding') return input.includes('image') && output.includes('text');
   if (cap === 'video_understanding') return input.includes('video') && output.includes('text');
   if (cap === 'image_generation') return output.includes('image');
-  if (cap === 'audio_generation' || cap === 'speech_generation') return output.includes('speech');
+  if (cap === 'audio_generation' || cap === 'speech_generation') return output.includes('speech') || output.includes('audio');
   if (cap === 'music_generation') return output.includes('audio');
-  if (cap === 'transcription') return output.includes('transcription');
+  if (cap === 'transcription') return output.includes('transcription') || (input.includes('audio') && output.includes('text'));
   if (cap === 'video_generation') return output.includes('video');
   return false;
 };
@@ -138,9 +138,10 @@ const providerLabel = endpoint => {
 
 const loadProviders = async (model, select, help, selected, saveButton) => {
   if (model.model_provider !== 'openrouter') {
-    select.replaceChildren(new Option('Direct · AI Hub', ''));
+    const label = model.model_provider === 'fal' ? 'fal.ai' : 'AI Hub';
+    select.replaceChildren(new Option(`Direct · ${label}`, ''));
     select.disabled = true;
-    help.textContent = 'No secondary endpoint routing is exposed by AI Hub.';
+    help.textContent = `No secondary endpoint routing is exposed by ${label}.`;
     saveButton.disabled = false;
     return;
   }
@@ -177,7 +178,9 @@ const loadProviders = async (model, select, help, selected, saveButton) => {
 const showDetail = model => {
   chosen = model;
   detail.replaceChildren();
-  const providerName = model.model_provider === 'aihub' ? 'AI Hub' : 'OpenRouter';
+  const providerName = model.model_provider === 'aihub'
+    ? 'AI Hub'
+    : model.model_provider === 'fal' ? 'fal.ai' : 'OpenRouter';
   detail.append(text('h2', model.name), text('div', `${providerName} · ${model.id}`, 'model-id'));
   detail.append(chips([...(model.input_modalities || []).map(item => `in: ${item}`), ...(model.output_modalities || []).map(item => `out: ${item}`)]));
   detail.append(text('p', model.description || `No description is supplied by ${providerName}.`, 'description'));

@@ -4,7 +4,11 @@
 //! selectable models. It reflects each bot API key's preferences, guardrails,
 //! privacy policy, and eligibility without maintaining a hard-coded allowlist.
 
-use crate::{Result, config::ModelProvider};
+use crate::{
+    Result,
+    config::{FalConfig, ModelProvider},
+    http::HttpClient,
+};
 use eyre::{Context, ContextCompat, bail};
 use serde::{Deserialize, Serialize};
 use serde_json::{Map, Value};
@@ -55,6 +59,7 @@ impl CatalogModel {
             }
             "intent_planning" | "intent_planning_fallback" => {
                 input("text")
+                    && input("image")
                     && output("text")
                     && self.supported_parameters.iter().any(|parameter| {
                         matches!(parameter.as_str(), "response_format" | "structured_outputs")
@@ -63,9 +68,9 @@ impl CatalogModel {
             "image_understanding" => input("image") && output("text"),
             "video_understanding" => input("video") && output("text"),
             "image_generation" => output("image"),
-            "audio_generation" | "speech_generation" => output("speech"),
+            "audio_generation" | "speech_generation" => output("speech") || output("audio"),
             "music_generation" => output("audio"),
-            "transcription" => output("transcription"),
+            "transcription" => output("transcription") || (input("audio") && output("text")),
             "video_generation" => output("video"),
             _ => false,
         }
@@ -88,7 +93,7 @@ impl ModelCatalogCache {
     /// Returns the current OpenRouter catalog, refreshing it at most once every ten minutes.
     pub async fn get_openrouter(
         &self,
-        client: &reqwest::Client,
+        client: &HttpClient,
         base_url: &str,
         bot_id: &str,
         api_key: &str,
@@ -100,7 +105,7 @@ impl ModelCatalogCache {
     /// Returns the current AI Hub catalog, refreshing it at most once every ten minutes.
     pub async fn get_aihub(
         &self,
-        client: &reqwest::Client,
+        client: &HttpClient,
         base_url: &str,
         bot_id: &str,
         api_key: &str,
@@ -111,7 +116,7 @@ impl ModelCatalogCache {
 
     async fn get(
         &self,
-        client: &reqwest::Client,
+        client: &HttpClient,
         base_url: &str,
         bot_id: &str,
         api_key: &str,
@@ -137,6 +142,7 @@ impl ModelCatalogCache {
         let fetched = match model_provider {
             ModelProvider::Openrouter => fetch_openrouter_catalog(client, base_url, api_key).await,
             ModelProvider::Aihub => fetch_aihub_catalog(client, base_url, api_key).await,
+            ModelProvider::Fal => bail!("Fal catalogs are built from configured endpoints"),
         };
         match fetched {
             Ok(models) => {
@@ -163,14 +169,76 @@ impl ModelCatalogCache {
     }
 }
 
+/// Converts configured fal.ai endpoints into the common admin catalog shape.
+pub fn fal_catalog(config: &FalConfig) -> Vec<CatalogModel> {
+    let mut models = config
+        .endpoints
+        .iter()
+        .map(|endpoint| {
+            let mut input = vec!["text".to_owned()];
+            if endpoint.image_field.is_some() {
+                input.push("image".to_owned());
+            }
+            if endpoint.video_field.is_some() {
+                input.push("video".to_owned());
+            }
+            if endpoint.audio_field.is_some() {
+                input.push("audio".to_owned());
+            }
+            let mut output = Vec::new();
+            for capability in &endpoint.capabilities {
+                let modality = match capability.as_str() {
+                    "image_generation" => "image",
+                    "speech_generation" | "audio_generation" => "speech",
+                    "music_generation" => "audio",
+                    "transcription" => "transcription",
+                    "video_generation" => "video",
+                    _ => continue,
+                };
+                if !output.iter().any(|item| item == modality) {
+                    output.push(modality.to_owned());
+                }
+            }
+            CatalogModel {
+                model_provider: ModelProvider::Fal,
+                id: endpoint.id.clone(),
+                name: if endpoint.name.is_empty() {
+                    endpoint.id.clone()
+                } else {
+                    endpoint.name.clone()
+                },
+                description: if endpoint.description.is_empty() {
+                    "Configured fal.ai endpoint".to_owned()
+                } else {
+                    endpoint.description.clone()
+                },
+                created: endpoint.created,
+                input_modalities: input,
+                output_modalities: output,
+                ..CatalogModel::default()
+            }
+        })
+        .collect::<Vec<_>>();
+    models.sort_by(|left, right| {
+        right
+            .created
+            .unwrap_or_default()
+            .cmp(&left.created.unwrap_or_default())
+            .then_with(|| left.name.cmp(&right.name))
+    });
+    models
+}
+
 async fn fetch_openrouter_catalog(
-    client: &reqwest::Client,
+    client: &HttpClient,
     base_url: &str,
     api_key: &str,
 ) -> Result<Vec<CatalogModel>> {
     let base = base_url.trim_end_matches('/');
-    // This authenticated endpoint excludes models unavailable under the API
-    // key's provider preferences, guardrails, privacy policy, and eligibility.
+    // Start with the user-scoped catalog, then merge the authenticated public
+    // catalog. `/models/user` reflects account policy but can omit otherwise
+    // selectable models; request-time routing remains the final eligibility
+    // authority. Identity-attestation models are filtered during parsing.
     let general = fetch_data(
         client,
         &format!("{base}/models/user?sort=newest&output_modalities=all"),
@@ -181,11 +249,21 @@ async fn fetch_openrouter_catalog(
 
     let mut models = BTreeMap::<String, CatalogModel>::new();
     merge_values(&mut models, general);
+    if let Ok(values) = fetch_data(
+        client,
+        &format!("{base}/models?sort=newest&output_modalities=all"),
+        api_key,
+        "OpenRouter",
+    )
+    .await
+    {
+        merge_values(&mut models, values);
+    }
     // `/models/user` currently defaults to text-output models even when an
     // `output_modalities=all` query is supplied. Pull the non-text catalogs
     // explicitly so media-only models are not silently omitted from the
     // capability chooser.
-    for modality in ["speech", "transcription"] {
+    for modality in ["audio", "speech", "transcription"] {
         if let Ok(values) = fetch_data(
             client,
             &format!("{base}/models?sort=newest&output_modalities={modality}"),
@@ -227,7 +305,7 @@ async fn fetch_openrouter_catalog(
 }
 
 async fn fetch_aihub_catalog(
-    client: &reqwest::Client,
+    client: &HttpClient,
     base_url: &str,
     api_key: &str,
 ) -> Result<Vec<CatalogModel>> {
@@ -257,7 +335,7 @@ async fn fetch_aihub_catalog(
 }
 
 async fn fetch_data(
-    client: &reqwest::Client,
+    client: &HttpClient,
     url: &str,
     api_key: &str,
     provider: &str,
@@ -536,11 +614,12 @@ mod tests {
         assert!(model(&["text", "image"], &["video"]).supports("video_generation"));
         assert!(model(&["text"], &["text"]).supports("output_processing"));
         assert!(model(&["text"], &["text"]).supports("error_processing"));
-        let mut planner = model(&["text"], &["text"]);
+        let mut planner = model(&["text", "image"], &["text"]);
         planner
             .supported_parameters
             .push("response_format".to_owned());
         assert!(planner.supports("intent_planning"));
+        assert!(!model(&["text"], &["text"]).supports("intent_planning"));
     }
 
     #[test]

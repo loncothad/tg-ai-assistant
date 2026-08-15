@@ -8,6 +8,7 @@ use std::{collections::BTreeMap, path::Path, sync::Arc};
 use base64::{Engine, engine::general_purpose::STANDARD};
 use chacha20poly1305::{ChaCha20Poly1305, KeyInit, aead::Aead};
 use chrono::Utc;
+use compact_str::CompactString;
 use eyre::{Context, bail};
 use rand::RngExt;
 use redb::{Database, ReadableDatabase, ReadableTable, TableDefinition};
@@ -32,7 +33,8 @@ pub struct Store {
 
 #[derive(Clone, Debug, Deserialize, Serialize, PartialEq, Eq)]
 pub struct ChatMessage {
-    pub role: String,
+    /// Short OpenAI-compatible role name, stored inline in the common case.
+    pub role: CompactString,
     pub content: String,
 }
 
@@ -54,6 +56,12 @@ pub struct Capabilities {
     pub file: bool,
     #[serde(default = "enabled_by_default")]
     pub model_upgrade: bool,
+    /// Allows public YouTube URLs to be supplied as video-model inputs.
+    #[serde(default = "enabled_by_default")]
+    pub youtube: bool,
+    /// Allows explicitly requested prompt expansion after planner approval.
+    #[serde(default = "enabled_by_default")]
+    pub prompt_expansion: bool,
 }
 impl Default for Capabilities {
     fn default() -> Self {
@@ -68,6 +76,8 @@ impl Default for Capabilities {
             transcription: true,
             file: true,
             model_upgrade: true,
+            youtube: true,
+            prompt_expansion: true,
         }
     }
 }
@@ -269,6 +279,7 @@ impl Store {
         for (provider, value) in [
             ("openrouter", config.openrouter.bootstrap_api_key.as_str()),
             ("aihub", config.aihub.bootstrap_api_key.as_str()),
+            ("fal", config.fal.bootstrap_api_key.as_str()),
             ("brave", config.search.brave.bootstrap_api_key.as_str()),
             ("exa", config.search.exa.bootstrap_api_key.as_str()),
             ("serpapi", config.search.serpapi.bootstrap_api_key.as_str()),
@@ -368,6 +379,8 @@ impl Store {
             "transcription" => settings.capabilities.transcription = enabled,
             "file" => settings.capabilities.file = enabled,
             "model_upgrade" => settings.capabilities.model_upgrade = enabled,
+            "youtube" => settings.capabilities.youtube = enabled,
+            "prompt_expansion" => settings.capabilities.prompt_expansion = enabled,
             _ => bail!("Unknown capability: {capability}"),
         }
         self.save_settings_unlocked(bot_id, &settings).await
@@ -418,6 +431,8 @@ impl Store {
             "transcription" => settings.capabilities.transcription,
             "file" => settings.capabilities.file,
             "model_upgrade" => settings.capabilities.model_upgrade,
+            "youtube" => settings.capabilities.youtube,
+            "prompt_expansion" => settings.capabilities.prompt_expansion,
             _ => false,
         };
         let mut skills = crate::defaults::BUILTIN_SKILLS
@@ -671,7 +686,10 @@ fn secret_key(bot: &str, provider: &str) -> String {
     format!("{bot}|{provider}")
 }
 fn validate_provider(value: &str) -> Result<()> {
-    if matches!(value, "openrouter" | "aihub" | "brave" | "exa" | "serpapi") {
+    if matches!(
+        value,
+        "openrouter" | "aihub" | "fal" | "brave" | "exa" | "serpapi"
+    ) {
         Ok(())
     } else {
         bail!("Unknown credential provider")

@@ -5,6 +5,7 @@ use crate::{
     catalog::ModelCatalogCache,
     config::{Config, ModelProvider},
     db::{ModelRouting, Store},
+    http::HttpClient,
 };
 use axum::{
     Form, Json, Router,
@@ -26,13 +27,13 @@ use std::{collections::BTreeMap, sync::Arc};
 pub struct AdminState {
     pub config: Arc<Config>,
     pub store: Store,
-    pub client: reqwest::Client,
+    pub client: HttpClient,
     catalog: ModelCatalogCache,
 }
 
 impl AdminState {
     /// Creates shared state for the authenticated Mini App endpoints.
-    pub fn new(config: Arc<Config>, store: Store, client: reqwest::Client) -> Self {
+    pub fn new(config: Arc<Config>, store: Store, client: HttpClient) -> Self {
         Self {
             config,
             store,
@@ -122,6 +123,7 @@ async fn models(
     for (provider, label) in [
         (ModelProvider::Openrouter, "OpenRouter"),
         (ModelProvider::Aihub, "AI Hub"),
+        (ModelProvider::Fal, "fal.ai"),
     ] {
         if !state
             .store
@@ -276,6 +278,14 @@ async fn aihub_key(state: &AdminState, bot: &str) -> Result<String> {
         .context("AI Hub API key is not configured")
 }
 
+async fn fal_key(state: &AdminState, bot: &str) -> Result<String> {
+    state
+        .store
+        .credential(bot, "fal")
+        .await?
+        .context("Fal API key is not configured")
+}
+
 async fn catalog_for(
     state: &AdminState,
     bot: &str,
@@ -295,6 +305,10 @@ async fn catalog_for(
                 .catalog
                 .get_aihub(&state.client, &state.config.aihub.base_url, bot, &key)
                 .await
+        }
+        ModelProvider::Fal => {
+            let _key = fal_key(state, bot).await?;
+            Ok(Arc::new(crate::catalog::fal_catalog(&state.config.fal)))
         }
     }
 }
@@ -317,6 +331,23 @@ async fn set_model(
         Ok(auth) => auth,
         Err(e) => return auth_error(e),
     };
+    if matches!(
+        form.capability.as_str(),
+        "intent_planning"
+            | "intent_planning_fallback"
+            | "chat"
+            | "output_processing"
+            | "error_processing"
+            | "model_upgrade"
+            | "image_understanding"
+            | "video_understanding"
+    ) && form.model_provider == ModelProvider::Fal
+    {
+        return message(
+            StatusCode::BAD_REQUEST,
+            "Fal endpoints are available only for generation and transcription capabilities",
+        );
+    }
     if matches!(
         form.capability.as_str(),
         "intent_planning" | "intent_planning_fallback"
@@ -344,7 +375,7 @@ async fn set_model(
             "Unknown model or model does not support this capability",
         );
     }
-    if form.model_provider == ModelProvider::Aihub
+    if form.model_provider != ModelProvider::Openrouter
         && (form.routing != "auto"
             || form
                 .provider
@@ -353,7 +384,7 @@ async fn set_model(
     {
         return message(
             StatusCode::BAD_REQUEST,
-            "AI Hub does not support OpenRouter endpoint routing controls",
+            "This provider does not support OpenRouter endpoint routing controls",
         );
     }
     if !matches!(
@@ -693,6 +724,8 @@ async fn import_skill_bundle(store: &Store, bot: &str, content: &str) -> Result<
             "transcription" => settings.capabilities.transcription = skill.enabled,
             "file" => settings.capabilities.file = skill.enabled,
             "model_upgrade" => settings.capabilities.model_upgrade = skill.enabled,
+            "youtube" => settings.capabilities.youtube = skill.enabled,
+            "prompt_expansion" => settings.capabilities.prompt_expansion = skill.enabled,
             _ => bail!("Unknown built-in skill: {}", skill.id),
         }
     }
@@ -724,6 +757,8 @@ async fn export_skills(
         "transcription" => settings.capabilities.transcription,
         "file" => settings.capabilities.file,
         "model_upgrade" => settings.capabilities.model_upgrade,
+        "youtube" => settings.capabilities.youtube,
+        "prompt_expansion" => settings.capabilities.prompt_expansion,
         _ => false,
     };
     let skills=crate::defaults::BUILTIN_SKILLS.iter().map(|s|serde_json::json!({"id":s.id,"description":s.description,"enabled":enabled(s.id),"instructions":s.instructions})).collect::<Vec<_>>();
@@ -789,12 +824,14 @@ async fn render(state: &AdminState, bot: &str) -> Response {
 async fn render_html(state: &AdminState, bot: &str) -> Result<String> {
     let settings = state.store.settings(bot).await?;
     let mut configured = BTreeMap::new();
-    for p in ["openrouter", "aihub", "brave", "exa", "serpapi"] {
+    for p in ["openrouter", "aihub", "fal", "brave", "exa", "serpapi"] {
         configured.insert(p, state.store.credential_configured(bot, p).await?);
     }
     let openrouter_ready = configured.get("openrouter").copied().unwrap_or(false);
     let aihub_ready = configured.get("aihub").copied().unwrap_or(false);
-    let any_model_provider_ready = openrouter_ready || aihub_ready;
+    let fal_ready = configured.get("fal").copied().unwrap_or(false);
+    let chat_provider_ready = openrouter_ready || aihub_ready;
+    let any_model_provider_ready = openrouter_ready || aihub_ready || fal_ready;
     let route = |capability: &str| {
         settings
             .model_routing
@@ -825,7 +862,7 @@ async fn render_html(state: &AdminState, bot: &str) -> Result<String> {
             &settings.selected_model,
             &route("chat"),
             &configured,
-            any_model_provider_ready,
+            chat_provider_ready,
         ),
         model_form(
             "Text output processing",
@@ -833,7 +870,7 @@ async fn render_html(state: &AdminState, bot: &str) -> Result<String> {
             &settings.selected_output_processing_model,
             &route("output_processing"),
             &configured,
-            any_model_provider_ready,
+            chat_provider_ready,
         ),
         model_form(
             "Error explanation",
@@ -841,7 +878,7 @@ async fn render_html(state: &AdminState, bot: &str) -> Result<String> {
             &settings.selected_error_processing_model,
             &route("error_processing"),
             &configured,
-            any_model_provider_ready,
+            chat_provider_ready,
         ),
         model_form(
             "Advanced model",
@@ -849,7 +886,7 @@ async fn render_html(state: &AdminState, bot: &str) -> Result<String> {
             &settings.selected_upgrade_model,
             &route("model_upgrade"),
             &configured,
-            any_model_provider_ready,
+            chat_provider_ready,
         ),
         model_form(
             "Image understanding",
@@ -857,7 +894,7 @@ async fn render_html(state: &AdminState, bot: &str) -> Result<String> {
             &settings.selected_image_understanding_model,
             &route("image_understanding"),
             &configured,
-            any_model_provider_ready,
+            chat_provider_ready,
         ),
         model_form(
             "Video understanding",
@@ -865,7 +902,7 @@ async fn render_html(state: &AdminState, bot: &str) -> Result<String> {
             &settings.selected_video_understanding_model,
             &route("video_understanding"),
             &configured,
-            any_model_provider_ready,
+            chat_provider_ready,
         ),
         model_form(
             "Image generation",
@@ -930,6 +967,8 @@ async fn render_html(state: &AdminState, bot: &str) -> Result<String> {
         "transcription" => settings.capabilities.transcription,
         "file" => settings.capabilities.file,
         "model_upgrade" => settings.capabilities.model_upgrade,
+        "youtube" => settings.capabilities.youtube,
+        "prompt_expansion" => settings.capabilities.prompt_expansion,
         _ => false,
     };
     let caps = crate::defaults::BUILTIN_SKILLS
@@ -943,6 +982,14 @@ async fn render_html(state: &AdminState, bot: &str) -> Result<String> {
                     model_provider_for_capability(&settings, "chat") == ModelProvider::Openrouter
                         && openrouter_ready
                 }
+                "youtube" => {
+                    settings.capabilities.media
+                        && configured
+                            .get(model_provider_for_capability(&settings, "video_understanding").as_str())
+                            .copied()
+                            .unwrap_or(false)
+                }
+                "prompt_expansion" => openrouter_ready,
                 _ => configured
                     .get(selected_model_provider.as_str())
                     .copied()
@@ -954,6 +1001,10 @@ async fn render_html(state: &AdminState, bot: &str) -> Result<String> {
                 "Unavailable: the selected search provider has no configured API key"
             } else if skill.id == "web_fetch" {
                 "Unavailable: Web Fetch requires an OpenRouter chat model and API key"
+            } else if skill.id == "youtube" {
+                "Unavailable: YouTube description requires media understanding and a video-understanding provider key"
+            } else if skill.id == "prompt_expansion" {
+                "Unavailable: prompt expansion requires the OpenRouter intent processor key"
             } else {
                 "Unavailable: the API key for this skill's selected model provider is missing"
             };
@@ -979,7 +1030,7 @@ async fn render_html(state: &AdminState, bot: &str) -> Result<String> {
     };
     Ok(format!(
         "<nav class=\"jump-nav\"><button type=button data-jump=\"models\">Models</button><button type=button data-jump=\"skills\">Skills</button><button type=button data-jump=\"credentials\">Credentials</button><button type=button data-jump=\"instructions\">Instructions</button><button type=button data-jump=\"access\">Access</button></nav>
-        <section id=\"models\"><div class=\"section-head\"><div><h2>Models by capability</h2><p>OpenRouter and AI Hub catalogs are loaded separately and selected per capability.</p></div><span class=\"badge\">Live catalogs</span></div><div class=\"grid model-grid\">{model_forms}</div><form hx-post=\"search\" hx-target=\"#panel\" hx-swap=\"innerHTML transition:true\"><label>Web search provider<select name=provider>{}</select></label><button>Save search provider</button></form></section>
+        <section id=\"models\"><div class=\"section-head\"><div><h2>Models by capability</h2><p>OpenRouter, AI Hub, and configured fal.ai endpoints are separated by provider and capability. Intent processing lists only models with text and image input, text output, and structured-output support.</p></div><span class=\"badge\">Live catalogs</span></div><div class=\"grid model-grid\">{model_forms}</div><form hx-post=\"search\" hx-target=\"#panel\" hx-swap=\"innerHTML transition:true\"><label>Web search provider<select name=provider>{}</select></label><button>Save search provider</button></form></section>
         <section id=\"skills\"><div class=\"section-head\"><div><h2>Built-in skills</h2><p>Enable only the callable APIs and instructions this bot should expose.</p></div></div><div class=grid>{caps}</div></section>
         <section id=\"credentials\"><div class=\"section-head\"><div><h2>API credentials</h2><p>Encrypted at rest and never returned to the browser.</p></div></div><div class=grid>{creds}</div></section>
         <section id=\"instructions\"><div class=\"section-head\"><div><h2>System prompt</h2><p>Override or restore the prompt compiled into this binary.</p></div></div>{}</section>
@@ -1065,6 +1116,8 @@ fn model_provider_for_skill(settings: &crate::db::BotSettings, skill: &str) -> M
         "media" => "image_understanding",
         "file" => "chat",
         "model_upgrade" => "model_upgrade",
+        "youtube" => "video_understanding",
+        "prompt_expansion" => "intent_planning",
         _ => "chat",
     };
     model_provider_for_capability(settings, capability)

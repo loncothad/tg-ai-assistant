@@ -6,6 +6,8 @@ pub mod config;
 pub mod db;
 pub mod defaults;
 pub mod ephemeral_media;
+pub mod fal;
+pub mod http;
 pub mod openrouter;
 pub mod rich;
 pub mod search;

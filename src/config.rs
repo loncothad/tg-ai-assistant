@@ -26,6 +26,8 @@ pub struct Config {
     pub openrouter: OpenRouterConfig,
     #[serde(default)]
     pub aihub: AiHubConfig,
+    #[serde(default)]
+    pub fal: FalConfig,
     pub search: SearchConfig,
     pub bots: Vec<BotConfig>,
 }
@@ -61,6 +63,7 @@ pub enum ModelProvider {
     #[default]
     Openrouter,
     Aihub,
+    Fal,
 }
 
 impl ModelProvider {
@@ -68,6 +71,7 @@ impl ModelProvider {
         match self {
             Self::Openrouter => "openrouter",
             Self::Aihub => "aihub",
+            Self::Fal => "fal",
         }
     }
 }
@@ -79,9 +83,77 @@ impl std::str::FromStr for ModelProvider {
         match value {
             "openrouter" => Ok(Self::Openrouter),
             "aihub" => Ok(Self::Aihub),
+            "fal" => Ok(Self::Fal),
             _ => bail!("Unknown model provider: {value}"),
         }
     }
+}
+
+/// fal.ai queue API and explicitly configured model endpoints.
+#[derive(Clone, Debug, Deserialize, Serialize)]
+#[serde(deny_unknown_fields)]
+pub struct FalConfig {
+    #[serde(default)]
+    pub bootstrap_api_key: String,
+    #[serde(default = "default_fal_url")]
+    pub base_url: String,
+    #[serde(default = "default_fal_poll")]
+    pub poll_interval_seconds: u64,
+    #[serde(default = "default_fal_timeout")]
+    pub timeout_seconds: u64,
+    #[serde(default)]
+    pub endpoints: Vec<FalEndpointConfig>,
+}
+
+impl Default for FalConfig {
+    fn default() -> Self {
+        Self {
+            bootstrap_api_key: String::new(),
+            base_url: default_fal_url(),
+            poll_interval_seconds: default_fal_poll(),
+            timeout_seconds: default_fal_timeout(),
+            endpoints: Vec::new(),
+        }
+    }
+}
+
+/// One fal.ai endpoint and its schema mapping.
+///
+/// fal endpoint schemas are model-specific. These mappings keep every endpoint
+/// usable without hard-coding a small vendor model allowlist.
+#[derive(Clone, Debug, Deserialize, Serialize)]
+#[serde(deny_unknown_fields)]
+pub struct FalEndpointConfig {
+    pub id: String,
+    /// Optional per-endpoint queue/direct origin override.
+    #[serde(default)]
+    pub base_url: Option<String>,
+    #[serde(default)]
+    pub name: String,
+    #[serde(default)]
+    pub description: String,
+    /// Teleforge capabilities served by this endpoint.
+    pub capabilities: Vec<String>,
+    #[serde(default = "default_prompt_field")]
+    pub prompt_field: String,
+    #[serde(default)]
+    pub image_field: Option<String>,
+    #[serde(default)]
+    pub video_field: Option<String>,
+    #[serde(default)]
+    pub audio_field: Option<String>,
+    #[serde(default)]
+    pub language_field: Option<String>,
+    /// JSON pointer candidates for media URLs in the result.
+    #[serde(default)]
+    pub output_url_paths: Vec<String>,
+    /// JSON pointer candidates for transcript/text in the result.
+    #[serde(default)]
+    pub output_text_paths: Vec<String>,
+    #[serde(default)]
+    pub defaults: serde_json::Map<String, Value>,
+    #[serde(default)]
+    pub created: Option<i64>,
 }
 
 #[derive(Clone, Debug, Deserialize, Serialize)]
@@ -99,10 +171,9 @@ pub struct ServerConfig {
     pub public_url: String,
     #[serde(default = "default_request_timeout")]
     pub request_timeout_seconds: u64,
-    /// Accepted only so older deployments can upgrade without editing YAML.
-    /// Update processing is intentionally unbounded and does not use this value.
-    #[serde(default, skip_serializing, rename = "max_concurrent_requests_per_bot")]
-    pub deprecated_concurrency_limit: Option<usize>,
+    /// Maximum concurrently executing Telegram updates for each bot token.
+    #[serde(default = "default_concurrency_limit")]
+    pub max_concurrent_requests_per_bot: usize,
     #[serde(default = "default_auth_ttl")]
     pub admin_init_data_ttl_seconds: i64,
     #[serde(default = "default_media_bytes")]
@@ -116,7 +187,7 @@ impl Default for ServerConfig {
             listen: default_listen(),
             public_url: String::new(),
             request_timeout_seconds: default_request_timeout(),
-            deprecated_concurrency_limit: None,
+            max_concurrent_requests_per_bot: default_concurrency_limit(),
             admin_init_data_ttl_seconds: default_auth_ttl(),
             max_input_media_bytes: default_media_bytes(),
             json_logs: false,
@@ -622,6 +693,9 @@ impl Config {
         if self.database.encryption_key.trim().is_empty() {
             bail!("Database encryption_key cannot be empty");
         }
+        if self.server.max_concurrent_requests_per_bot == 0 {
+            bail!("Server max_concurrent_requests_per_bot must be greater than zero");
+        }
         if self.openrouter.models.is_empty() {
             bail!("OpenRouter models cannot be empty");
         }
@@ -636,6 +710,60 @@ impl Config {
         validate_openrouter_options("AI Hub defaults", &self.aihub.defaults)?;
         if !self.aihub.base_url.starts_with("https://") {
             bail!("AI Hub base_url must use HTTPS");
+        }
+        if !self.fal.base_url.starts_with("https://")
+            || self.fal.poll_interval_seconds == 0
+            || self.fal.timeout_seconds == 0
+        {
+            bail!("Fal base_url must use HTTPS and its polling limits must be non-zero");
+        }
+        let mut fal_ids = HashSet::new();
+        for endpoint in &self.fal.endpoints {
+            if endpoint.id.trim().is_empty()
+                || endpoint
+                    .id
+                    .split('/')
+                    .any(|part| part.is_empty() || part == "..")
+                || !fal_ids.insert(endpoint.id.as_str())
+            {
+                bail!(
+                    "Fal endpoint IDs must be safe, non-empty, and unique: {}",
+                    endpoint.id
+                );
+            }
+            if endpoint
+                .base_url
+                .as_deref()
+                .is_some_and(|base| !base.starts_with("https://"))
+            {
+                bail!("Fal endpoint {} base_url must use HTTPS", endpoint.id);
+            }
+            if endpoint.capabilities.is_empty()
+                || endpoint.capabilities.iter().any(|capability| {
+                    !matches!(
+                        capability.as_str(),
+                        "image_generation"
+                            | "speech_generation"
+                            | "audio_generation"
+                            | "music_generation"
+                            | "transcription"
+                            | "video_generation"
+                    )
+                })
+            {
+                bail!("Fal endpoint {} has an unsupported capability", endpoint.id);
+            }
+            if endpoint
+                .capabilities
+                .iter()
+                .any(|value| value == "transcription")
+                && endpoint.audio_field.is_none()
+            {
+                bail!(
+                    "Fal transcription endpoint {} requires audio_field",
+                    endpoint.id
+                );
+            }
         }
         for model in self
             .openrouter
@@ -965,6 +1093,9 @@ fn default_listen() -> String {
 fn default_request_timeout() -> u64 {
     180
 }
+fn default_concurrency_limit() -> usize {
+    4
+}
 fn default_auth_ttl() -> i64 {
     900
 }
@@ -979,6 +1110,18 @@ fn default_openrouter_url() -> String {
 }
 fn default_aihub_url() -> String {
     "https://aihub.top/v1".into()
+}
+fn default_fal_url() -> String {
+    "https://queue.fal.run".into()
+}
+fn default_fal_poll() -> u64 {
+    2
+}
+fn default_fal_timeout() -> u64 {
+    900
+}
+fn default_prompt_field() -> String {
+    "prompt".into()
 }
 fn default_openrouter_search_engine() -> String {
     "auto".into()

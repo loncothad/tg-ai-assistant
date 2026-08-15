@@ -5,7 +5,8 @@ server:
   # Public HTTPS origin used by Telegram to open the authenticated Mini App.
   public_url: "${TELEFORGE_PUBLIC_URL}"
   request_timeout_seconds: 180
-  # Updates are dispatched concurrently without a per-bot concurrency semaphore.
+  # Limits CPU/memory spikes if Telegram delivers a burst of updates.
+  max_concurrent_requests_per_bot: 4
   admin_init_data_ttl_seconds: 900
   max_input_media_bytes: 20971520
   json_logs: true
@@ -31,6 +32,53 @@ aihub:
     temperature: null
     tools: []
     extra: {}
+
+# fal.ai uses model-specific JSON schemas. Add any fal endpoint here and map
+# its common input/output fields; arbitrary endpoint parameters belong in
+# `defaults`. The queue client handles submission, polling, retries, and result
+# downloads uniformly. The API key remains encrypted per bot after bootstrap.
+fal:
+  bootstrap_api_key: "${FAL_KEY:-}"
+  base_url: "https://queue.fal.run"
+  poll_interval_seconds: 2
+  timeout_seconds: 900
+  endpoints:
+    - id: "fal-ai/flux/schnell"
+      # Override with https://fal.run for a direct call; queue.fal.run is recommended.
+      base_url: null
+      name: "FLUX Schnell (fal.ai)"
+      description: "Fast text-to-image generation through fal.ai."
+      capabilities: ["image_generation"]
+      prompt_field: "prompt"
+      image_field: "image_url"
+      output_url_paths: ["/images/0/url"]
+      output_text_paths: []
+      defaults:
+        num_images: 1
+        enable_safety_checker: true
+      created: null
+    # Endpoint schemas vary. Example mappings for other capability types:
+    # - id: "fal-ai/your-video-endpoint"
+    #   base_url: null
+    #   name: "Configured video endpoint"
+    #   capabilities: ["video_generation"]
+    #   prompt_field: "prompt"
+    #   image_field: "image_url"
+    #   output_url_paths: ["/video/url"]
+    #   output_text_paths: []
+    #   defaults: {}
+    #   created: null
+    # - id: "fal-ai/your-transcription-endpoint"
+    #   base_url: null
+    #   name: "Configured transcription endpoint"
+    #   capabilities: ["transcription"]
+    #   prompt_field: ""
+    #   audio_field: "audio_url"
+    #   language_field: "language"
+    #   output_url_paths: []
+    #   output_text_paths: ["/text"]
+    #   defaults: {}
+    #   created: null
 
 openrouter:
   # Optional bootstrap value. On first start it is encrypted separately for every

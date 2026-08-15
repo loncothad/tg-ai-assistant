@@ -120,6 +120,65 @@ pub fn escape_text(input: &str) -> String {
         .collect()
 }
 
+/// Produces a short, credential-safe error suitable for a Telegram reply.
+///
+/// Provider responses are frequently nested JSON documents.  Those documents
+/// are useful in logs, but sending them to users is noisy and can expose
+/// internal routing metadata.  This helper extracts only the most specific
+/// provider message and caps it to a small excerpt.
+pub fn concise_error(error: &(dyn std::fmt::Display + Sync)) -> String {
+    let sanitized = sanitized_error(error);
+    let cause = extract_provider_message(&sanitized)
+        .unwrap_or_else(|| first_meaningful_line(&sanitized))
+        .trim()
+        .to_owned();
+    let cause = truncate_chars(&cause, 280);
+    if cause.is_empty() {
+        "The request failed. Please try again shortly.".to_owned()
+    } else {
+        format!("The request failed: {}", sentence_case(&cause))
+    }
+}
+
+fn extract_provider_message(input: &str) -> Option<String> {
+    let start = input.find('{')?;
+    let value: serde_json::Value = serde_json::from_str(&input[start..]).ok()?;
+    for pointer in ["/error/message", "/message", "/detail/message", "/detail"] {
+        if let Some(message) = value.pointer(pointer).and_then(serde_json::Value::as_str)
+            && !message.trim().is_empty()
+        {
+            return Some(message.trim().to_owned());
+        }
+    }
+    None
+}
+
+fn first_meaningful_line(input: &str) -> String {
+    input
+        .lines()
+        .map(str::trim)
+        .find(|line| !line.is_empty() && *line != "{" && *line != "}")
+        .unwrap_or("The provider rejected the request")
+        .trim_end_matches([':', ';', '.'])
+        .to_owned()
+}
+
+fn truncate_chars(input: &str, limit: usize) -> String {
+    let mut output = input.chars().take(limit).collect::<String>();
+    if input.chars().count() > limit {
+        output.push('…');
+    }
+    output
+}
+
+fn sentence_case(input: &str) -> String {
+    let mut characters = input.chars();
+    let Some(first) = characters.next() else {
+        return String::new();
+    };
+    first.to_uppercase().chain(characters).collect()
+}
+
 fn normalize_inline(line: &str) -> String {
     // These are the delimiters most frequently emitted by models trained to
     // target MathJax. Telegram Rich Markdown documents `$` and `$$` instead.
@@ -403,5 +462,15 @@ mod tests {
         );
         assert!(!detail.contains("secret-value"));
         assert!(!detail.contains("abcdefghijklmnopqrstuvwxyz"));
+    }
+
+    #[test]
+    fn concise_errors_extract_only_a_small_provider_message() {
+        let error = r#"OpenRouter returned 400: {"error":{"message":"audio.format must be pcm16 while streaming","metadata":{"provider":"OpenAI","request_id":"internal"}},"routing":{"endpoints":[1,2,3]}}"#;
+        let detail = concise_error(&error);
+        assert!(detail.contains("Audio.format must be pcm16 while streaming"));
+        assert!(!detail.contains("routing"));
+        assert!(!detail.contains("request_id"));
+        assert!(detail.chars().count() < 350);
     }
 }

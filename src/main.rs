@@ -16,6 +16,7 @@ use teleforge::{
     config::Config,
     db::Store,
     ephemeral_media,
+    http::HttpClient,
     telegram::BotRunner,
 };
 use tokio::{
@@ -30,9 +31,6 @@ use tower_http::{
 use tracing::{error, info};
 use tracing_subscriber::EnvFilter;
 use uuid::Uuid;
-
-#[global_allocator]
-static ALLOC: tikv_jemallocator::Jemalloc = tikv_jemallocator::Jemalloc;
 
 #[derive(Debug, Parser)]
 #[command(version, about)]
@@ -59,7 +57,8 @@ impl MakeRequestId for MakeRequestUuidV7 {
 async fn main() -> Result<()> {
     let args = Args::parse();
     if args.healthcheck {
-        let response = reqwest::Client::new()
+        let client = HttpClient::build(Duration::from_secs(15))?;
+        let response = client
             .get("http://127.0.0.1:8080/readyz")
             .send()
             .await
@@ -72,13 +71,7 @@ async fn main() -> Result<()> {
     let config = Arc::new(Config::load(&args.config)?);
     init_tracing(config.server.json_logs);
     let store = Store::connect(&config.database).await?;
-    let client = reqwest::Client::builder()
-        .connect_timeout(Duration::from_secs(10))
-        .timeout(config.timeout())
-        .user_agent(format!("teleforge/{}", env!("CARGO_PKG_VERSION")))
-        .pool_max_idle_per_host(16)
-        .build()
-        .context("Failed to build HTTP client")?;
+    let client = HttpClient::build(config.timeout())?;
 
     let enabled = config
         .bots

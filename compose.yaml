@@ -5,6 +5,7 @@ services:
     env_file: .env
     environment:
       TELEFORGE_CONFIG: /app/config.yaml
+      TOKIO_WORKER_THREADS: ${TOKIO_WORKER_THREADS:-2}
     volumes:
       # Z gives the bind-mounted file a private SELinux container label on
       # enforcing RHEL-family hosts such as AlmaLinux.

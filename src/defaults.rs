@@ -60,4 +60,14 @@ pub const BUILTIN_SKILLS: &[BuiltinSkill] = &[
         description: "Route difficult requests to an administrator-selected, more capable model.",
         instructions: include_str!("../defaults/skills/model_upgrade.md"),
     },
+    BuiltinSkill {
+        id: "youtube",
+        description: "Describe and analyze public YouTube videos with the selected video-understanding model.",
+        instructions: include_str!("../defaults/skills/youtube.md"),
+    },
+    BuiltinSkill {
+        id: "prompt_expansion",
+        description: "Expand a prompt only after the user explicitly asks and the intent processor authorizes it.",
+        instructions: include_str!("../defaults/skills/prompt_expansion.md"),
+    },
 ];

@@ -26,9 +26,10 @@ use frankenstein::{
     },
     updates::{Update, UpdateContent},
 };
+use smallvec::SmallVec;
 use tempfile::Builder as TempFileBuilder;
 use tokio::{
-    sync::{mpsc, watch},
+    sync::{Semaphore, mpsc, watch},
     task::JoinSet,
     time::sleep,
 };
@@ -41,6 +42,7 @@ use crate::{
     catalog::ModelCatalogCache,
     config::{BotConfig, Config, ModelProvider, SearchProvider},
     db::{ModelRouting, Store},
+    http::HttpClient,
     openrouter::{
         AssistantResponse, ChatRequest, GeneratedFile, GenerationPromptContext, MediaInput,
         OpenRouter, OutputProcessingRequest, PlannedAction, PlannedSkill, PlanningRequest,
@@ -58,11 +60,12 @@ pub struct BotRunner {
     store: Store,
     openrouter: OpenRouter,
     search: SearchService,
-    client: reqwest::Client,
+    client: HttpClient,
     catalog: ModelCatalogCache,
     bot_user_id: u64,
     username: String,
     active: ActiveRequests,
+    concurrency: Arc<Semaphore>,
 }
 
 type MessageKey = (i64, i32);
@@ -142,12 +145,12 @@ impl BotRunner {
         bot: BotConfig,
         config: Arc<Config>,
         store: Store,
-        client: reqwest::Client,
+        client: HttpClient,
     ) -> Result<Self> {
         store.seed_bot(&bot, &config).await?;
         let telegram = Bot::builder()
             .api_url(format!("{}{}", frankenstein::BASE_API_URL, bot.token))
-            .client(client.clone())
+            .client(client.reqwest_handle())
             .build();
         let identity = telegram
             .get_me()
@@ -163,12 +166,13 @@ impl BotRunner {
             client.clone(),
             config.openrouter.clone(),
             config.aihub.clone(),
+            config.fal.clone(),
         );
         let search = SearchService::new(client.clone(), config.search.clone());
         Ok(Self {
             telegram,
             bot,
-            config,
+            config: config.clone(),
             store,
             openrouter,
             search,
@@ -177,6 +181,9 @@ impl BotRunner {
             bot_user_id: identity.id,
             username,
             active: ActiveRequests::default(),
+            concurrency: Arc::new(Semaphore::new(
+                config.server.max_concurrent_requests_per_bot.max(1),
+            )),
         })
     }
 
@@ -197,6 +204,7 @@ impl BotRunner {
                     AllowedUpdate::DeletedBusinessMessages,
                 ])
                 .build();
+            let poll_started = std::time::Instant::now();
             let response = tokio::select! {
                 _ = shutdown.changed() => break,
                 result = jobs.join_next(), if !jobs.is_empty() => {
@@ -220,6 +228,15 @@ impl BotRunner {
                 }
             };
             if updates.is_empty() {
+                // Some Telegram-compatible gateways occasionally ignore the
+                // long-poll timeout and return immediately. Avoid a hot loop
+                // that can otherwise consume an entire CPU core while idle.
+                if poll_started.elapsed() < Duration::from_millis(500) {
+                    tokio::select! {
+                        _ = shutdown.changed() => break,
+                        _ = sleep(Duration::from_millis(250)) => {}
+                    }
+                }
                 continue;
             }
             let next_offset = updates
@@ -229,7 +246,15 @@ impl BotRunner {
                 .expect("non-empty updates");
             for update in updates {
                 let runner = self.clone();
-                jobs.spawn(async move { runner.process(update).await });
+                jobs.spawn(async move {
+                    let _permit = runner
+                        .concurrency
+                        .clone()
+                        .acquire_owned()
+                        .await
+                        .map_err(|_| eyre::eyre!("Update concurrency limiter closed"))?;
+                    runner.process(update).await
+                });
             }
             self.store.set_offset(&self.bot.id, next_offset).await?;
             offset = Some(next_offset);
@@ -453,9 +478,27 @@ impl BotRunner {
         let _ = sender.send(ProgressUpdate::step("Classifying request"));
         let settings = self.store.settings(&self.bot.id).await?;
         let mut capabilities = settings.capabilities.clone();
-        let attachment_flags = attachment_flags(&message);
+        let mut attachment_flags = attachment_flags(&message);
         let planner_key = self.store.credential(&self.bot.id, "openrouter").await?;
         let request_text = with_reply_context(&text, reply_context.as_deref());
+        let media = if attachment_flags.0
+            || attachment_flags.1
+            || attachment_flags.2
+            || youtube_url(&request_text).is_some()
+        {
+            self.collect_media(&message, &request_text).await?
+        } else {
+            Vec::new()
+        };
+        attachment_flags.0 |= media
+            .iter()
+            .any(|item| matches!(item, MediaInput::Image { .. }));
+        attachment_flags.1 |= media
+            .iter()
+            .any(|item| matches!(item, MediaInput::Video { .. }));
+        attachment_flags.2 |= media
+            .iter()
+            .any(|item| matches!(item, MediaInput::Audio { .. }));
         let plan = if let Some(key) = planner_key.as_deref() {
             match self
                 .openrouter
@@ -469,6 +512,7 @@ impl BotRunner {
                     has_image: attachment_flags.0,
                     has_video: attachment_flags.1,
                     has_audio: attachment_flags.2,
+                    media: &media,
                     api_key: key,
                 })
                 .await
@@ -490,6 +534,15 @@ impl BotRunner {
         } else {
             "Applied standard routing"
         }));
+        if let Some(plan) = plan.as_ref().filter(|plan| plan.is_composed_workflow()) {
+            let stages = plan
+                .workflow_steps
+                .iter()
+                .map(|step| format!("{step:?}"))
+                .collect::<Vec<_>>()
+                .join(" → ");
+            let _ = sender.send(ProgressUpdate::step(format!("Planned workflow: {stages}")));
+        }
         let override_generation = if let Some(override_) = model_override.as_ref() {
             match self.media_only_override_action(override_).await {
                 Ok(action) => action,
@@ -541,10 +594,28 @@ impl BotRunner {
             return Ok(());
         }
         if let Some(command) = generation_command {
-            let generation_prompt = plan.as_ref().map_or_else(
+            let mut generation_prompt = plan.as_ref().map_or_else(
                 || text.trim().to_owned(),
                 |plan| plan.effective_generation_prompt(&text, replied_text, telegram_quote),
             );
+            if plan.as_ref().is_some_and(|plan| {
+                plan.skills
+                    .contains(&crate::openrouter::PlannedSkill::PromptExpansion)
+            }) {
+                let key = planner_key
+                    .as_deref()
+                    .context("Prompt expansion requires an OpenRouter API key")?;
+                let _ = sender.send(ProgressUpdate::step("Expanding requested prompt"));
+                generation_prompt = self
+                    .openrouter
+                    .expand_prompt(
+                        &generation_prompt,
+                        &settings.selected_planner_model,
+                        &settings.selected_planner_fallback_model,
+                        key,
+                    )
+                    .await?;
+            }
             drop(sender);
             let _ = progress_task.await;
             if let Err(error) = self
@@ -600,17 +671,6 @@ impl BotRunner {
         };
         capabilities.search &= search_key.is_some();
         let history = self.store.history(&self.bot.id, &scope).await?;
-        let media = if capabilities.media
-            || capabilities.transcription
-            || capabilities.image
-            || capabilities.audio
-            || capabilities.music
-            || capabilities.video
-        {
-            self.collect_media(&message, &request_text).await?
-        } else {
-            Vec::new()
-        };
         let (mut model_capability, mut selected) = if capabilities.media
             && media
                 .iter()
@@ -632,13 +692,28 @@ impl BotRunner {
         } else {
             ("chat", &settings.selected_model)
         };
-        if should_route_to_upgrade_model(
+        let upgrade_requested = should_route_to_upgrade_model(
             model_override.is_some(),
             model_capability,
             &capabilities,
             plan.as_ref(),
             explicit_upgrade,
-        ) {
+        );
+        let upgrade_routing = settings
+            .model_routing
+            .get("model_upgrade")
+            .cloned()
+            .unwrap_or_default();
+        if upgrade_requested
+            && self
+                .upgrade_model_supports(
+                    upgrade_routing.model_provider,
+                    &settings.selected_upgrade_model,
+                    model_capability,
+                )
+                .await
+                .unwrap_or(false)
+        {
             model_capability = "model_upgrade";
             selected = &settings.selected_upgrade_model;
         }
@@ -659,6 +734,9 @@ impl BotRunner {
         let model = match routing.model_provider {
             ModelProvider::Openrouter => self.config.resolved_model(model_capability, selected),
             ModelProvider::Aihub => self.config.resolved_aihub_model(selected),
+            ModelProvider::Fal => {
+                bail!("Fal endpoints cannot be used for chat or media understanding")
+            }
         };
         if routing.model_provider == ModelProvider::Aihub {
             capabilities.web_fetch = false;
@@ -718,7 +796,18 @@ impl BotRunner {
         let author = caller_name(&message);
         let contextual_text = format!("{author}: {request_text}{}", media_summary(&media));
         let mut instructions = self.store.effective_instructions(&self.bot.id).await?;
-        instructions.push_str(&format!("\n\n# Current request context\nCurrent UTC date and time: {}\nBot: @{} (backend ID {})\nConversation mode: {:?}\nChat: {} (ID {})\nCaller: {} (ID {}, language {})\nTelegram message Unix time: {}\nEnabled capabilities and callable tools for this request: search={}, web_fetch={}, image_generation={}, speech_generation={}, music_generation={}, video_generation={}, media_understanding={}, transcription={}, file_delivery={}, model_upgrade={}. If a capability is true, never claim it is disabled; call its tool when the user explicitly requests that operation. Preserve the user's exact request; do not substitute a planner-written prompt. Format non-trivial responses for Telegram Rich Messages with descriptive headings, bold key terms and labels, and sparing italics for qualifications.", chrono::Utc::now().to_rfc3339(), self.username, self.bot.id, mode, message.chat.title.as_deref().unwrap_or("Private or untitled chat"), message.chat.id, author, user_id, message.guest_bot_caller_user.as_ref().or(message.from.as_ref()).and_then(|u| u.language_code.as_deref()).unwrap_or("unknown"), message.date, capabilities.search, capabilities.web_fetch, capabilities.image, capabilities.audio, capabilities.music, capabilities.video, capabilities.media, capabilities.transcription, capabilities.file, capabilities.model_upgrade));
+        let prompt_expansion_authorized = plan.as_ref().is_some_and(|plan| {
+            plan.skills
+                .contains(&crate::openrouter::PlannedSkill::PromptExpansion)
+        });
+        let workflow_steps = plan
+            .as_ref()
+            .filter(|plan| plan.is_composed_workflow())
+            .map(|plan| format!("{:?}", plan.workflow_steps))
+            .unwrap_or_else(|| "[]".to_owned());
+        let composed_workflow_authorized =
+            plan.as_ref().is_some_and(RequestPlan::is_composed_workflow);
+        instructions.push_str(&format!("\n\n# Current request context\nCurrent UTC date and time: {}\nBot: @{} (backend ID {})\nConversation mode: {:?}\nChat: {} (ID {})\nCaller: {} (ID {}, language {})\nTelegram message Unix time: {}\nEnabled capabilities and callable tools for this request: search={}, web_fetch={}, image_generation={}, speech_generation={}, music_generation={}, video_generation={}, media_understanding={}, youtube_video_understanding={}, transcription={}, file_delivery={}, model_upgrade={}, prompt_expansion_authorized={}.\nAuthorized ordered workflow: {}. Composed workflow output authorized: {}. When this is true, complete each prerequisite in order and put its actual result—not the user's instruction to create it—into the downstream tool argument. For example, ComposeText then MusicGeneration means write the complete requested lyrics first, then call generate_music with those lyrics and relevant musical directions in its prompt. Do not skip, merely describe, or ask the user to perform an authorized step. When false, preserve the user's exact generation request and do not substitute rewritten content. If a capability is true, never claim it is disabled; call its tool when the user explicitly requests that operation. Format non-trivial responses for Telegram Rich Messages with descriptive headings, bold key terms and labels, and sparing italics for qualifications.", chrono::Utc::now().to_rfc3339(), self.username, self.bot.id, mode, message.chat.title.as_deref().unwrap_or("Private or untitled chat"), message.chat.id, author, user_id, message.guest_bot_caller_user.as_ref().or(message.from.as_ref()).and_then(|u| u.language_code.as_deref()).unwrap_or("unknown"), message.date, capabilities.search, capabilities.web_fetch, capabilities.image, capabilities.audio, capabilities.music, capabilities.video, capabilities.media, capabilities.youtube, capabilities.transcription, capabilities.file, capabilities.model_upgrade, prompt_expansion_authorized, workflow_steps, composed_workflow_authorized));
         self.store
             .append_message(&self.bot.id, &scope, "user", &contextual_text)
             .await?;
@@ -781,6 +870,7 @@ impl BotRunner {
                     has_image: attachment_flags.0,
                     has_video: attachment_flags.1,
                     has_audio: attachment_flags.2,
+                    allow_composed_output: composed_workflow_authorized,
                 },
                 progress: Some(sender.clone()),
             })
@@ -944,10 +1034,17 @@ impl BotRunner {
                     )
                     .await?
             }
+            ModelProvider::Fal => Arc::new(crate::catalog::fal_catalog(&self.config.fal)),
         };
-        let Some(model) = models.iter().find(|model| model.id == override_.model) else {
-            return Ok(None);
-        };
+        let model = models
+            .iter()
+            .find(|model| model.id == override_.model)
+            .with_context(|| {
+                format!(
+                    "Model {} is not available in the selected provider catalog",
+                    override_.model
+                )
+            })?;
         if model.supports("chat") {
             return Ok(None);
         }
@@ -960,11 +1057,104 @@ impl BotRunner {
         .into_iter()
         .filter_map(|(capability, action)| model.supports(capability).then_some(action))
         .collect::<Vec<_>>();
-        if actions.len() == 1 {
-            Ok(actions.first().copied())
-        } else {
-            Ok(None)
+        match actions.as_slice() {
+            [action] => Ok(Some(*action)),
+            [] => Ok(None),
+            _ => bail!(
+                "Model {} serves multiple media capabilities; use an explicit generation command",
+                override_.model
+            ),
         }
+    }
+
+    async fn upgrade_model_supports(
+        &self,
+        provider: ModelProvider,
+        model_id: &str,
+        current_capability: &str,
+    ) -> Result<bool> {
+        // The admin picker already guarantees text output for the advanced
+        // model. Do not make ordinary `-smart` routing depend on a live catalog
+        // refresh; only multimodal upgrades require modality verification.
+        if current_capability == "chat" {
+            return Ok(true);
+        }
+        if provider == ModelProvider::Fal {
+            return Ok(false);
+        }
+        let key = self.model_api_key(provider).await?;
+        let models = match provider {
+            ModelProvider::Openrouter => {
+                self.catalog
+                    .get_openrouter(
+                        &self.client,
+                        &self.config.openrouter.base_url,
+                        &self.bot.id,
+                        &key,
+                    )
+                    .await?
+            }
+            ModelProvider::Aihub => {
+                self.catalog
+                    .get_aihub(
+                        &self.client,
+                        &self.config.aihub.base_url,
+                        &self.bot.id,
+                        &key,
+                    )
+                    .await?
+            }
+            ModelProvider::Fal => unreachable!(),
+        };
+        Ok(models.iter().any(|model| {
+            model.id == model_id
+                && model.supports("model_upgrade")
+                && (current_capability == "chat" || model.supports(current_capability))
+        }))
+    }
+
+    async fn validate_model_override(
+        &self,
+        override_: &MessageModelOverride,
+        capability: &str,
+    ) -> Result<()> {
+        let key = self.model_api_key(override_.model_provider).await?;
+        let models = match override_.model_provider {
+            ModelProvider::Openrouter => {
+                self.catalog
+                    .get_openrouter(
+                        &self.client,
+                        &self.config.openrouter.base_url,
+                        &self.bot.id,
+                        &key,
+                    )
+                    .await?
+            }
+            ModelProvider::Aihub => {
+                self.catalog
+                    .get_aihub(
+                        &self.client,
+                        &self.config.aihub.base_url,
+                        &self.bot.id,
+                        &key,
+                    )
+                    .await?
+            }
+            ModelProvider::Fal => Arc::new(crate::catalog::fal_catalog(&self.config.fal)),
+        };
+        let model = models
+            .iter()
+            .find(|model| model.id == override_.model)
+            .with_context(|| {
+                format!(
+                    "Model {} is not available in the selected provider catalog",
+                    override_.model
+                )
+            })?;
+        if !model.supports(capability) {
+            bail!("Model {} does not support {capability}", override_.model);
+        }
+        Ok(())
     }
 
     async fn command(
@@ -996,6 +1186,19 @@ impl BotRunner {
             None
         };
         let model_override = outer_model_override.or(inline_model_override.as_ref());
+        if let (Some(override_), Some(capability)) = (
+            model_override,
+            match command {
+                "image" => Some("image_generation"),
+                "audio" | "speech" => Some("speech_generation"),
+                "music" => Some("music_generation"),
+                "video" => Some("video_generation"),
+                "transcribe" => Some("transcription"),
+                _ => None,
+            },
+        ) {
+            self.validate_model_override(override_, capability).await?;
+        }
         let contextual_arguments = reply_context
             .filter(|_| matches!(command, "search" | "image" | "music" | "video"))
             .map(|reply| with_reply_context(arguments, Some(reply)));
@@ -1819,9 +2022,10 @@ impl BotRunner {
         let sanitized = rich::sanitized_error(error);
         self.run_output_processor(message, &sanitized, true)
             .await
+            .and_then(validate_error_explanation)
             .unwrap_or_else(|processor_error| {
                 warn!(bot_id = %self.bot.id, error = %format!("{processor_error:#}"), "error output processor failed");
-                rich::detailed_error(error)
+                rich::concise_error(error)
             })
     }
 
@@ -1850,6 +2054,7 @@ impl BotRunner {
         let model = match routing.model_provider {
             ModelProvider::Openrouter => self.config.resolved_model(capability, selected),
             ModelProvider::Aihub => self.config.resolved_aihub_model(selected),
+            ModelProvider::Fal => bail!("Fal endpoints cannot process assistant or error text"),
         };
         let api_key = self.model_api_key(routing.model_provider).await?;
         let original_request = message
@@ -2338,7 +2543,7 @@ impl BotRunner {
         message_id: i32,
         mut updates: mpsc::UnboundedReceiver<ProgressUpdate>,
     ) {
-        let mut steps = Vec::new();
+        let mut steps = SmallVec::<[ProgressUpdate; 12]>::new();
         let mut dirty = false;
         let mut heartbeat_ticks = 0u8;
         let mut ticker = tokio::time::interval(Duration::from_secs(1));
@@ -2412,7 +2617,7 @@ impl BotRunner {
         inline_message_id: String,
         mut updates: mpsc::UnboundedReceiver<ProgressUpdate>,
     ) {
-        let mut steps = Vec::new();
+        let mut steps = SmallVec::<[ProgressUpdate; 12]>::new();
         let mut dirty = false;
         let mut heartbeat_ticks = 0u8;
         let mut ticker = tokio::time::interval(Duration::from_secs(1));
@@ -2776,7 +2981,13 @@ impl BotRunner {
                 }
             }
         }
-        if let Some(url) = youtube_url(text) {
+        let youtube_enabled = self
+            .store
+            .settings(&self.bot.id)
+            .await?
+            .capabilities
+            .youtube;
+        if youtube_enabled && let Some(url) = youtube_url(text) {
             inputs.push(MediaInput::Video { url });
         }
         Ok(inputs)
@@ -2814,6 +3025,9 @@ impl BotRunner {
                         self.config.resolved_model("video_understanding", model_id)
                     }
                     ModelProvider::Aihub => self.config.resolved_aihub_model(model_id),
+                    ModelProvider::Fal => {
+                        bail!("Fal endpoints cannot be used for video understanding")
+                    }
                 };
                 let key = self.model_api_key(routing.model_provider).await?;
                 let description = self
@@ -2996,6 +3210,7 @@ impl BotRunner {
         let name = match provider {
             ModelProvider::Openrouter => "OpenRouter",
             ModelProvider::Aihub => "AI Hub",
+            ModelProvider::Fal => "Fal",
         };
         self.store
             .credential(&self.bot.id, provider.as_str())
@@ -3038,7 +3253,7 @@ struct MessageModelOverride {
 fn parse_model_override(arguments: &str) -> Result<(MessageModelOverride, &str)> {
     let (specification, prompt) = arguments
         .split_once(char::is_whitespace)
-        .context("Expected `-model [openrouter:|aihub:]<model-id> <request>`")?;
+        .context("Expected `-model [openrouter:|aihub:|fal:]<model-id> <request>`")?;
     let prompt = prompt.trim();
     if prompt.is_empty() {
         bail!("Expected a request after the model ID");
@@ -3047,6 +3262,8 @@ fn parse_model_override(arguments: &str) -> Result<(MessageModelOverride, &str)>
         (ModelProvider::Openrouter, model)
     } else if let Some(model) = specification.strip_prefix("aihub:") {
         (ModelProvider::Aihub, model)
+    } else if let Some(model) = specification.strip_prefix("fal:") {
+        (ModelProvider::Fal, model)
     } else {
         (ModelProvider::Openrouter, specification)
     };
@@ -3126,7 +3343,7 @@ fn materialize_oversized_text(answer: &mut AssistantResponse) {
             .to_owned();
 }
 
-fn push_progress_step(steps: &mut Vec<ProgressUpdate>, update: ProgressUpdate) {
+fn push_progress_step(steps: &mut SmallVec<[ProgressUpdate; 12]>, update: ProgressUpdate) {
     if steps.last() == Some(&update) {
         return;
     }
@@ -3539,10 +3756,34 @@ fn should_route_to_upgrade_model(
     explicit_request: bool,
 ) -> bool {
     !has_admin_override
-        && current_capability == "chat"
+        && matches!(
+            current_capability,
+            "chat" | "image_understanding" | "video_understanding"
+        )
         && capabilities.model_upgrade
         && (explicit_request
             || plan.is_some_and(|plan| plan.skills.contains(&PlannedSkill::ModelUpgrade)))
+}
+
+fn validate_error_explanation(value: String) -> Result<String> {
+    let trimmed = value.trim();
+    let unwrapped = trimmed
+        .strip_prefix("```json")
+        .or_else(|| trimmed.strip_prefix("```JSON"))
+        .and_then(|value| value.strip_suffix("```"))
+        .unwrap_or(trimmed)
+        .trim();
+    if serde_json::from_str::<serde_json::Value>(unwrapped).is_ok() {
+        bail!("Error explanation model returned JSON instead of user-facing text");
+    }
+    if trimmed.is_empty() {
+        bail!("Error explanation model returned empty text");
+    }
+    let mut concise = trimmed.chars().take(800).collect::<String>();
+    if trimmed.chars().count() > 800 {
+        concise.push('…');
+    }
+    Ok(concise)
 }
 
 fn explicit_model_upgrade_requested(text: &str) -> bool {
@@ -3644,8 +3885,20 @@ fn youtube_url(text: &str) -> Option<String> {
             )
         });
         let parsed = url::Url::parse(candidate).ok()?;
+        if parsed.scheme() != "https" {
+            return None;
+        }
         let host = parsed.host_str()?.trim_start_matches("www.");
-        matches!(host, "youtube.com" | "m.youtube.com" | "youtu.be").then(|| parsed.into())
+        matches!(
+            host,
+            "youtube.com"
+                | "www.youtube.com"
+                | "m.youtube.com"
+                | "music.youtube.com"
+                | "youtu.be"
+                | "youtube-nocookie.com"
+        )
+        .then(|| parsed.into())
     })
 }
 
@@ -3686,6 +3939,16 @@ mod tests {
             parse_command("-SEARCH current news"),
             Some(("search".to_owned(), "current news"))
         );
+    }
+
+    #[test]
+    fn youtube_detection_accepts_canonical_hosts_only() {
+        assert_eq!(
+            youtube_url("describe https://www.youtube.com/watch?v=dQw4w9WgXcQ").as_deref(),
+            Some("https://www.youtube.com/watch?v=dQw4w9WgXcQ")
+        );
+        assert!(youtube_url("https://youtube.com.evil.example/watch?v=x").is_none());
+        assert!(youtube_url("http://www.youtube.com/watch?v=x").is_none());
     }
 
     #[test]
@@ -3766,19 +4029,25 @@ mod tests {
         assert_eq!(override_.model_provider, ModelProvider::Openrouter);
         assert_eq!(override_.model, "openai/gpt-5.4:free");
         assert_eq!(prompt, "write code");
+        let (override_, prompt) =
+            parse_model_override("fal:fal-ai/flux/schnell draw a fox").unwrap();
+        assert_eq!(override_.model_provider, ModelProvider::Fal);
+        assert_eq!(override_.model, "fal-ai/flux/schnell");
+        assert_eq!(prompt, "draw a fox");
     }
 
     #[test]
     fn planner_upgrade_skill_routes_chat_to_the_advanced_model() {
         let plan = RequestPlan {
             action: PlannedAction::Chat,
-            skills: vec![PlannedSkill::ModelUpgrade],
+            skills: smallvec::smallvec![PlannedSkill::ModelUpgrade],
             delivery: crate::openrouter::PlannedDelivery::Inline,
             filename: String::new(),
             refusal_message: String::new(),
             core_prompt: String::new(),
             reply_excerpt: String::new(),
-            prompt_sources: Vec::new(),
+            prompt_sources: smallvec::SmallVec::new(),
+            workflow_steps: smallvec::SmallVec::new(),
         };
         assert!(should_route_to_upgrade_model(
             false,
@@ -3794,7 +4063,7 @@ mod tests {
             Some(&plan),
             false,
         ));
-        assert!(!should_route_to_upgrade_model(
+        assert!(should_route_to_upgrade_model(
             false,
             "image_understanding",
             &crate::db::Capabilities::default(),
@@ -3828,6 +4097,14 @@ mod tests {
         assert!(output_needs_no_model_edit("Ракета"));
         assert!(output_needs_no_model_edit("A short factual answer."));
         assert!(!output_needs_no_model_edit("## Result\n\n- one\n- two"));
+    }
+
+    #[test]
+    fn error_explanations_reject_json_and_are_length_bounded() {
+        assert!(validate_error_explanation(r#"{"error":{"message":"bad"}}"#.into()).is_err());
+        assert!(validate_error_explanation("```json\n{\"error\":\"bad\"}\n```".into()).is_err());
+        let value = validate_error_explanation("x".repeat(1_000)).unwrap();
+        assert!(value.chars().count() <= 801);
     }
 
     #[test]
