@@ -42,6 +42,33 @@ pub struct CatalogModel {
     pub supported_voices: Vec<String>,
     pub knowledge_cutoff: Option<String>,
     pub expiration_date: Option<String>,
+    /// Provider-native model category, such as `image-to-video`.
+    #[serde(default)]
+    pub category: Option<String>,
+    /// Provider lifecycle status, such as `active` or `deprecated`.
+    #[serde(default)]
+    pub status: Option<String>,
+    /// Last provider metadata update as a Unix timestamp.
+    #[serde(default)]
+    pub updated: Option<i64>,
+    /// Provider-supplied discovery tags.
+    #[serde(default)]
+    pub tags: Vec<String>,
+    /// Provider model documentation or playground URL.
+    #[serde(default)]
+    pub model_url: Option<String>,
+    /// Provider-supplied preview image URL.
+    #[serde(default)]
+    pub thumbnail_url: Option<String>,
+    /// fal.ai enterprise-readiness status when the catalog publishes it.
+    #[serde(default)]
+    pub enterprise_status: Option<String>,
+    #[serde(default)]
+    pub highlighted: Option<bool>,
+    #[serde(default)]
+    pub pinned: Option<bool>,
+    #[serde(default)]
+    pub favorited: Option<bool>,
     pub supported_resolutions: Vec<String>,
     pub supported_aspect_ratios: Vec<String>,
     pub supported_durations: Vec<String>,
@@ -507,14 +534,14 @@ fn parse_fal_model(value: &Value) -> Option<CatalogModel> {
         return None;
     }
     let (input_modalities, output_modalities) = fal_modalities(&capabilities);
-    let created = ["date", "updated_at"]
-        .into_iter()
-        .filter_map(|key| string(metadata, key))
-        .find_map(|value| {
+    let timestamp = |key| {
+        string(metadata, key).and_then(|value| {
             chrono::DateTime::parse_from_rfc3339(&value)
                 .ok()
                 .map(|date| date.timestamp())
-        });
+        })
+    };
+    let created = timestamp("date").or_else(|| timestamp("updated_at"));
     Some(CatalogModel {
         model_provider: ModelProvider::Fal,
         name: string(metadata, "display_name").unwrap_or_else(|| id.clone()),
@@ -523,6 +550,23 @@ fn parse_fal_model(value: &Value) -> Option<CatalogModel> {
         input_modalities,
         output_modalities,
         supported_capabilities: capabilities,
+        category: Some(category),
+        status: string(metadata, "status"),
+        updated: timestamp("updated_at"),
+        tags: metadata
+            .get("tags")
+            .and_then(Value::as_array)
+            .into_iter()
+            .flatten()
+            .filter_map(Value::as_str)
+            .map(str::to_owned)
+            .collect(),
+        model_url: string(metadata, "model_url"),
+        thumbnail_url: string(metadata, "thumbnail_url"),
+        enterprise_status: string(object, "enterprise_status"),
+        highlighted: metadata.get("highlighted").and_then(Value::as_bool),
+        pinned: metadata.get("pinned").and_then(Value::as_bool),
+        favorited: metadata.get("is_favorited").and_then(Value::as_bool),
         id,
         ..CatalogModel::default()
     })
@@ -835,6 +879,7 @@ fn parse_model(value: &Value) -> Option<CatalogModel> {
         generates_audio: object.get("generate_audio").and_then(Value::as_bool),
         supported_capabilities: Vec::new(),
         id,
+        ..CatalogModel::default()
     })
 }
 
@@ -1046,8 +1091,15 @@ mod tests {
                 "display_name": "Example 3D",
                 "description": "Makes a mesh",
                 "category": "image-to-3d",
-                "date": "2026-02-03T04:05:06Z"
-            }
+                "status": "active",
+                "tags": ["3d", "mesh"],
+                "model_url": "https://fal.run/fal-ai/example/image-to-3d",
+                "thumbnail_url": "https://fal.media/example.webp",
+                "highlighted": true,
+                "date": "2026-02-03T04:05:06Z",
+                "updated_at": "2026-02-04T04:05:06Z"
+            },
+            "enterprise_status": "ready"
         }))
         .unwrap();
         assert_eq!(model.model_provider, ModelProvider::Fal);
@@ -1056,6 +1108,12 @@ mod tests {
         assert_eq!(model.input_modalities, ["text", "image"]);
         assert_eq!(model.output_modalities, ["3d"]);
         assert!(model.created.is_some());
+        assert_eq!(model.category.as_deref(), Some("image-to-3d"));
+        assert_eq!(model.status.as_deref(), Some("active"));
+        assert_eq!(model.tags, ["3d", "mesh"]);
+        assert_eq!(model.enterprise_status.as_deref(), Some("ready"));
+        assert_eq!(model.highlighted, Some(true));
+        assert!(model.updated.is_some());
         assert!(
             parse_fal_model(&serde_json::json!({
                 "endpoint_id": "fal-ai/example/trainer",

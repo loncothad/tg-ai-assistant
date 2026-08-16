@@ -53,6 +53,7 @@ pub fn router(state: AdminState) -> Router {
         .route("/admin/{bot_id}/", get(shell))
         .route("/admin/{bot_id}/panel", get(panel))
         .route("/admin/{bot_id}/models", get(models))
+        .route("/admin/{bot_id}/model-details", get(model_details))
         .route("/admin/{bot_id}/model-providers", get(model_providers))
         .route("/admin/{bot_id}/model", post(set_model))
         .route("/admin/{bot_id}/search", post(set_search))
@@ -197,6 +198,51 @@ struct ModelProvidersQuery {
     model: String,
     model_provider: ModelProvider,
     capability: String,
+}
+
+#[derive(Deserialize)]
+struct ModelDetailsQuery {
+    model: String,
+    model_provider: ModelProvider,
+}
+
+async fn model_details(
+    Path(bot): Path<String>,
+    State(state): State<AdminState>,
+    headers: HeaderMap,
+    Query(query): Query<ModelDetailsQuery>,
+) -> Response {
+    let (_, bot) = match authorize(&state, &bot, &headers) {
+        Ok(auth) => auth,
+        Err(error) => return auth_error(error),
+    };
+    if query.model_provider != ModelProvider::Fal {
+        return message(
+            StatusCode::BAD_REQUEST,
+            "Detailed endpoint schemas are currently available for fal.ai models",
+        );
+    }
+    let catalog = match catalog_for(&state, &bot, ModelProvider::Fal).await {
+        Ok(catalog) => catalog,
+        Err(error) => return internal(error),
+    };
+    if !catalog.iter().any(|model| model.id == query.model) {
+        return message(StatusCode::BAD_REQUEST, "Unknown fal.ai model");
+    }
+    let key = match fal_key(&state, &bot).await {
+        Ok(key) => key,
+        Err(error) => return internal(error),
+    };
+    match state.fal.model_details(&query.model, &key).await {
+        Ok(details) => no_store(Json(details).into_response()),
+        Err(error) => {
+            tracing::warn!(bot_id = %bot, model = %query.model, error = %format!("{error:#}"), "fal model details unavailable");
+            message(
+                StatusCode::BAD_GATEWAY,
+                "Fal.ai did not return a usable OpenAPI schema for this endpoint",
+            )
+        }
+    }
 }
 
 async fn model_providers(
@@ -773,21 +819,10 @@ async fn import_skill_bundle(store: &Store, bot: &str, content: &str) -> Result<
     let mut settings = store.settings(bot).await?;
     for skill in bundle.builtins {
         let _metadata = (skill.description, skill.instructions);
-        match skill.id.as_str() {
-            "search" => settings.capabilities.search = skill.enabled,
-            "web_fetch" => settings.capabilities.web_fetch = skill.enabled,
-            "image" => settings.capabilities.image = skill.enabled,
-            "audio" | "speech" => settings.capabilities.audio = skill.enabled,
-            "music" => settings.capabilities.music = skill.enabled,
-            "video" => settings.capabilities.video = skill.enabled,
-            "media" => settings.capabilities.media = skill.enabled,
-            "transcription" => settings.capabilities.transcription = skill.enabled,
-            "file" => settings.capabilities.file = skill.enabled,
-            "model_upgrade" => settings.capabilities.model_upgrade = skill.enabled,
-            "youtube" => settings.capabilities.youtube = skill.enabled,
-            "prompt_expansion" => settings.capabilities.prompt_expansion = skill.enabled,
-            _ => bail!("Unknown built-in skill: {}", skill.id),
-        }
+        settings
+            .capabilities
+            .set(&skill.id, skill.enabled)
+            .wrap_err_with(|| format!("Unknown built-in skill: {}", skill.id))?;
     }
     settings.custom_skills = bundle.custom;
     settings.custom_skills_enabled = bundle.custom_enabled;
@@ -806,21 +841,7 @@ async fn export_skills(
         Ok(v) => v,
         Err(e) => return internal(e),
     };
-    let enabled = |id: &str| match id {
-        "search" => settings.capabilities.search,
-        "web_fetch" => settings.capabilities.web_fetch,
-        "image" => settings.capabilities.image,
-        "audio" | "speech" => settings.capabilities.audio,
-        "music" => settings.capabilities.music,
-        "video" => settings.capabilities.video,
-        "media" => settings.capabilities.media,
-        "transcription" => settings.capabilities.transcription,
-        "file" => settings.capabilities.file,
-        "model_upgrade" => settings.capabilities.model_upgrade,
-        "youtube" => settings.capabilities.youtube,
-        "prompt_expansion" => settings.capabilities.prompt_expansion,
-        _ => false,
-    };
+    let enabled = |id: &str| settings.capabilities.enabled(id);
     let skills=crate::defaults::BUILTIN_SKILLS.iter().map(|s|serde_json::json!({"id":s.id,"description":s.description,"enabled":enabled(s.id),"instructions":s.instructions})).collect::<Vec<_>>();
     let bundle = serde_json::json!({"version":1,"builtins":skills,"custom":settings.custom_skills,"custom_enabled":settings.custom_skills_enabled});
     no_store(
@@ -1075,21 +1096,7 @@ async fn render_html(state: &AdminState, bot: &str) -> Result<String> {
         .as_deref()
         .unwrap_or(state.config.search.default_provider.as_str());
     let search_available = configured.get(provider).copied().unwrap_or(false);
-    let enabled = |id: &str| match id {
-        "search" => settings.capabilities.search,
-        "web_fetch" => settings.capabilities.web_fetch,
-        "image" => settings.capabilities.image,
-        "audio" | "speech" => settings.capabilities.audio,
-        "music" => settings.capabilities.music,
-        "video" => settings.capabilities.video,
-        "media" => settings.capabilities.media,
-        "transcription" => settings.capabilities.transcription,
-        "file" => settings.capabilities.file,
-        "model_upgrade" => settings.capabilities.model_upgrade,
-        "youtube" => settings.capabilities.youtube,
-        "prompt_expansion" => settings.capabilities.prompt_expansion,
-        _ => false,
-    };
+    let enabled = |id: &str| settings.capabilities.enabled(id);
     let caps = crate::defaults::BUILTIN_SKILLS
         .iter()
         .map(|skill| {
@@ -1102,7 +1109,7 @@ async fn render_html(state: &AdminState, bot: &str) -> Result<String> {
                         && openrouter_ready
                 }
                 "youtube" => {
-                    settings.capabilities.media
+                    settings.capabilities.enabled("video_understanding")
                         && configured
                             .get(model_provider_for_capability(&settings, "video_understanding").as_str())
                             .copied()
@@ -1281,13 +1288,40 @@ fn model_provider_for_capability(
 }
 
 fn model_provider_for_skill(settings: &crate::db::BotSettings, skill: &str) -> ModelProvider {
+    if let Some(routing) = settings.model_routing.get(skill) {
+        return routing.model_provider;
+    }
     let capability = match skill {
-        "image" => "image_generation",
-        "audio" | "speech" => "speech_generation",
-        "music" => "music_generation",
-        "video" => "video_generation",
+        "text_to_image"
+        | "image_to_image"
+        | "text_to_video"
+        | "image_to_video"
+        | "video_to_video"
+        | "text_to_audio"
+        | "video_to_audio"
+        | "text_to_speech"
+        | "text_to_3d"
+        | "image_to_3d"
+        | "text_to_image_vector"
+        | "image_to_image_vector"
+        | "image_understanding"
+        | "video_understanding" => {
+            if matches!(
+                skill,
+                "text_to_3d" | "image_to_3d" | "text_to_image_vector" | "image_to_image_vector"
+            ) {
+                return ModelProvider::Fal;
+            }
+            let legacy = match skill {
+                "text_to_image" | "image_to_image" => "image_generation",
+                "text_to_video" | "image_to_video" | "video_to_video" => "video_generation",
+                "text_to_audio" | "video_to_audio" => "music_generation",
+                "text_to_speech" => "speech_generation",
+                _ => skill,
+            };
+            return model_provider_for_capability(settings, legacy);
+        }
         "transcription" => "transcription",
-        "media" => "image_understanding",
         "file" => "chat",
         "model_upgrade" => "model_upgrade",
         "youtube" => "video_understanding",

@@ -1252,7 +1252,7 @@ impl OpenRouter {
                             Err(error) => json!({"error":error.to_string()}).to_string(),
                         }
                     }
-                    "generate_3d" if capabilities.image => {
+                    "generate_3d" if capabilities.three_d => {
                         let prompt = media_prompt
                             .as_deref()
                             .unwrap_or(generation_prompt.current_request);
@@ -1283,7 +1283,7 @@ impl OpenRouter {
                             Err(error) => json!({"error":error.to_string()}).to_string(),
                         }
                     }
-                    "generate_vector" if capabilities.image => {
+                    "generate_vector" if capabilities.vector => {
                         let prompt = media_prompt
                             .as_deref()
                             .unwrap_or(generation_prompt.current_request);
@@ -2495,14 +2495,14 @@ fn add_tools(body: &mut Map<String, Value>, capabilities: &Capabilities, context
             "prompt",
         ));
     }
-    if capabilities.image && context.three_d_ready {
+    if capabilities.three_d && context.three_d_ready {
         additions.push(function_tool(
             "generate_3d",
             "Generate a 3D artifact from text and an optional attached image, then deliver it as a Telegram file.",
             "prompt",
         ));
     }
-    if capabilities.image && context.vector_ready {
+    if capabilities.vector && context.vector_ready {
         additions.push(function_tool(
             "generate_vector",
             "Generate vector artwork from text and an optional attached image, then deliver it as a safe HTML file.",
@@ -2720,8 +2720,8 @@ fn enabled_planner_skills(capabilities: &Capabilities) -> SmallVec<[&'static str
         (capabilities.audio, "audio_generation"),
         (capabilities.music, "music_generation"),
         (capabilities.video, "video_generation"),
-        (capabilities.image, "three_d_generation"),
-        (capabilities.image, "vector_generation"),
+        (capabilities.three_d, "three_d_generation"),
+        (capabilities.vector, "vector_generation"),
         (capabilities.media, "image_understanding"),
         (capabilities.media, "video_understanding"),
         (capabilities.transcription, "transcription"),
@@ -2740,7 +2740,8 @@ fn planned_action_enabled(action: PlannedAction, capabilities: &Capabilities) ->
         PlannedAction::GenerateSpeech | PlannedAction::GenerateAudio => capabilities.audio,
         PlannedAction::GenerateMusic => capabilities.music,
         PlannedAction::GenerateVideo => capabilities.video,
-        PlannedAction::Generate3d | PlannedAction::GenerateVector => capabilities.image,
+        PlannedAction::Generate3d => capabilities.three_d,
+        PlannedAction::GenerateVector => capabilities.vector,
         PlannedAction::Transcribe => capabilities.transcription,
         PlannedAction::Chat | PlannedAction::GenerateCode | PlannedAction::Refuse => true,
     }
@@ -2757,7 +2758,8 @@ fn workflow_step_enabled(step: WorkflowStep, capabilities: &Capabilities) -> boo
         WorkflowStep::SpeechGeneration => capabilities.audio,
         WorkflowStep::MusicGeneration => capabilities.music,
         WorkflowStep::VideoGeneration => capabilities.video,
-        WorkflowStep::ThreeDGeneration | WorkflowStep::VectorGeneration => capabilities.image,
+        WorkflowStep::ThreeDGeneration => capabilities.three_d,
+        WorkflowStep::VectorGeneration => capabilities.vector,
         WorkflowStep::FileDelivery => capabilities.file,
     }
 }

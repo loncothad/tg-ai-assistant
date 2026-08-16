@@ -15,6 +15,7 @@ use std::{
 
 use eyre::{Context, ContextCompat, bail};
 use reqwest::header::RETRY_AFTER;
+use serde::Serialize;
 use serde_json::{Map, Value};
 use tokio::sync::RwLock;
 use tokio::time::sleep;
@@ -31,6 +32,34 @@ pub struct FalClient {
     client: HttpClient,
     config: FalConfig,
     discovered: Arc<RwLock<BTreeMap<String, FalEndpointConfig>>>,
+}
+
+/// Compact provider schema details exposed to authenticated administrators.
+#[derive(Clone, Debug, Serialize)]
+pub struct FalModelDetails {
+    pub input_fields: Vec<FalSchemaField>,
+    pub output_fields: Vec<FalSchemaField>,
+    pub enterprise_status: Option<String>,
+    pub pricing: Option<FalModelPrice>,
+}
+
+/// Account-aware unit price published for one fal.ai endpoint.
+#[derive(Clone, Debug, Serialize)]
+pub struct FalModelPrice {
+    pub unit_price: Value,
+    pub unit: String,
+    pub currency: String,
+}
+
+/// A top-level field from a fal.ai endpoint's OpenAPI input or output schema.
+#[derive(Clone, Debug, Serialize)]
+pub struct FalSchemaField {
+    pub name: String,
+    pub kind: String,
+    pub required: bool,
+    pub description: Option<String>,
+    pub default: Option<Value>,
+    pub choices: Vec<Value>,
 }
 
 impl FalClient {
@@ -99,6 +128,69 @@ impl FalClient {
     }
 
     async fn discover_endpoint(&self, id: &str, api_key: &str) -> Result<FalEndpointConfig> {
+        let model = self.discover_model(id, api_key).await?;
+        endpoint_from_openapi(&model)
+    }
+
+    /// Returns a compact, browser-safe view of an endpoint's live OpenAPI
+    /// contract for the authenticated administration model picker.
+    pub async fn model_details(&self, id: &str, api_key: &str) -> Result<FalModelDetails> {
+        let (model, pricing) = tokio::join!(
+            self.discover_model(id, api_key),
+            self.discover_price(id, api_key)
+        );
+        let mut details = details_from_openapi(&model?)?;
+        details.pricing = pricing.unwrap_or_default();
+        Ok(details)
+    }
+
+    async fn discover_price(&self, id: &str, api_key: &str) -> Result<Option<FalModelPrice>> {
+        let response = self
+            .client
+            .get(format!(
+                "{}/models/pricing",
+                self.config.catalog_url.trim_end_matches('/')
+            ))
+            .header(reqwest::header::AUTHORIZATION, format!("Key {api_key}"))
+            .query(&[("endpoint_id", id)])
+            .timeout(Duration::from_secs(10))
+            .send()
+            .await
+            .context("Failed to fetch fal.ai endpoint pricing")?;
+        if !response.status().is_success() {
+            bail!(
+                "Fal endpoint pricing lookup returned HTTP {}",
+                response.status()
+            );
+        }
+        let body: Value = response
+            .json()
+            .await
+            .context("Fal returned an invalid endpoint pricing response")?;
+        Ok(body
+            .get("prices")
+            .and_then(Value::as_array)
+            .into_iter()
+            .flatten()
+            .find(|price| price.get("endpoint_id").and_then(Value::as_str) == Some(id))
+            .and_then(|price| {
+                Some(FalModelPrice {
+                    unit_price: price.get("unit_price")?.clone(),
+                    unit: price
+                        .get("unit")
+                        .and_then(Value::as_str)
+                        .unwrap_or("billing unit")
+                        .to_owned(),
+                    currency: price
+                        .get("currency")
+                        .and_then(Value::as_str)
+                        .unwrap_or("USD")
+                        .to_owned(),
+                })
+            }))
+    }
+
+    async fn discover_model(&self, id: &str, api_key: &str) -> Result<Value> {
         let response = self
             .client
             .get(format!(
@@ -106,7 +198,11 @@ impl FalClient {
                 self.config.catalog_url.trim_end_matches('/')
             ))
             .header(reqwest::header::AUTHORIZATION, format!("Key {api_key}"))
-            .query(&[("endpoint_id", id), ("expand", "openapi-3.0")])
+            .query(&[
+                ("endpoint_id", id),
+                ("expand", "openapi-3.0"),
+                ("expand", "enterprise_status"),
+            ])
             .timeout(Duration::from_secs(20))
             .send()
             .await
@@ -121,14 +217,13 @@ impl FalClient {
             .json()
             .await
             .context("Fal returned an invalid endpoint schema response")?;
-        let model = body
-            .get("models")
+        body.get("models")
             .and_then(Value::as_array)
             .into_iter()
             .flatten()
             .find(|model| model.get("endpoint_id").and_then(Value::as_str) == Some(id))
-            .with_context(|| format!("Fal model catalog did not return endpoint {id}"))?;
-        endpoint_from_openapi(model)
+            .with_context(|| format!("Fal model catalog did not return endpoint {id}"))
+            .cloned()
     }
 
     pub async fn run(
@@ -502,6 +597,104 @@ fn endpoint_from_openapi(model: &Value) -> Result<FalEndpointConfig> {
         defaults,
         created,
     })
+}
+
+fn details_from_openapi(model: &Value) -> Result<FalModelDetails> {
+    let id = model
+        .get("endpoint_id")
+        .and_then(Value::as_str)
+        .context("Fal schema record has no endpoint_id")?;
+    let openapi = model
+        .get("openapi")
+        .context("Fal schema record has no OpenAPI expansion")?;
+    let input = request_schema(openapi, id).context("Fal OpenAPI has no input schema")?;
+    let input_fields = schema_fields(openapi, input);
+    let output_fields = response_schema(openapi, id)
+        .map(|schema| schema_fields(openapi, schema))
+        .unwrap_or_default();
+    Ok(FalModelDetails {
+        input_fields,
+        output_fields,
+        enterprise_status: model
+            .get("enterprise_status")
+            .and_then(Value::as_str)
+            .map(str::to_owned),
+        pricing: None,
+    })
+}
+
+fn schema_fields(openapi: &Value, schema: &Value) -> Vec<FalSchemaField> {
+    let mut properties = Map::new();
+    let mut required = Vec::new();
+    collect_schema(openapi, schema, 0, &mut properties, &mut required);
+    properties
+        .into_iter()
+        .map(|(name, schema)| {
+            let resolved = resolved_schema(openapi, &schema, 0);
+            FalSchemaField {
+                required: required.iter().any(|field| field == &name),
+                kind: schema_kind(openapi, &schema, 0),
+                description: resolved
+                    .get("description")
+                    .and_then(Value::as_str)
+                    .map(str::to_owned),
+                default: schema_default(openapi, &schema, 0).cloned(),
+                choices: schema_choices(openapi, &schema, 0),
+                name,
+            }
+        })
+        .collect()
+}
+
+fn schema_kind(openapi: &Value, schema: &Value, depth: usize) -> String {
+    if depth > 12 {
+        return "value".to_owned();
+    }
+    let resolved = resolved_schema(openapi, schema, depth);
+    if let Some(kind) = resolved.get("type").and_then(Value::as_str) {
+        if kind == "array" {
+            let item = resolved
+                .get("items")
+                .map(|value| schema_kind(openapi, value, depth + 1))
+                .unwrap_or_else(|| "value".to_owned());
+            return format!("array<{item}>");
+        }
+        if let Some(format) = resolved.get("format").and_then(Value::as_str) {
+            return format!("{kind} · {format}");
+        }
+        return kind.to_owned();
+    }
+    for branch in ["anyOf", "oneOf"] {
+        if let Some(values) = resolved.get(branch).and_then(Value::as_array) {
+            let mut kinds = values
+                .iter()
+                .map(|value| schema_kind(openapi, value, depth + 1))
+                .collect::<Vec<_>>();
+            kinds.sort();
+            kinds.dedup();
+            if !kinds.is_empty() {
+                return kinds.join(" | ");
+            }
+        }
+    }
+    "object".to_owned()
+}
+
+fn schema_choices(openapi: &Value, schema: &Value, depth: usize) -> Vec<Value> {
+    if depth > 12 {
+        return Vec::new();
+    }
+    let resolved = resolved_schema(openapi, schema, depth);
+    if let Some(values) = resolved.get("enum").and_then(Value::as_array) {
+        return values.iter().take(30).cloned().collect();
+    }
+    ["anyOf", "oneOf"]
+        .into_iter()
+        .filter_map(|branch| resolved.get(branch).and_then(Value::as_array))
+        .flatten()
+        .flat_map(|value| schema_choices(openapi, value, depth + 1))
+        .take(30)
+        .collect()
 }
 
 fn request_schema<'a>(openapi: &'a Value, id: &str) -> Option<&'a Value> {
@@ -974,6 +1167,26 @@ mod tests {
         assert_eq!(endpoint.defaults["aspect_ratio"], "auto");
         assert_eq!(endpoint.defaults["quality"], "standard");
         assert!(endpoint.output_url_paths.contains(&"/video/url".into()));
+        let details = details_from_openapi(&model).unwrap();
+        let prompt = details
+            .input_fields
+            .iter()
+            .find(|field| field.name == "prompt")
+            .unwrap();
+        assert!(prompt.required);
+        assert_eq!(prompt.kind, "string");
+        let quality = details
+            .input_fields
+            .iter()
+            .find(|field| field.name == "quality")
+            .unwrap();
+        assert_eq!(quality.choices, ["standard", "high"]);
+        assert!(
+            details
+                .output_fields
+                .iter()
+                .any(|field| field.name == "video")
+        );
     }
 
     #[test]

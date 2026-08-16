@@ -499,6 +499,44 @@ impl BotRunner {
         attachment_flags.2 |= media
             .iter()
             .any(|item| matches!(item, MediaInput::Audio { .. }));
+        // Collapse the persisted per-route switches into the tool-layer flags
+        // for this request's actual attachment shape.
+        capabilities.image = settings.capabilities.enabled(if attachment_flags.0 {
+            "image_to_image"
+        } else {
+            "text_to_image"
+        });
+        capabilities.video = settings.capabilities.enabled(if attachment_flags.1 {
+            "video_to_video"
+        } else if attachment_flags.0 {
+            "image_to_video"
+        } else {
+            "text_to_video"
+        });
+        capabilities.audio = settings.capabilities.enabled("text_to_speech");
+        capabilities.music = settings.capabilities.enabled(if attachment_flags.1 {
+            "video_to_audio"
+        } else {
+            "text_to_audio"
+        });
+        capabilities.three_d = settings.capabilities.enabled(if attachment_flags.0 {
+            "image_to_3d"
+        } else {
+            "text_to_3d"
+        });
+        capabilities.vector = settings.capabilities.enabled(if attachment_flags.0 {
+            "image_to_image_vector"
+        } else {
+            "text_to_image_vector"
+        });
+        capabilities.media = if attachment_flags.1 {
+            settings.capabilities.enabled("video_understanding")
+        } else if attachment_flags.0 {
+            settings.capabilities.enabled("image_understanding")
+        } else {
+            settings.capabilities.enabled("image_understanding")
+                || settings.capabilities.enabled("video_understanding")
+        };
         let plan = if let Some(key) = planner_key.as_deref() {
             match self
                 .openrouter
@@ -1446,15 +1484,15 @@ impl BotRunner {
             }
             "image" => {
                 let settings = self.store.settings(&self.bot.id).await?;
-                if !settings.capabilities.image {
-                    bail!("Image generation is disabled by an administrator");
-                }
-                require_arguments(arguments, "/image <prompt>")?;
                 let image_capability = if attachment_flags(message).0 {
                     "image_to_image"
                 } else {
                     "text_to_image"
                 };
+                if !settings.capabilities.enabled(image_capability) {
+                    bail!("Image generation is disabled by an administrator");
+                }
+                require_arguments(arguments, "/image <prompt>")?;
                 let generation_model = model_override.map_or(
                     specialized_model(
                         &settings,
@@ -1607,20 +1645,6 @@ impl BotRunner {
             "audio" | "speech" | "music" => {
                 let settings = self.store.settings(&self.bot.id).await?;
                 let is_music = command == "music";
-                if is_music && !settings.capabilities.music {
-                    bail!("Music generation is disabled by an administrator");
-                }
-                if !is_music && !settings.capabilities.audio {
-                    bail!("Speech generation is disabled by an administrator");
-                }
-                require_arguments(
-                    arguments,
-                    if is_music {
-                        "/music <prompt>"
-                    } else {
-                        "/speech <text>"
-                    },
-                )?;
                 let audio_capability = if is_music {
                     if attachment_flags(message).1 {
                         "video_to_audio"
@@ -1630,6 +1654,17 @@ impl BotRunner {
                 } else {
                     "text_to_speech"
                 };
+                if !settings.capabilities.enabled(audio_capability) {
+                    bail!("Audio generation is disabled by an administrator");
+                }
+                require_arguments(
+                    arguments,
+                    if is_music {
+                        "/music <prompt>"
+                    } else {
+                        "/speech <text>"
+                    },
+                )?;
                 let generation_model = model_override.map_or(
                     if is_music {
                         specialized_model(
@@ -1843,9 +1878,6 @@ impl BotRunner {
             }
             "3d" | "vector" => {
                 let settings = self.store.settings(&self.bot.id).await?;
-                if !settings.capabilities.image {
-                    bail!("Visual generation is disabled by an administrator");
-                }
                 require_arguments(
                     arguments,
                     if command == "3d" {
@@ -1862,6 +1894,9 @@ impl BotRunner {
                     ("vector", false) => "text_to_image_vector",
                     _ => unreachable!(),
                 };
+                if !settings.capabilities.enabled(capability) {
+                    bail!("{capability} is disabled by an administrator");
+                }
                 let model = model_override
                     .map_or(specialized_model(&settings, capability, ""), |override_| {
                         override_.model.as_str()
@@ -1981,10 +2016,6 @@ impl BotRunner {
             }
             "video" => {
                 let settings = self.store.settings(&self.bot.id).await?;
-                if !settings.capabilities.video {
-                    bail!("Video generation is disabled by an administrator");
-                }
-                require_arguments(arguments, "/video <prompt>")?;
                 let flags = attachment_flags(message);
                 let video_capability = if flags.1 {
                     "video_to_video"
@@ -1993,6 +2024,10 @@ impl BotRunner {
                 } else {
                     "text_to_video"
                 };
+                if !settings.capabilities.enabled(video_capability) {
+                    bail!("Video generation is disabled by an administrator");
+                }
+                require_arguments(arguments, "/video <prompt>")?;
                 let generation_model = model_override.map_or(
                     specialized_model(
                         &settings,

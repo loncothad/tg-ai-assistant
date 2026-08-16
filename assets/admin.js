@@ -109,7 +109,7 @@ const noCompatibleModelsMessage = provider => {
 const fuzzyScore = (model, rawQuery) => {
   const query = rawQuery.trim().toLowerCase();
   if (!query) return 1;
-  const haystack = `${model.name} ${model.id} ${model.description || ''} ${(model.input_modalities || []).join(' ')} ${(model.output_modalities || []).join(' ')}`.toLowerCase();
+  const haystack = `${model.name} ${model.id} ${model.description || ''} ${model.category || ''} ${(model.tags || []).join(' ')} ${(model.input_modalities || []).join(' ')} ${(model.output_modalities || []).join(' ')}`.toLowerCase();
   const direct = haystack.indexOf(query);
   if (direct >= 0) return 10000 - direct;
   const tokens = query.split(/\s+/).filter(Boolean);
@@ -133,6 +133,11 @@ const price = value => {
 };
 const date = value => value ? new Date(value * 1000).toLocaleDateString() : 'Not published';
 const unitPrice = (key, value) => {
+  if (key.startsWith('fal · ')) {
+    const label = key.slice('fal · '.length);
+    const numeric = Number(value);
+    return `${Number.isFinite(numeric) ? `$${numeric.toLocaleString(undefined, { maximumFractionDigits: 8 })}` : value} ${label}`;
+  }
   const mediaEndpoint = ['text_to_image', 'image_to_image', 'text_to_video', 'image_to_video', 'video_to_video', 'text_to_audio', 'video_to_audio', 'text_to_speech', 'image_to_3d', 'text_to_3d', 'text_to_image_vector', 'image_to_image_vector', 'transcription'].includes(capability);
   if (['prompt', 'completion'].includes(key) && mediaEndpoint) {
     const numeric = Number(value);
@@ -170,6 +175,80 @@ const fact = (label, value) => {
   const box = text('div', '', 'fact');
   box.append(text('span', label), text('strong', value));
   return box;
+};
+
+const externalLink = (label, rawUrl) => {
+  try {
+    const url = new URL(rawUrl);
+    if (url.protocol !== 'https:') return null;
+    const link = text('a', label, 'external-link');
+    link.href = url.href;
+    link.target = '_blank';
+    link.rel = 'noopener noreferrer';
+    return link;
+  } catch (_) {
+    return null;
+  }
+};
+
+const displaySchemaValue = value => {
+  if (value === undefined || value === null) return '';
+  const rendered = typeof value === 'string' ? value : JSON.stringify(value);
+  return rendered.length > 180 ? `${rendered.slice(0, 177)}…` : rendered;
+};
+
+const schemaFields = (title, fields) => {
+  const section = text('section', '', 'schema-section');
+  section.append(text('h3', title));
+  if (!fields?.length) {
+    section.append(text('p', 'No top-level fields were published.', 'muted'));
+    return section;
+  }
+  const list = text('div', '', 'schema-fields');
+  fields.forEach(field => {
+    const row = text('div', '', 'schema-field');
+    const heading = text('div', '', 'schema-field-heading');
+    heading.append(text('code', field.name), text('span', `${field.kind}${field.required ? ' · required' : ' · optional'}`));
+    row.append(heading);
+    if (field.description) row.append(text('p', field.description));
+    const annotations = [];
+    if (field.default !== undefined && field.default !== null) annotations.push(`default: ${displaySchemaValue(field.default)}`);
+    if (field.choices?.length) annotations.push(`choices: ${field.choices.map(displaySchemaValue).join(', ')}`);
+    if (annotations.length) row.append(chips(annotations));
+    list.append(row);
+  });
+  section.append(list);
+  return section;
+};
+
+const loadFalDetails = async (model, target) => {
+  const selectedId = model.id;
+  try {
+    const response = await fetch(`model-details?model=${encodeURIComponent(model.id)}&model_provider=fal`, {
+      headers: { 'X-Telegram-Init-Data': initData }
+    });
+    if (!response.ok) throw new Error(await response.text());
+    const details = await response.json();
+    if (chosen?.id !== selectedId || chosen?.model_provider !== 'fal') return;
+    target.replaceChildren();
+    if (details.enterprise_status) target.append(chips([`enterprise: ${details.enterprise_status}`]));
+    if (details.pricing) {
+      const amount = Number(details.pricing.unit_price);
+      const rendered = Number.isFinite(amount)
+        ? `$${amount.toLocaleString(undefined, { maximumFractionDigits: 8 })}`
+        : displaySchemaValue(details.pricing.unit_price);
+      target.append(text('h3', 'Current account pricing'), chips([
+        `${rendered} ${details.pricing.currency} per ${details.pricing.unit}`
+      ]));
+    }
+    target.append(
+      schemaFields('Input schema', details.input_fields),
+      schemaFields('Output schema', details.output_fields)
+    );
+  } catch (_) {
+    if (chosen?.id !== selectedId || chosen?.model_provider !== 'fal') return;
+    target.replaceChildren(text('p', 'The live OpenAPI schema could not be loaded. The catalog metadata above is still current.', 'muted'));
+  }
 };
 
 const providerLabel = endpoint => {
@@ -225,24 +304,58 @@ const showDetail = model => {
     ? 'AI Hub'
     : model.model_provider === 'fal' ? 'fal.ai' : 'OpenRouter';
   detail.append(text('h2', model.name), text('div', `${providerName} · ${model.id}`, 'model-id'));
+  if (model.model_provider === 'fal' && model.thumbnail_url) {
+    const preview = document.createElement('img');
+    preview.className = 'model-preview';
+    preview.src = model.thumbnail_url;
+    preview.alt = `${model.name} preview`;
+    preview.loading = 'lazy';
+    preview.referrerPolicy = 'no-referrer';
+    preview.addEventListener('error', () => preview.remove());
+    detail.append(preview);
+  }
   detail.append(chips([...(model.input_modalities || []).map(item => `in: ${item}`), ...(model.output_modalities || []).map(item => `out: ${item}`)]));
   detail.append(text('p', model.description || `No description is supplied by ${providerName}.`, 'description'));
   const facts = text('div', '', 'facts');
-  facts.append(
-    fact('Context', compactNumber(model.context_length)),
-    fact('Max output', compactNumber(model.max_completion_tokens)),
-    fact('Input rate', primaryRate(model.pricing?.prompt)),
-    fact('Output rate', primaryRate(model.pricing?.completion)),
-    fact('Knowledge cutoff', model.knowledge_cutoff || 'Not published'),
-    fact('Tokenizer', model.tokenizer || 'Not published'),
-    fact('Released', date(model.created)),
-    fact('Expires', model.expiration_date || 'Not published')
-  );
+  if (model.model_provider === 'fal') {
+    facts.append(
+      fact('Category', model.category || 'Not published'),
+      fact('Status', model.status || 'Not published'),
+      fact('Released', date(model.created)),
+      fact('Updated', date(model.updated))
+    );
+  } else {
+    facts.append(
+      fact('Context', compactNumber(model.context_length)),
+      fact('Max output', compactNumber(model.max_completion_tokens)),
+      fact('Input rate', primaryRate(model.pricing?.prompt)),
+      fact('Output rate', primaryRate(model.pricing?.completion)),
+      fact('Knowledge cutoff', model.knowledge_cutoff || 'Not published'),
+      fact('Tokenizer', model.tokenizer || 'Not published'),
+      fact('Released', date(model.created)),
+      fact('Expires', model.expiration_date || 'Not published')
+    );
+  }
   detail.append(facts);
   const prices = Object.entries(model.pricing || {}).map(([key, value]) => unitPrice(key, value));
   if (prices.length) {
     detail.append(text('h3', 'Published pricing'));
     detail.append(chips(prices));
+  }
+  if (model.model_provider === 'fal') {
+    const metadata = [
+      ...(model.tags || []).map(item => `tag: ${item}`),
+      ...(model.highlighted ? ['highlighted'] : []),
+      ...(model.pinned ? ['pinned'] : []),
+      ...(model.favorited ? ['favorited'] : [])
+    ];
+    if (metadata.length) detail.append(text('h3', 'Catalog metadata'), chips(metadata));
+    const modelLink = externalLink('Open model page ↗', model.model_url);
+    if (modelLink) detail.append(modelLink);
+    const schemaTarget = text('div', '', 'fal-schema-details');
+    schemaTarget.append(text('div', 'Loading live input and output schema…', 'loading-inline'));
+    detail.append(schemaTarget);
+    loadFalDetails(model, schemaTarget);
   }
   const extras = [
     ...(model.supported_resolutions || []).map(item => `resolution: ${item}`),
@@ -373,7 +486,7 @@ const enrichCards = () => {
     summary.textContent = model.description ? `${model.description.slice(0, 155)}${model.description.length > 155 ? '…' : ''}` : 'Provider metadata is not available.';
     const target = card.querySelector('.model-chips');
     target.replaceChildren(...[
-      `context ${compactNumber(model.context_length)}`,
+      ...(model.model_provider === 'fal' ? [`category: ${model.category || 'unknown'}`] : [`context ${compactNumber(model.context_length)}`]),
       ...(model.input_modalities || []).map(item => `in: ${item}`),
       ...(model.output_modalities || []).map(item => `out: ${item}`)
     ].map(value => text('span', value, 'chip')));

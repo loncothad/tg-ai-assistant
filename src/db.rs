@@ -131,6 +131,41 @@ pub struct Capabilities {
     /// Allows explicitly requested prompt expansion after planner approval.
     #[serde(default = "enabled_by_default")]
     pub prompt_expansion: bool,
+    /// Capability-specific overrides. `None` inherits the corresponding
+    /// legacy group switch, preserving existing redb settings.
+    #[serde(default)]
+    pub text_to_image: Option<bool>,
+    #[serde(default)]
+    pub image_to_image: Option<bool>,
+    #[serde(default)]
+    pub text_to_video: Option<bool>,
+    #[serde(default)]
+    pub image_to_video: Option<bool>,
+    #[serde(default)]
+    pub video_to_video: Option<bool>,
+    #[serde(default)]
+    pub text_to_audio: Option<bool>,
+    #[serde(default)]
+    pub video_to_audio: Option<bool>,
+    #[serde(default)]
+    pub text_to_speech: Option<bool>,
+    #[serde(default)]
+    pub text_to_3d: Option<bool>,
+    #[serde(default)]
+    pub image_to_3d: Option<bool>,
+    #[serde(default)]
+    pub text_to_image_vector: Option<bool>,
+    #[serde(default)]
+    pub image_to_image_vector: Option<bool>,
+    #[serde(default)]
+    pub image_understanding: Option<bool>,
+    #[serde(default)]
+    pub video_understanding: Option<bool>,
+    /// Request-specific aggregates used by the tool layer, never persisted.
+    #[serde(skip, default = "enabled_by_default")]
+    pub three_d: bool,
+    #[serde(skip, default = "enabled_by_default")]
+    pub vector: bool,
 }
 impl Default for Capabilities {
     fn default() -> Self {
@@ -147,7 +182,177 @@ impl Default for Capabilities {
             model_upgrade: true,
             youtube: true,
             prompt_expansion: true,
+            text_to_image: None,
+            image_to_image: None,
+            text_to_video: None,
+            image_to_video: None,
+            video_to_video: None,
+            text_to_audio: None,
+            video_to_audio: None,
+            text_to_speech: None,
+            text_to_3d: None,
+            image_to_3d: None,
+            text_to_image_vector: None,
+            image_to_image_vector: None,
+            image_understanding: None,
+            video_understanding: None,
+            three_d: true,
+            vector: true,
         }
+    }
+}
+
+impl Capabilities {
+    /// Returns an exact skill switch, falling back to the legacy group switch
+    /// for settings saved before capability-specific media skills existed.
+    pub fn enabled(&self, capability: &str) -> bool {
+        match capability {
+            "search" => self.search,
+            "web_fetch" => self.web_fetch,
+            "text_to_image" => self.image && self.text_to_image.unwrap_or(true),
+            "image_to_image" => self.image && self.image_to_image.unwrap_or(true),
+            "text_to_video" => self.video && self.text_to_video.unwrap_or(true),
+            "image_to_video" => self.video && self.image_to_video.unwrap_or(true),
+            "video_to_video" => self.video && self.video_to_video.unwrap_or(true),
+            "text_to_audio" => self.music && self.text_to_audio.unwrap_or(true),
+            "video_to_audio" => self.music && self.video_to_audio.unwrap_or(true),
+            "text_to_speech" => self.audio && self.text_to_speech.unwrap_or(true),
+            "text_to_3d" => self.image && self.text_to_3d.unwrap_or(true),
+            "image_to_3d" => self.image && self.image_to_3d.unwrap_or(true),
+            "text_to_image_vector" => self.image && self.text_to_image_vector.unwrap_or(true),
+            "image_to_image_vector" => self.image && self.image_to_image_vector.unwrap_or(true),
+            "image_understanding" => self.media && self.image_understanding.unwrap_or(true),
+            "video_understanding" => self.media && self.video_understanding.unwrap_or(true),
+            "transcription" => self.transcription,
+            "file" => self.file,
+            "model_upgrade" => self.model_upgrade,
+            "youtube" => self.youtube,
+            "prompt_expansion" => self.prompt_expansion,
+            _ => false,
+        }
+    }
+
+    fn enable_image_overrides(&mut self) {
+        if !self.image {
+            for value in [
+                &mut self.text_to_image,
+                &mut self.image_to_image,
+                &mut self.text_to_3d,
+                &mut self.image_to_3d,
+                &mut self.text_to_image_vector,
+                &mut self.image_to_image_vector,
+            ] {
+                value.get_or_insert(false);
+            }
+        }
+        self.image = true;
+    }
+
+    fn enable_video_overrides(&mut self) {
+        if !self.video {
+            for value in [
+                &mut self.text_to_video,
+                &mut self.image_to_video,
+                &mut self.video_to_video,
+            ] {
+                value.get_or_insert(false);
+            }
+        }
+        self.video = true;
+    }
+
+    fn enable_music_overrides(&mut self) {
+        if !self.music {
+            for value in [&mut self.text_to_audio, &mut self.video_to_audio] {
+                value.get_or_insert(false);
+            }
+        }
+        self.music = true;
+    }
+
+    fn enable_media_overrides(&mut self) {
+        if !self.media {
+            for value in [&mut self.image_understanding, &mut self.video_understanding] {
+                value.get_or_insert(false);
+            }
+        }
+        self.media = true;
+    }
+
+    /// Changes one switch while accepting legacy exported skill identifiers.
+    pub fn set(&mut self, capability: &str, enabled: bool) -> Result<()> {
+        match capability {
+            "search" => self.search = enabled,
+            "web_fetch" => self.web_fetch = enabled,
+            "image" => self.image = enabled,
+            "audio" | "speech" => self.audio = enabled,
+            "music" => self.music = enabled,
+            "video" => self.video = enabled,
+            "media" => self.media = enabled,
+            "text_to_image" => {
+                self.enable_image_overrides();
+                self.text_to_image = Some(enabled);
+            }
+            "image_to_image" => {
+                self.enable_image_overrides();
+                self.image_to_image = Some(enabled);
+            }
+            "text_to_video" => {
+                self.enable_video_overrides();
+                self.text_to_video = Some(enabled);
+            }
+            "image_to_video" => {
+                self.enable_video_overrides();
+                self.image_to_video = Some(enabled);
+            }
+            "video_to_video" => {
+                self.enable_video_overrides();
+                self.video_to_video = Some(enabled);
+            }
+            "text_to_audio" => {
+                self.enable_music_overrides();
+                self.text_to_audio = Some(enabled);
+            }
+            "video_to_audio" => {
+                self.enable_music_overrides();
+                self.video_to_audio = Some(enabled);
+            }
+            "text_to_speech" => {
+                self.audio = true;
+                self.text_to_speech = Some(enabled);
+            }
+            "text_to_3d" => {
+                self.enable_image_overrides();
+                self.text_to_3d = Some(enabled);
+            }
+            "image_to_3d" => {
+                self.enable_image_overrides();
+                self.image_to_3d = Some(enabled);
+            }
+            "text_to_image_vector" => {
+                self.enable_image_overrides();
+                self.text_to_image_vector = Some(enabled);
+            }
+            "image_to_image_vector" => {
+                self.enable_image_overrides();
+                self.image_to_image_vector = Some(enabled);
+            }
+            "image_understanding" => {
+                self.enable_media_overrides();
+                self.image_understanding = Some(enabled);
+            }
+            "video_understanding" => {
+                self.enable_media_overrides();
+                self.video_understanding = Some(enabled);
+            }
+            "transcription" => self.transcription = enabled,
+            "file" => self.file = enabled,
+            "model_upgrade" => self.model_upgrade = enabled,
+            "youtube" => self.youtube = enabled,
+            "prompt_expansion" => self.prompt_expansion = enabled,
+            _ => bail!("Unknown capability: {capability}"),
+        }
+        Ok(())
     }
 }
 
@@ -469,22 +674,7 @@ impl Store {
     ) -> Result<()> {
         let _guard = self.mutation_lock.lock().await;
         let mut settings = self.settings(bot_id).await?;
-        match capability {
-            "search" => settings.capabilities.search = enabled,
-            "web_fetch" => settings.capabilities.web_fetch = enabled,
-            "image" => settings.capabilities.image = enabled,
-            "audio" => settings.capabilities.audio = enabled,
-            "speech" => settings.capabilities.audio = enabled,
-            "music" => settings.capabilities.music = enabled,
-            "video" => settings.capabilities.video = enabled,
-            "media" => settings.capabilities.media = enabled,
-            "transcription" => settings.capabilities.transcription = enabled,
-            "file" => settings.capabilities.file = enabled,
-            "model_upgrade" => settings.capabilities.model_upgrade = enabled,
-            "youtube" => settings.capabilities.youtube = enabled,
-            "prompt_expansion" => settings.capabilities.prompt_expansion = enabled,
-            _ => bail!("Unknown capability: {capability}"),
-        }
+        settings.capabilities.set(capability, enabled)?;
         self.save_settings_unlocked(bot_id, &settings).await
     }
 
@@ -521,22 +711,7 @@ impl Store {
         } else {
             crate::defaults::SYSTEM_PROMPT
         };
-        let enabled = |id: &str| match id {
-            "search" => settings.capabilities.search,
-            "web_fetch" => settings.capabilities.web_fetch,
-            "image" => settings.capabilities.image,
-            "audio" => settings.capabilities.audio,
-            "speech" => settings.capabilities.audio,
-            "music" => settings.capabilities.music,
-            "video" => settings.capabilities.video,
-            "media" => settings.capabilities.media,
-            "transcription" => settings.capabilities.transcription,
-            "file" => settings.capabilities.file,
-            "model_upgrade" => settings.capabilities.model_upgrade,
-            "youtube" => settings.capabilities.youtube,
-            "prompt_expansion" => settings.capabilities.prompt_expansion,
-            _ => false,
-        };
+        let enabled = |id: &str| settings.capabilities.enabled(id);
         let mut skills = crate::defaults::BUILTIN_SKILLS
             .iter()
             .filter(|skill| enabled(skill.id))
@@ -893,10 +1068,27 @@ mod tests {
     #[tokio::test]
     async fn disabling_a_skill_removes_its_embedded_instructions() {
         let (_directory, store) = test_store().await;
-        store.set_capability("a", "image", false).await.unwrap();
+        store
+            .set_capability("a", "text_to_image", false)
+            .await
+            .unwrap();
         let instructions = store.effective_instructions("a").await.unwrap();
-        assert!(!instructions.contains("# Image generation skill"));
+        assert!(!instructions.contains("# Text-to-image generation"));
+        assert!(instructions.contains("# Image-to-image generation"));
         assert!(instructions.contains("# Web research skill"));
+    }
+
+    #[test]
+    fn capability_specific_media_switches_preserve_legacy_group_state() {
+        let mut capabilities = Capabilities {
+            image: false,
+            ..Capabilities::default()
+        };
+        assert!(!capabilities.enabled("text_to_image"));
+        assert!(!capabilities.enabled("image_to_image"));
+        capabilities.set("text_to_image", true).unwrap();
+        assert!(capabilities.enabled("text_to_image"));
+        assert!(!capabilities.enabled("image_to_image"));
     }
 
     #[tokio::test]
