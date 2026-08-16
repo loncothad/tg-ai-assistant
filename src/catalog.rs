@@ -46,11 +46,21 @@ pub struct CatalogModel {
     pub supported_sizes: Vec<String>,
     pub supported_frame_images: Vec<String>,
     pub generates_audio: Option<bool>,
+    /// Exact capabilities declared by schema-configured providers.
+    #[serde(default)]
+    pub supported_capabilities: Vec<String>,
 }
 
 impl CatalogModel {
     /// Returns whether this model can serve the requested Teleforge capability.
     pub fn supports(&self, capability: &str) -> bool {
+        if !self.supported_capabilities.is_empty() {
+            return self
+                .supported_capabilities
+                .iter()
+                .any(|item| item == capability)
+                || legacy_capability_alias(self, capability);
+        }
         let input = |value: &str| self.input_modalities.iter().any(|item| item == value);
         let output = |value: &str| self.output_modalities.iter().any(|item| item == value);
         match capability {
@@ -67,14 +77,64 @@ impl CatalogModel {
             }
             "image_understanding" => input("image") && output("text"),
             "video_understanding" => input("video") && output("text"),
-            "image_generation" => output("image"),
-            "audio_generation" | "speech_generation" => output("speech") || output("audio"),
-            "music_generation" => output("audio"),
+            "image_generation" | "text_to_image" => input("text") && output("image"),
+            "image_to_image" => input("image") && output("image"),
+            "audio_generation" | "speech_generation" | "text_to_speech" => {
+                input("text") && (output("speech") || output("audio"))
+            }
+            "music_generation" | "text_to_audio" => input("text") && output("audio"),
+            "video_to_audio" => input("video") && output("audio"),
             "transcription" => output("transcription") || (input("audio") && output("text")),
-            "video_generation" => output("video"),
+            "video_generation" | "text_to_video" => input("text") && output("video"),
+            "image_to_video" => input("image") && output("video"),
+            "video_to_video" => input("video") && output("video"),
+            "text_to_3d" => input("text") && output("3d"),
+            "image_to_3d" => input("image") && output("3d"),
+            "text_to_image_vector" => input("text") && (output("svg") || output("vector")),
+            "image_to_image_vector" => input("image") && (output("svg") || output("vector")),
             _ => false,
         }
     }
+}
+
+fn legacy_capability_alias(model: &CatalogModel, requested: &str) -> bool {
+    let has = |value: &str| {
+        model
+            .supported_capabilities
+            .iter()
+            .any(|item| item == value)
+    };
+    let input = |value: &str| model.input_modalities.iter().any(|item| item == value);
+    match requested {
+        "text_to_image" => input("text") && has("image_generation"),
+        "image_to_image" => input("image") && has("image_generation"),
+        "text_to_video" => input("text") && has("video_generation"),
+        "image_to_video" => input("image") && has("video_generation"),
+        "video_to_video" => input("video") && has("video_generation"),
+        "text_to_audio" => input("text") && has("music_generation"),
+        "video_to_audio" => input("video") && has("music_generation"),
+        "text_to_speech" => input("text") && (has("speech_generation") || has("audio_generation")),
+        _ => false,
+    }
+}
+
+/// Whether a capability has its own input/output-specific model selector.
+pub fn is_specialized_generation_capability(capability: &str) -> bool {
+    matches!(
+        capability,
+        "text_to_image"
+            | "image_to_image"
+            | "text_to_video"
+            | "image_to_video"
+            | "video_to_video"
+            | "text_to_audio"
+            | "video_to_audio"
+            | "text_to_speech"
+            | "image_to_3d"
+            | "text_to_3d"
+            | "text_to_image_vector"
+            | "image_to_image_vector"
+    )
 }
 
 #[derive(Clone)]
@@ -189,10 +249,16 @@ pub fn fal_catalog(config: &FalConfig) -> Vec<CatalogModel> {
             for capability in &endpoint.capabilities {
                 let modality = match capability.as_str() {
                     "image_generation" => "image",
+                    "text_to_image" | "image_to_image" => "image",
                     "speech_generation" | "audio_generation" => "speech",
-                    "music_generation" => "audio",
+                    "music_generation" | "text_to_audio" | "video_to_audio" => "audio",
                     "transcription" => "transcription",
-                    "video_generation" => "video",
+                    "video_generation" | "text_to_video" | "image_to_video" | "video_to_video" => {
+                        "video"
+                    }
+                    "image_understanding" | "video_understanding" => "text",
+                    "text_to_3d" | "image_to_3d" => "3d",
+                    "text_to_image_vector" | "image_to_image_vector" => "vector",
                     _ => continue,
                 };
                 if !output.iter().any(|item| item == modality) {
@@ -215,6 +281,7 @@ pub fn fal_catalog(config: &FalConfig) -> Vec<CatalogModel> {
                 created: endpoint.created,
                 input_modalities: input,
                 output_modalities: output,
+                supported_capabilities: endpoint.capabilities.clone(),
                 ..CatalogModel::default()
             }
         })
@@ -431,6 +498,7 @@ fn parse_model(value: &Value) -> Option<CatalogModel> {
         supported_sizes: strings(Some(object), "supported_sizes"),
         supported_frame_images: strings(Some(object), "supported_frame_images"),
         generates_audio: object.get("generate_audio").and_then(Value::as_bool),
+        supported_capabilities: Vec::new(),
         id,
     })
 }
@@ -620,6 +688,19 @@ mod tests {
             .push("response_format".to_owned());
         assert!(planner.supports("intent_planning"));
         assert!(!model(&["text"], &["text"]).supports("intent_planning"));
+    }
+
+    #[test]
+    fn fal_declared_capabilities_do_not_leak_across_broad_modalities() {
+        let model = CatalogModel {
+            input_modalities: vec!["text".into(), "image".into()],
+            output_modalities: vec!["text".into()],
+            supported_capabilities: vec!["image_understanding".into()],
+            ..CatalogModel::default()
+        };
+        assert!(model.supports("image_understanding"));
+        assert!(!model.supports("chat"));
+        assert!(!model.supports("image_to_image"));
     }
 
     #[test]

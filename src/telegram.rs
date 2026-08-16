@@ -40,7 +40,7 @@ use uuid::Uuid;
 use crate::{
     Result,
     catalog::ModelCatalogCache,
-    config::{BotConfig, Config, ModelProvider, SearchProvider},
+    config::{BotConfig, Config, ModelConfig, ModelProvider, OpenRouterOptions, SearchProvider},
     db::{ModelRouting, Store},
     http::HttpClient,
     openrouter::{
@@ -561,6 +561,8 @@ impl BotRunner {
             Some(PlannedAction::GenerateSpeech | PlannedAction::GenerateAudio) => Some("speech"),
             Some(PlannedAction::GenerateMusic) => Some("music"),
             Some(PlannedAction::GenerateVideo) => Some("video"),
+            Some(PlannedAction::Generate3d) => Some("3d"),
+            Some(PlannedAction::GenerateVector) => Some("vector"),
             _ => None,
         };
         let transcription_command = plan
@@ -734,10 +736,29 @@ impl BotRunner {
         let model = match routing.model_provider {
             ModelProvider::Openrouter => self.config.resolved_model(model_capability, selected),
             ModelProvider::Aihub => self.config.resolved_aihub_model(selected),
-            ModelProvider::Fal => {
-                bail!("Fal endpoints cannot be used for chat or media understanding")
-            }
+            ModelProvider::Fal => ModelConfig {
+                id: selected.to_owned(),
+                label: None,
+                options: OpenRouterOptions::default(),
+            },
         };
+        if routing.model_provider == ModelProvider::Fal {
+            let key = self.model_api_key(ModelProvider::Fal).await?;
+            let _ = sender.send(ProgressUpdate::step("Running fal.ai vision model"));
+            let result = self
+                .openrouter
+                .describe_generation_media(&model, &media, &text, routing, &key)
+                .await;
+            drop(sender);
+            let _ = progress_task.await;
+            let description = result?;
+            if let Some(inline_id) = guest_pending_id.as_deref() {
+                self.edit_guest_text(inline_id, &description).await?;
+            } else {
+                self.respond(&message, mode, &description, None).await?;
+            }
+            return Ok(());
+        }
         if routing.model_provider == ModelProvider::Aihub {
             capabilities.web_fetch = false;
         }
@@ -749,18 +770,57 @@ impl BotRunner {
                 && plan.delivery == crate::openrouter::PlannedDelivery::File
         });
         let api_key = self.model_api_key(routing.model_provider).await?;
+        let media_flags = (
+            media
+                .iter()
+                .any(|item| matches!(item, MediaInput::Image { .. })),
+            media
+                .iter()
+                .any(|item| matches!(item, MediaInput::Video { .. })),
+        );
+        let image_generation_capability = if media_flags.0 {
+            "image_to_image"
+        } else {
+            "text_to_image"
+        };
+        let video_generation_capability = if media_flags.1 {
+            "video_to_video"
+        } else if media_flags.0 {
+            "image_to_video"
+        } else {
+            "text_to_video"
+        };
+        let audio_generation_capability = "text_to_speech";
+        let music_generation_capability = if media_flags.1 {
+            "video_to_audio"
+        } else {
+            "text_to_audio"
+        };
+        let three_d_generation_capability = if media_flags.0 {
+            "image_to_3d"
+        } else {
+            "text_to_3d"
+        };
+        let vector_generation_capability = if media_flags.0 {
+            "image_to_image_vector"
+        } else {
+            "text_to_image_vector"
+        };
         let image_routing = settings
             .model_routing
-            .get("image_generation")
+            .get(image_generation_capability)
+            .or_else(|| settings.model_routing.get("image_generation"))
             .unwrap_or(&default_routing);
         let audio_routing = settings
             .model_routing
-            .get("speech_generation")
+            .get(audio_generation_capability)
+            .or_else(|| settings.model_routing.get("speech_generation"))
             .or_else(|| settings.model_routing.get("audio_generation"))
             .unwrap_or(&default_routing);
         let music_routing = settings
             .model_routing
-            .get("music_generation")
+            .get(music_generation_capability)
+            .or_else(|| settings.model_routing.get("music_generation"))
             .unwrap_or(&default_routing);
         let transcription_routing = settings
             .model_routing
@@ -768,8 +828,19 @@ impl BotRunner {
             .unwrap_or(&default_routing);
         let video_routing = settings
             .model_routing
-            .get("video_generation")
+            .get(video_generation_capability)
+            .or_else(|| settings.model_routing.get("video_generation"))
             .unwrap_or(&default_routing);
+        let three_d_routing = settings
+            .model_routing
+            .get(three_d_generation_capability)
+            .unwrap_or(&default_routing);
+        let vector_routing = settings
+            .model_routing
+            .get(vector_generation_capability)
+            .unwrap_or(&default_routing);
+        let three_d_model = specialized_model(&settings, three_d_generation_capability, "");
+        let vector_model = specialized_model(&settings, vector_generation_capability, "");
         let image_key = self
             .optional_model_api_key(image_routing.model_provider, capabilities.image)
             .await?;
@@ -788,6 +859,20 @@ impl BotRunner {
         let video_key = self
             .optional_model_api_key(video_routing.model_provider, capabilities.video)
             .await?;
+        let three_d_key =
+            if !three_d_model.is_empty() && three_d_routing.model_provider == ModelProvider::Fal {
+                self.optional_model_api_key(ModelProvider::Fal, true)
+                    .await?
+            } else {
+                String::new()
+            };
+        let vector_key =
+            if !vector_model.is_empty() && vector_routing.model_provider == ModelProvider::Fal {
+                self.optional_model_api_key(ModelProvider::Fal, true)
+                    .await?
+            } else {
+                String::new()
+            };
         capabilities.image &= !image_key.is_empty();
         capabilities.audio &= !audio_key.is_empty();
         capabilities.music &= !music_key.is_empty();
@@ -835,17 +920,29 @@ impl BotRunner {
                 routing,
                 tool_models: ToolModels {
                     image_generation: ToolModel {
-                        model: &settings.selected_image_generation_model,
+                        model: specialized_model(
+                            &settings,
+                            image_generation_capability,
+                            &settings.selected_image_generation_model,
+                        ),
                         routing: image_routing,
                         api_key: &image_key,
                     },
                     audio_generation: ToolModel {
-                        model: &settings.selected_audio_generation_model,
+                        model: specialized_model(
+                            &settings,
+                            audio_generation_capability,
+                            &settings.selected_audio_generation_model,
+                        ),
                         routing: audio_routing,
                         api_key: &audio_key,
                     },
                     music_generation: ToolModel {
-                        model: &settings.selected_music_generation_model,
+                        model: specialized_model(
+                            &settings,
+                            music_generation_capability,
+                            &settings.selected_music_generation_model,
+                        ),
                         routing: music_routing,
                         api_key: &music_key,
                     },
@@ -855,9 +952,23 @@ impl BotRunner {
                         api_key: &transcription_key,
                     },
                     video_generation: ToolModel {
-                        model: &settings.selected_video_generation_model,
+                        model: specialized_model(
+                            &settings,
+                            video_generation_capability,
+                            &settings.selected_video_generation_model,
+                        ),
                         routing: video_routing,
                         api_key: &video_key,
+                    },
+                    three_d_generation: ToolModel {
+                        model: three_d_model,
+                        routing: three_d_routing,
+                        api_key: &three_d_key,
+                    },
+                    vector_generation: ToolModel {
+                        model: vector_model,
+                        routing: vector_routing,
+                        api_key: &vector_key,
                     },
                 },
                 generation_prompt: GenerationPromptContext {
@@ -1053,6 +1164,18 @@ impl BotRunner {
             ("speech_generation", PlannedAction::GenerateSpeech),
             ("music_generation", PlannedAction::GenerateMusic),
             ("video_generation", PlannedAction::GenerateVideo),
+            ("text_to_3d", PlannedAction::Generate3d),
+            ("image_to_3d", PlannedAction::Generate3d),
+            ("text_to_image_vector", PlannedAction::GenerateVector),
+            ("image_to_image_vector", PlannedAction::GenerateVector),
+            ("text_to_image", PlannedAction::GenerateImage),
+            ("image_to_image", PlannedAction::GenerateImage),
+            ("text_to_video", PlannedAction::GenerateVideo),
+            ("image_to_video", PlannedAction::GenerateVideo),
+            ("video_to_video", PlannedAction::GenerateVideo),
+            ("text_to_speech", PlannedAction::GenerateSpeech),
+            ("text_to_audio", PlannedAction::GenerateMusic),
+            ("video_to_audio", PlannedAction::GenerateMusic),
         ]
         .into_iter()
         .filter_map(|(capability, action)| model.supports(capability).then_some(action))
@@ -1189,10 +1312,18 @@ impl BotRunner {
         if let (Some(override_), Some(capability)) = (
             model_override,
             match command {
-                "image" => Some("image_generation"),
-                "audio" | "speech" => Some("speech_generation"),
-                "music" => Some("music_generation"),
-                "video" => Some("video_generation"),
+                "image" if attachment_flags(message).0 => Some("image_to_image"),
+                "image" => Some("text_to_image"),
+                "audio" | "speech" => Some("text_to_speech"),
+                "music" if attachment_flags(message).1 => Some("video_to_audio"),
+                "music" => Some("text_to_audio"),
+                "video" if attachment_flags(message).1 => Some("video_to_video"),
+                "video" if attachment_flags(message).0 => Some("image_to_video"),
+                "video" => Some("text_to_video"),
+                "3d" if attachment_flags(message).0 => Some("image_to_3d"),
+                "3d" => Some("text_to_3d"),
+                "vector" if attachment_flags(message).0 => Some("image_to_image_vector"),
+                "vector" => Some("text_to_image_vector"),
                 "transcribe" => Some("transcription"),
                 _ => None,
             },
@@ -1200,7 +1331,12 @@ impl BotRunner {
             self.validate_model_override(override_, capability).await?;
         }
         let contextual_arguments = reply_context
-            .filter(|_| matches!(command, "search" | "image" | "music" | "video"))
+            .filter(|_| {
+                matches!(
+                    command,
+                    "search" | "image" | "music" | "video" | "3d" | "vector"
+                )
+            })
             .map(|reply| with_reply_context(arguments, Some(reply)));
         let arguments = contextual_arguments.as_deref().unwrap_or(arguments);
         match command {
@@ -1301,15 +1437,25 @@ impl BotRunner {
                     bail!("Image generation is disabled by an administrator");
                 }
                 require_arguments(arguments, "/image <prompt>")?;
+                let image_capability = if attachment_flags(message).0 {
+                    "image_to_image"
+                } else {
+                    "text_to_image"
+                };
                 let generation_model = model_override.map_or(
-                    settings.selected_image_generation_model.as_str(),
+                    specialized_model(
+                        &settings,
+                        image_capability,
+                        &settings.selected_image_generation_model,
+                    ),
                     |override_| override_.model.as_str(),
                 );
                 let routing = model_override.map_or_else(
                     || {
                         settings
                             .model_routing
-                            .get("image_generation")
+                            .get(image_capability)
+                            .or_else(|| settings.model_routing.get("image_generation"))
                             .cloned()
                             .unwrap_or_default()
                     },
@@ -1462,11 +1608,28 @@ impl BotRunner {
                         "/speech <text>"
                     },
                 )?;
+                let audio_capability = if is_music {
+                    if attachment_flags(message).1 {
+                        "video_to_audio"
+                    } else {
+                        "text_to_audio"
+                    }
+                } else {
+                    "text_to_speech"
+                };
                 let generation_model = model_override.map_or(
                     if is_music {
-                        settings.selected_music_generation_model.as_str()
+                        specialized_model(
+                            &settings,
+                            audio_capability,
+                            &settings.selected_music_generation_model,
+                        )
                     } else {
-                        settings.selected_audio_generation_model.as_str()
+                        specialized_model(
+                            &settings,
+                            audio_capability,
+                            &settings.selected_audio_generation_model,
+                        )
                     },
                     |override_| override_.model.as_str(),
                 );
@@ -1474,10 +1637,13 @@ impl BotRunner {
                     || {
                         settings
                             .model_routing
-                            .get(if is_music {
-                                "music_generation"
-                            } else {
-                                "speech_generation"
+                            .get(audio_capability)
+                            .or_else(|| {
+                                settings.model_routing.get(if is_music {
+                                    "music_generation"
+                                } else {
+                                    "speech_generation"
+                                })
                             })
                             .or_else(|| {
                                 (!is_music)
@@ -1662,6 +1828,98 @@ impl BotRunner {
                     }
                 }
             }
+            "3d" | "vector" => {
+                let settings = self.store.settings(&self.bot.id).await?;
+                if !settings.capabilities.image {
+                    bail!("Visual generation is disabled by an administrator");
+                }
+                require_arguments(
+                    arguments,
+                    if command == "3d" {
+                        "3d <prompt>"
+                    } else {
+                        "vector <prompt>"
+                    },
+                )?;
+                let has_image = attachment_flags(message).0;
+                let capability = match (command, has_image) {
+                    ("3d", true) => "image_to_3d",
+                    ("3d", false) => "text_to_3d",
+                    ("vector", true) => "image_to_image_vector",
+                    ("vector", false) => "text_to_image_vector",
+                    _ => unreachable!(),
+                };
+                let model = model_override
+                    .map_or(specialized_model(&settings, capability, ""), |override_| {
+                        override_.model.as_str()
+                    });
+                if model.is_empty() {
+                    bail!("No model is selected for {capability}");
+                }
+                let routing = model_override.map_or_else(
+                    || {
+                        settings
+                            .model_routing
+                            .get(capability)
+                            .cloned()
+                            .unwrap_or_default()
+                    },
+                    |override_| ModelRouting {
+                        model_provider: override_.model_provider,
+                        ..ModelRouting::default()
+                    },
+                );
+                if routing.model_provider != ModelProvider::Fal {
+                    bail!(
+                        "3D and vector generation currently require a configured fal.ai endpoint"
+                    );
+                }
+                let guest_inline_id = if mode == MessageMode::Guest {
+                    Some(match guest_pending_id {
+                        Some(id) => id.to_owned(),
+                        None => {
+                            self.answer_guest_pending(message, "Generating the requested artifact")
+                                .await?
+                        }
+                    })
+                } else {
+                    None
+                };
+                let (progress, progress_task) = if let Some(inline_id) = guest_inline_id.as_deref()
+                {
+                    self.begin_guest_progress(message, inline_id, "Preparing artifact generation")
+                } else {
+                    self.begin_chat_progress(message, "Preparing artifact generation")
+                        .await?
+                };
+                let references = self.collect_media(message, arguments).await?;
+                let key = self.model_api_key(ModelProvider::Fal).await?;
+                let _ = progress.send(ProgressUpdate::generation(
+                    if command == "3d" { "3d" } else { "vector" },
+                    model,
+                    arguments,
+                ));
+                let result = self
+                    .openrouter
+                    .generate_fal_artifact(arguments, &references, model, capability, &key)
+                    .await;
+                drop(progress);
+                let _ = progress_task.await;
+                let file = result?;
+                if let Some(inline_id) = guest_inline_id.as_deref() {
+                    self.edit_guest_document(inline_id, file.bytes, &file.filename)
+                        .await?;
+                } else {
+                    self.send_document_bytes(
+                        message.chat.id,
+                        message.message_thread_id,
+                        &file.filename,
+                        &file.bytes,
+                        Some(message.message_id),
+                    )
+                    .await?;
+                }
+            }
             "transcribe" => {
                 let settings = self.store.settings(&self.bot.id).await?;
                 if !settings.capabilities.transcription {
@@ -1716,15 +1974,28 @@ impl BotRunner {
                     bail!("Video generation is disabled by an administrator");
                 }
                 require_arguments(arguments, "/video <prompt>")?;
+                let flags = attachment_flags(message);
+                let video_capability = if flags.1 {
+                    "video_to_video"
+                } else if flags.0 {
+                    "image_to_video"
+                } else {
+                    "text_to_video"
+                };
                 let generation_model = model_override.map_or(
-                    settings.selected_video_generation_model.as_str(),
+                    specialized_model(
+                        &settings,
+                        video_capability,
+                        &settings.selected_video_generation_model,
+                    ),
                     |override_| override_.model.as_str(),
                 );
                 let routing = model_override.map_or_else(
                     || {
                         settings
                             .model_routing
-                            .get("video_generation")
+                            .get(video_capability)
+                            .or_else(|| settings.model_routing.get("video_generation"))
                             .cloned()
                             .unwrap_or_default()
                     },
@@ -2865,18 +3136,24 @@ impl BotRunner {
                 let data = self.download_telegram_file(&photo.file_id).await?;
                 inputs.push(MediaInput::Image {
                     url: data_url("image/jpeg", &data),
+                    width: Some(photo.width),
+                    height: Some(photo.height),
                 });
             }
             if let Some(video) = &source.video {
                 let data = self.download_telegram_file(&video.file_id).await?;
                 inputs.push(MediaInput::Video {
                     url: data_url(video.mime_type.as_deref().unwrap_or("video/mp4"), &data),
+                    width: Some(video.width),
+                    height: Some(video.height),
                 });
             }
             if let Some(video) = &source.video_note {
                 let data = self.download_telegram_file(&video.file_id).await?;
                 inputs.push(MediaInput::Video {
                     url: data_url("video/mp4", &data),
+                    width: Some(video.length),
+                    height: Some(video.length),
                 });
             }
             if let Some(voice) = &source.voice {
@@ -2904,10 +3181,14 @@ impl BotRunner {
                     if mime.starts_with("image/") {
                         inputs.push(MediaInput::Image {
                             url: data_url(mime, &data),
+                            width: document.thumbnail.as_ref().map(|item| item.width),
+                            height: document.thumbnail.as_ref().map(|item| item.height),
                         });
                     } else if mime.starts_with("video/") {
                         inputs.push(MediaInput::Video {
                             url: data_url(mime, &data),
+                            width: document.thumbnail.as_ref().map(|item| item.width),
+                            height: document.thumbnail.as_ref().map(|item| item.height),
                         });
                     } else {
                         inputs.push(MediaInput::Audio {
@@ -2928,18 +3209,24 @@ impl BotRunner {
                 let data = self.download_telegram_file(&photo.file_id).await?;
                 inputs.push(MediaInput::Image {
                     url: data_url("image/jpeg", &data),
+                    width: Some(photo.width),
+                    height: Some(photo.height),
                 });
             }
             if let Some(video) = &source.video {
                 let data = self.download_telegram_file(&video.file_id).await?;
                 inputs.push(MediaInput::Video {
                     url: data_url(video.mime_type.as_deref().unwrap_or("video/mp4"), &data),
+                    width: Some(video.width),
+                    height: Some(video.height),
                 });
             }
             if let Some(video) = &source.video_note {
                 let data = self.download_telegram_file(&video.file_id).await?;
                 inputs.push(MediaInput::Video {
                     url: data_url("video/mp4", &data),
+                    width: Some(video.length),
+                    height: Some(video.length),
                 });
             }
             if let Some(voice) = &source.voice {
@@ -2967,10 +3254,14 @@ impl BotRunner {
                     if mime.starts_with("image/") {
                         inputs.push(MediaInput::Image {
                             url: data_url(mime, &data),
+                            width: document.thumbnail.as_ref().map(|item| item.width),
+                            height: document.thumbnail.as_ref().map(|item| item.height),
                         });
                     } else if mime.starts_with("video/") {
                         inputs.push(MediaInput::Video {
                             url: data_url(mime, &data),
+                            width: document.thumbnail.as_ref().map(|item| item.width),
+                            height: document.thumbnail.as_ref().map(|item| item.height),
                         });
                     } else {
                         inputs.push(MediaInput::Audio {
@@ -2988,7 +3279,11 @@ impl BotRunner {
             .capabilities
             .youtube;
         if youtube_enabled && let Some(url) = youtube_url(text) {
-            inputs.push(MediaInput::Video { url });
+            inputs.push(MediaInput::Video {
+                url,
+                width: None,
+                height: None,
+            });
         }
         Ok(inputs)
     }
@@ -3025,14 +3320,22 @@ impl BotRunner {
                         self.config.resolved_model("video_understanding", model_id)
                     }
                     ModelProvider::Aihub => self.config.resolved_aihub_model(model_id),
-                    ModelProvider::Fal => {
-                        bail!("Fal endpoints cannot be used for video understanding")
-                    }
+                    ModelProvider::Fal => ModelConfig {
+                        id: model_id.clone(),
+                        label: None,
+                        options: OpenRouterOptions::default(),
+                    },
                 };
                 let key = self.model_api_key(routing.model_provider).await?;
                 let description = self
                     .openrouter
-                    .describe_generation_media(&model, &videos, &routing, &key)
+                    .describe_generation_media(
+                        &model,
+                        &videos,
+                        "Describe this reference media faithfully for downstream generation.",
+                        &routing,
+                        &key,
+                    )
                     .await?;
                 supplements.push(format!("Reference video description:\n{description}"));
             }
@@ -3748,6 +4051,19 @@ fn attachment_flags(message: &Message) -> (bool, bool, bool) {
     (image, video, audio)
 }
 
+fn specialized_model<'a>(
+    settings: &'a crate::db::BotSettings,
+    capability: &str,
+    legacy_fallback: &'a str,
+) -> &'a str {
+    settings
+        .specialized_generation_models
+        .get(capability)
+        .filter(|model| !model.is_empty())
+        .map(String::as_str)
+        .unwrap_or(legacy_fallback)
+}
+
 fn should_route_to_upgrade_model(
     has_admin_override: bool,
     current_capability: &str,
@@ -3918,6 +4234,8 @@ Ask me a question directly. I can use live web search when the selected model de
 - `/music <prompt>` — generate music or other non-speech audio
 - `/transcribe` — transcribe an attached/replied-to voice note or audio file
 - `/video <prompt>` — generate a video
+- `/3d <prompt>` — generate a 3D artifact (fal.ai endpoint required)
+- `/vector <prompt>` — generate vector art delivered as a safe HTML file
 - `/admin` — open the admin panel (administrators only)
 - `/allow <id>` — add a user to this bot's answer allowlist (administrators only)
 - `/deny <id>` — deny a user while retaining a disabled entry (administrators only)
@@ -3968,6 +4286,8 @@ mod tests {
             "/music",
             "/transcribe",
             "/video",
+            "/3d",
+            "/vector",
             "/admin",
             "/allow",
             "/deny",

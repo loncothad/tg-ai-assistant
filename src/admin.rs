@@ -251,8 +251,16 @@ fn model_endpoints_url(base_url: &str, model: &str, capability: &str) -> Result<
             .path_segments_mut()
             .map_err(|_| eyre::eyre!("OpenRouter base URL cannot contain path segments"))?;
         segments.pop_if_empty().push("models");
-        if capability == "image_generation" {
+        if matches!(
+            capability,
+            "image_generation" | "text_to_image" | "image_to_image"
+        ) {
             segments.pop().push("images").push("models");
+        } else if matches!(
+            capability,
+            "video_generation" | "text_to_video" | "image_to_video" | "video_to_video"
+        ) {
+            segments.pop().push("videos").push("models");
         }
         for segment in model.split('/') {
             segments.push(segment);
@@ -339,13 +347,11 @@ async fn set_model(
             | "output_processing"
             | "error_processing"
             | "model_upgrade"
-            | "image_understanding"
-            | "video_understanding"
     ) && form.model_provider == ModelProvider::Fal
     {
         return message(
             StatusCode::BAD_REQUEST,
-            "Fal endpoints are available only for generation and transcription capabilities",
+            "Fal endpoints are not general chat or intent-processing models",
         );
     }
     if matches!(
@@ -894,42 +900,13 @@ async fn render_html(state: &AdminState, bot: &str) -> Result<String> {
             &settings.selected_image_understanding_model,
             &route("image_understanding"),
             &configured,
-            chat_provider_ready,
+            any_model_provider_ready,
         ),
         model_form(
             "Video understanding",
             "video_understanding",
             &settings.selected_video_understanding_model,
             &route("video_understanding"),
-            &configured,
-            chat_provider_ready,
-        ),
-        model_form(
-            "Image generation",
-            "image_generation",
-            &settings.selected_image_generation_model,
-            &route("image_generation"),
-            &configured,
-            any_model_provider_ready,
-        ),
-        model_form(
-            "Speech generation",
-            "speech_generation",
-            &settings.selected_audio_generation_model,
-            &settings
-                .model_routing
-                .get("speech_generation")
-                .cloned()
-                .or_else(|| settings.model_routing.get("audio_generation").cloned())
-                .unwrap_or_default(),
-            &configured,
-            any_model_provider_ready,
-        ),
-        model_form(
-            "Music generation",
-            "music_generation",
-            &settings.selected_music_generation_model,
-            &route("music_generation"),
             &configured,
             any_model_provider_ready,
         ),
@@ -941,13 +918,101 @@ async fn render_html(state: &AdminState, bot: &str) -> Result<String> {
             &configured,
             any_model_provider_ready,
         ),
-        model_form(
-            "Video generation",
-            "video_generation",
-            &settings.selected_video_generation_model,
-            &route("video_generation"),
+        specialized_model_form(
+            &settings,
+            "Text → image",
+            "text_to_image",
+            &settings.selected_image_generation_model,
             &configured,
             any_model_provider_ready,
+        ),
+        specialized_model_form(
+            &settings,
+            "Image → image",
+            "image_to_image",
+            &settings.selected_image_generation_model,
+            &configured,
+            any_model_provider_ready,
+        ),
+        specialized_model_form(
+            &settings,
+            "Text → video",
+            "text_to_video",
+            &settings.selected_video_generation_model,
+            &configured,
+            any_model_provider_ready,
+        ),
+        specialized_model_form(
+            &settings,
+            "Image → video",
+            "image_to_video",
+            &settings.selected_video_generation_model,
+            &configured,
+            any_model_provider_ready,
+        ),
+        specialized_model_form(
+            &settings,
+            "Video → video",
+            "video_to_video",
+            &settings.selected_video_generation_model,
+            &configured,
+            any_model_provider_ready,
+        ),
+        specialized_model_form(
+            &settings,
+            "Text → audio",
+            "text_to_audio",
+            &settings.selected_music_generation_model,
+            &configured,
+            any_model_provider_ready,
+        ),
+        specialized_model_form(
+            &settings,
+            "Video → audio",
+            "video_to_audio",
+            &settings.selected_music_generation_model,
+            &configured,
+            any_model_provider_ready,
+        ),
+        specialized_model_form(
+            &settings,
+            "Text → speech",
+            "text_to_speech",
+            &settings.selected_audio_generation_model,
+            &configured,
+            any_model_provider_ready,
+        ),
+        specialized_model_form(
+            &settings,
+            "Image → 3D",
+            "image_to_3d",
+            "",
+            &configured,
+            fal_ready,
+        ),
+        specialized_model_form(
+            &settings,
+            "Text → 3D",
+            "text_to_3d",
+            "",
+            &configured,
+            fal_ready,
+        ),
+        specialized_model_form(
+            &settings,
+            "Text → image (vector HTML)",
+            "text_to_image_vector",
+            "",
+            &configured,
+            fal_ready,
+        ),
+        specialized_model_form(
+            &settings,
+            "Image → image (vector HTML)",
+            "image_to_image_vector",
+            "",
+            &configured,
+            fal_ready,
         ),
     ]
     .join("");
@@ -1050,6 +1115,52 @@ async fn render_html(state: &AdminState, bot: &str) -> Result<String> {
     ))
 }
 
+fn specialized_model_form(
+    settings: &crate::db::BotSettings,
+    label: &str,
+    capability: &str,
+    legacy_fallback: &str,
+    configured: &BTreeMap<&str, bool>,
+    available: bool,
+) -> String {
+    let selected = settings
+        .specialized_generation_models
+        .get(capability)
+        .map(String::as_str)
+        .unwrap_or(legacy_fallback);
+    let routing = settings
+        .model_routing
+        .get(capability)
+        .cloned()
+        .unwrap_or_else(|| {
+            if matches!(
+                capability,
+                "image_to_3d" | "text_to_3d" | "text_to_image_vector" | "image_to_image_vector"
+            ) {
+                return ModelRouting {
+                    model_provider: ModelProvider::Fal,
+                    ..ModelRouting::default()
+                };
+            }
+            let legacy = match capability {
+                "text_to_image"
+                | "image_to_image"
+                | "text_to_image_vector"
+                | "image_to_image_vector" => "image_generation",
+                "text_to_video" | "image_to_video" | "video_to_video" => "video_generation",
+                "text_to_speech" => "speech_generation",
+                "text_to_audio" | "video_to_audio" => "music_generation",
+                _ => capability,
+            };
+            settings
+                .model_routing
+                .get(legacy)
+                .cloned()
+                .unwrap_or_default()
+        });
+    model_form(label, capability, selected, &routing, configured, available)
+}
+
 fn model_form(
     label: &str,
     capability: &str,
@@ -1144,19 +1255,19 @@ fn model_allowed_fallback(config: &Config, capability: &str, id: &str) -> bool {
             .models
             .iter()
             .any(|model| model.id == id),
-        "image_generation" => config
+        "image_generation" | "text_to_image" | "image_to_image" => config
             .openrouter
             .image
             .models
             .iter()
             .any(|model| model.id == id),
-        "audio_generation" | "speech_generation" => config
+        "audio_generation" | "speech_generation" | "text_to_speech" => config
             .openrouter
             .audio
             .models
             .iter()
             .any(|model| model.id == id),
-        "music_generation" => config
+        "music_generation" | "text_to_audio" | "video_to_audio" => config
             .openrouter
             .music
             .models
@@ -1168,7 +1279,7 @@ fn model_allowed_fallback(config: &Config, capability: &str, id: &str) -> bool {
             .models
             .iter()
             .any(|model| model.id == id),
-        "video_generation" => config
+        "video_generation" | "text_to_video" | "image_to_video" | "video_to_video" => config
             .openrouter
             .video
             .models

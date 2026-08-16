@@ -23,6 +23,75 @@ const STATE: TableDefinition<&str, &[u8]> = TableDefinition::new("state");
 const ACCESS: TableDefinition<&str, u8> = TableDefinition::new("access");
 const SECRETS: TableDefinition<&str, &[u8]> = TableDefinition::new("secrets");
 
+const SPECIALIZED_GENERATION_CAPABILITIES: [&str; 12] = [
+    "text_to_image",
+    "image_to_image",
+    "text_to_video",
+    "image_to_video",
+    "video_to_video",
+    "text_to_audio",
+    "video_to_audio",
+    "text_to_speech",
+    "image_to_3d",
+    "text_to_3d",
+    "text_to_image_vector",
+    "image_to_image_vector",
+];
+
+fn default_generation_models(config: &Config) -> BTreeMap<String, String> {
+    SPECIALIZED_GENERATION_CAPABILITIES
+        .into_iter()
+        .map(|capability| {
+            let configured_fal = config
+                .fal
+                .endpoints
+                .iter()
+                .find(|endpoint| endpoint.capabilities.iter().any(|item| item == capability))
+                .map(|endpoint| endpoint.id.clone());
+            let fallback = match capability {
+                "text_to_image" | "image_to_image" => config.openrouter.image.model.clone(),
+                "text_to_video" | "image_to_video" | "video_to_video" => {
+                    config.openrouter.video.model.clone()
+                }
+                "text_to_speech" => config.openrouter.audio.model.clone(),
+                "text_to_audio" | "video_to_audio" => config.openrouter.music.model.clone(),
+                // 3D/vector are schema-specific fal endpoints. An empty value
+                // makes missing setup explicit instead of choosing a raster model.
+                "image_to_3d" | "text_to_3d" | "text_to_image_vector" | "image_to_image_vector" => {
+                    configured_fal.unwrap_or_default()
+                }
+                _ => unreachable!(),
+            };
+            (capability.to_owned(), fallback)
+        })
+        .collect()
+}
+
+fn default_generation_routing(config: &Config) -> BTreeMap<String, ModelRouting> {
+    SPECIALIZED_GENERATION_CAPABILITIES
+        .into_iter()
+        .filter(|capability| {
+            matches!(
+                *capability,
+                "image_to_3d" | "text_to_3d" | "text_to_image_vector" | "image_to_image_vector"
+            ) && config
+                .fal
+                .endpoints
+                .iter()
+                .any(|endpoint| endpoint.capabilities.iter().any(|item| item == capability))
+        })
+        .map(|capability| {
+            (
+                capability.to_owned(),
+                ModelRouting {
+                    model_provider: ModelProvider::Fal,
+                    ..ModelRouting::default()
+                },
+            )
+        })
+        .collect()
+}
+
 #[derive(Clone)]
 pub struct Store {
     db: Arc<Database>,
@@ -109,6 +178,10 @@ pub struct BotSettings {
     pub selected_transcription_model: String,
     #[serde(default)]
     pub selected_video_generation_model: String,
+    /// Per-input/output generation models.  Kept as a map so newly introduced
+    /// provider modalities do not require a redb schema migration.
+    #[serde(default)]
+    pub specialized_generation_models: BTreeMap<String, String>,
     #[serde(default)]
     pub model_routing: BTreeMap<String, ModelRouting>,
     pub search_provider: Option<String>,
@@ -199,7 +272,8 @@ impl Store {
                     selected_music_generation_model: config.openrouter.music.model.clone(),
                     selected_transcription_model: config.openrouter.transcription.model.clone(),
                     selected_video_generation_model: config.openrouter.video.model.clone(),
-                    model_routing: BTreeMap::new(),
+                    specialized_generation_models: default_generation_models(config),
+                    model_routing: default_generation_routing(config),
                     search_provider: None,
                     capabilities: Capabilities::default(),
                     custom_system_prompt: None,
@@ -268,6 +342,29 @@ impl Store {
             settings.selected_model.clone_from(&bot.default_model);
             changed = true;
         }
+        for (capability, fallback) in default_generation_models(config) {
+            if fallback.is_empty() {
+                continue;
+            }
+            if settings
+                .specialized_generation_models
+                .get(&capability)
+                .is_none_or(String::is_empty)
+            {
+                settings
+                    .specialized_generation_models
+                    .insert(capability, fallback);
+                changed = true;
+            }
+        }
+        for (capability, routing) in default_generation_routing(config) {
+            if let std::collections::btree_map::Entry::Vacant(entry) =
+                settings.model_routing.entry(capability)
+            {
+                entry.insert(routing);
+                changed = true;
+            }
+        }
         if changed {
             self.save_settings(&bot.id, &settings).await?;
         }
@@ -335,6 +432,11 @@ impl Store {
             "music_generation" => settings.selected_music_generation_model = model.into(),
             "transcription" => settings.selected_transcription_model = model.into(),
             "video_generation" => settings.selected_video_generation_model = model.into(),
+            capability if crate::catalog::is_specialized_generation_capability(capability) => {
+                settings
+                    .specialized_generation_models
+                    .insert(capability.into(), model.into());
+            }
             _ => bail!("Unknown model capability: {capability}"),
         }
         settings.model_routing.insert(capability.into(), routing);
@@ -731,6 +833,7 @@ mod tests {
                         selected_music_generation_model: "music".into(),
                         selected_transcription_model: "stt".into(),
                         selected_video_generation_model: "video".into(),
+                        specialized_generation_models: BTreeMap::new(),
                         model_routing: BTreeMap::new(),
                         search_provider: None,
                         capabilities: Capabilities::default(),

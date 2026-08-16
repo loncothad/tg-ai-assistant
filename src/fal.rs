@@ -155,15 +155,14 @@ impl FalClient {
         endpoint
             .output_text_paths
             .iter()
-            .filter_map(|path| result.pointer(path).and_then(Value::as_str))
+            .filter_map(|path| result.pointer(path).and_then(render_text_value))
             .find(|text| !text.trim().is_empty())
             .or_else(|| {
                 ["/text", "/transcript", "/output/text", "/data/text"]
                     .into_iter()
-                    .filter_map(|path| result.pointer(path).and_then(Value::as_str))
+                    .filter_map(|path| result.pointer(path).and_then(render_text_value))
                     .find(|text| !text.trim().is_empty())
             })
-            .map(str::to_owned)
     }
 
     pub async fn download(&self, url: &str) -> Result<(Vec<u8>, String)> {
@@ -197,6 +196,15 @@ impl FalClient {
                 .to_vec(),
             media_type,
         ))
+    }
+}
+
+fn render_text_value(value: &Value) -> Option<String> {
+    match value {
+        Value::Null => None,
+        Value::String(text) => Some(text.clone()),
+        Value::Bool(_) | Value::Number(_) => Some(value.to_string()),
+        Value::Array(_) | Value::Object(_) => serde_json::to_string_pretty(value).ok(),
     }
 }
 
@@ -313,5 +321,15 @@ mod tests {
             &mut urls,
         );
         assert_eq!(urls, ["https://cdn.example/a.png"]);
+    }
+
+    #[test]
+    fn vision_outputs_can_be_structured_or_scalar_json() {
+        assert_eq!(
+            render_text_value(&serde_json::json!(true)).as_deref(),
+            Some("true")
+        );
+        let object = render_text_value(&serde_json::json!({"label":"sfw","score":0.99})).unwrap();
+        assert!(object.contains("\"label\": \"sfw\""));
     }
 }

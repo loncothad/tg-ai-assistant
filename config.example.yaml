@@ -48,9 +48,12 @@ fal:
       base_url: null
       name: "FLUX Schnell (fal.ai)"
       description: "Fast text-to-image generation through fal.ai."
-      capabilities: ["image_generation"]
+      capabilities: ["text_to_image", "image_to_image"]
       prompt_field: "prompt"
       image_field: "image_url"
+      width_field: "width"
+      height_field: "height"
+      aspect_ratio_field: null
       output_url_paths: ["/images/0/url"]
       output_text_paths: []
       defaults:
@@ -68,6 +71,25 @@ fal:
     #   output_text_paths: []
     #   defaults: {}
     #   created: null
+    # Vision endpoints return text/JSON and must explicitly declare the kind of
+    # understanding they provide. A classifier such as an NSFW detector should
+    # only be selected if that narrow output is what the bot administrator wants.
+    # - id: "fal-ai/x-ailab/nsfw"
+    #   base_url: null
+    #   name: "NSFW image classifier"
+    #   description: "Schema-configured fal.ai vision endpoint."
+    #   capabilities: ["image_understanding"]
+    #   prompt_field: ""
+    #   image_field: "image_urls"
+    #   output_url_paths: []
+    #   output_text_paths: ["/has_nsfw_concepts"]
+    #   defaults: {}
+    #   created: null
+    # Specialized generation capability names are: text_to_image,
+    # image_to_image, text_to_video, image_to_video, video_to_video,
+    # text_to_audio, video_to_audio, text_to_speech, text_to_3d, image_to_3d,
+    # text_to_image_vector, and image_to_image_vector. Vector endpoints must
+    # return SVG; Teleforge wraps it in a standalone HTML document.
     # - id: "fal-ai/your-transcription-endpoint"
     #   base_url: null
     #   name: "Configured transcription endpoint"
@@ -239,7 +261,8 @@ openrouter:
         label: "GPT Image 1"
         extra:
           quality: "high"
-    size: "1024x1024"
+    # Size is intentionally omitted: explicit prompt geometry or reference-media
+    # geometry is used; otherwise the selected provider chooses its native best.
     extra:
       n: 1
 
@@ -292,8 +315,7 @@ openrouter:
         label: "Veo 3.1"
         extra: {}
     duration: 8
-    aspect_ratio: "16:9"
-    resolution: "720p"
+    # aspect_ratio/resolution are intentionally omitted for the same reason.
     poll_interval_seconds: 15
     timeout_seconds: 600
     generate_audio: false

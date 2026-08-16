@@ -144,6 +144,14 @@ pub struct FalEndpointConfig {
     pub audio_field: Option<String>,
     #[serde(default)]
     pub language_field: Option<String>,
+    /// Optional endpoint-specific geometry mappings. They are populated only
+    /// from an explicit user request or reference-media metadata.
+    #[serde(default)]
+    pub width_field: Option<String>,
+    #[serde(default)]
+    pub height_field: Option<String>,
+    #[serde(default)]
+    pub aspect_ratio_field: Option<String>,
     /// JSON pointer candidates for media URLs in the result.
     #[serde(default)]
     pub output_url_paths: Vec<String>,
@@ -454,6 +462,8 @@ pub struct OpenRouterOptions {
 pub struct MediaModelConfig {
     pub model: String,
     pub models: Vec<ModelChoice>,
+    /// Legacy compatibility field. Runtime geometry is never taken from this
+    /// default; it comes from the request/reference or remains provider-auto.
     #[serde(default = "default_image_size")]
     pub size: String,
     #[serde(default)]
@@ -523,8 +533,10 @@ pub struct VideoModelConfig {
     pub models: Vec<ModelChoice>,
     #[serde(default = "default_video_duration")]
     pub duration: u64,
+    /// Legacy compatibility field; ignored by generation requests.
     #[serde(default = "default_aspect_ratio")]
     pub aspect_ratio: String,
+    /// Legacy compatibility field; ignored by generation requests.
     #[serde(default = "default_video_resolution")]
     pub resolution: String,
     #[serde(default = "default_video_poll")]
@@ -748,10 +760,58 @@ impl Config {
                             | "music_generation"
                             | "transcription"
                             | "video_generation"
+                            | "text_to_image"
+                            | "image_to_image"
+                            | "text_to_video"
+                            | "image_to_video"
+                            | "video_to_video"
+                            | "text_to_audio"
+                            | "video_to_audio"
+                            | "text_to_speech"
+                            | "text_to_3d"
+                            | "image_to_3d"
+                            | "text_to_image_vector"
+                            | "image_to_image_vector"
+                            | "image_understanding"
+                            | "video_understanding"
                     )
                 })
             {
                 bail!("Fal endpoint {} has an unsupported capability", endpoint.id);
+            }
+            if endpoint.capabilities.iter().any(|value| {
+                matches!(
+                    value.as_str(),
+                    "image_to_image"
+                        | "image_to_video"
+                        | "image_to_3d"
+                        | "image_to_image_vector"
+                        | "image_understanding"
+                )
+            }) && endpoint.image_field.is_none()
+            {
+                bail!("Fal endpoint {} requires image_field", endpoint.id);
+            }
+            if endpoint.capabilities.iter().any(|value| {
+                matches!(
+                    value.as_str(),
+                    "video_to_video" | "video_to_audio" | "video_understanding"
+                )
+            }) && endpoint.video_field.is_none()
+            {
+                bail!("Fal endpoint {} requires video_field", endpoint.id);
+            }
+            if endpoint.capabilities.iter().any(|value| {
+                matches!(
+                    value.as_str(),
+                    "image_understanding" | "video_understanding"
+                )
+            }) && endpoint.output_text_paths.is_empty()
+            {
+                bail!(
+                    "Fal vision endpoint {} requires output_text_paths",
+                    endpoint.id
+                );
             }
             if endpoint
                 .capabilities

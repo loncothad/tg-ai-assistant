@@ -109,6 +109,8 @@ pub enum WorkflowStep {
     SpeechGeneration,
     MusicGeneration,
     VideoGeneration,
+    ThreeDGeneration,
+    VectorGeneration,
     FileDelivery,
 }
 
@@ -173,7 +175,9 @@ impl RequestPlan {
             | PlannedAction::GenerateSpeech
             | PlannedAction::GenerateMusic
             | PlannedAction::GenerateAudio
-            | PlannedAction::GenerateVideo => Some(self.action),
+            | PlannedAction::GenerateVideo
+            | PlannedAction::Generate3d
+            | PlannedAction::GenerateVector => Some(self.action),
             PlannedAction::Chat | PlannedAction::GenerateCode => {
                 let generations = self
                     .skills
@@ -185,6 +189,8 @@ impl RequestPlan {
                         }
                         PlannedSkill::MusicGeneration => Some(PlannedAction::GenerateMusic),
                         PlannedSkill::VideoGeneration => Some(PlannedAction::GenerateVideo),
+                        PlannedSkill::ThreeDGeneration => Some(PlannedAction::Generate3d),
+                        PlannedSkill::VectorGeneration => Some(PlannedAction::GenerateVector),
                         _ => None,
                     })
                     .collect::<SmallVec<[_; 2]>>();
@@ -341,6 +347,8 @@ pub enum PlannedAction {
     /// Backward-compatible planner alias for speech generation.
     GenerateAudio,
     GenerateVideo,
+    Generate3d,
+    GenerateVector,
     Refuse,
 }
 
@@ -356,6 +364,8 @@ pub enum PlannedSkill {
     /// Backward-compatible planner alias for speech generation.
     AudioGeneration,
     VideoGeneration,
+    ThreeDGeneration,
+    VectorGeneration,
     ImageUnderstanding,
     VideoUnderstanding,
     Transcription,
@@ -375,6 +385,8 @@ impl PlannedSkill {
             Self::MusicGeneration => "music_generation",
             Self::AudioGeneration => "audio_generation",
             Self::VideoGeneration => "video_generation",
+            Self::ThreeDGeneration => "three_d_generation",
+            Self::VectorGeneration => "vector_generation",
             Self::ImageUnderstanding => "image_understanding",
             Self::VideoUnderstanding => "video_understanding",
             Self::Transcription => "transcription",
@@ -423,9 +435,20 @@ pub struct GenerationPromptContext<'a> {
 /// Private media downloaded from Telegram or a public video URL supplied by a user.
 #[derive(Clone, Debug)]
 pub enum MediaInput {
-    Image { url: String },
-    Video { url: String },
-    Audio { data: String, format: String },
+    Image {
+        url: String,
+        width: Option<u32>,
+        height: Option<u32>,
+    },
+    Video {
+        url: String,
+        width: Option<u32>,
+        height: Option<u32>,
+    },
+    Audio {
+        data: String,
+        format: String,
+    },
 }
 
 /// Complete, explicitly scoped input for one model-driven assistant turn.
@@ -455,6 +478,8 @@ pub struct ToolModels<'a> {
     pub music_generation: ToolModel<'a>,
     pub transcription: ToolModel<'a>,
     pub video_generation: ToolModel<'a>,
+    pub three_d_generation: ToolModel<'a>,
+    pub vector_generation: ToolModel<'a>,
 }
 
 /// Provider-qualified model and credential used by a model-callable media tool.
@@ -498,9 +523,27 @@ impl OpenRouter {
         &self,
         model: &ModelConfig,
         media: &[MediaInput],
+        request: &str,
         routing: &ModelRouting,
         api_key: &str,
     ) -> Result<String> {
+        if routing.model_provider == ModelProvider::Fal {
+            let capability = if media
+                .iter()
+                .any(|item| matches!(item, MediaInput::Video { .. }))
+            {
+                "video_understanding"
+            } else {
+                "image_understanding"
+            };
+            let endpoint = self.fal.endpoint(&model.id, capability)?;
+            let input = fal_input(endpoint, request, media, None)?;
+            let result = self.fal.run(endpoint, input, api_key).await?;
+            return self
+                .fal
+                .text(endpoint, &result)
+                .context("Fal vision endpoint returned no configured text output");
+        }
         let mut body = Map::new();
         apply_options(&mut body, &self.config.defaults);
         apply_options(&mut body, &model.options);
@@ -515,7 +558,7 @@ impl OpenRouter {
                 },
                 {
                     "role":"user",
-                    "content":generation_user_content("Describe this reference media.", media)
+                    "content":generation_user_content(request, media)
                 }
             ]),
         );
@@ -549,12 +592,12 @@ impl OpenRouter {
             "properties": {
                 "action": {
                     "type": "string",
-                    "enum": ["chat", "generate_code", "transcribe", "generate_image", "generate_speech", "generate_music", "generate_audio", "generate_video", "refuse"],
-                    "description": "Use transcribe for an exact transcript, lyrics, subtitles, or verbatim spoken/sung words from supplied audio/video. Use chat with transcription for summaries, analysis, translation, or questions about media. Use generate_speech for narration or text-to-speech, generate_music for songs or non-speech audio, and generate_audio only as a backward-compatible alias for generate_speech. Use generate_code for software artifacts and chat for ordinary prose."
+                    "enum": ["chat", "generate_code", "transcribe", "generate_image", "generate_speech", "generate_music", "generate_audio", "generate_video", "generate_3d", "generate_vector", "refuse"],
+                    "description": "Use transcribe for exact spoken/sung words. Use generate_speech for text-to-speech, generate_music for text/video-to-audio, generate_3d for text/image-to-3D, and generate_vector for text/image-to-vector HTML. Use generate_code for software artifacts and chat for ordinary prose."
                 },
                 "skills": {
                     "type": "array",
-                    "items": {"type":"string", "enum": ["generate_code", "search", "web_fetch", "image_generation", "speech_generation", "music_generation", "audio_generation", "video_generation", "image_understanding", "video_understanding", "transcription", "file_delivery", "model_upgrade", "prompt_expansion"]},
+                    "items": {"type":"string", "enum": ["generate_code", "search", "web_fetch", "image_generation", "speech_generation", "music_generation", "audio_generation", "video_generation", "three_d_generation", "vector_generation", "image_understanding", "video_understanding", "transcription", "file_delivery", "model_upgrade", "prompt_expansion"]},
                     "description": "Include model_upgrade whenever the user explicitly asks to use the smarter, advanced, intelligent, stronger, better, or upgrade model, even if the underlying request is routine. Otherwise include it only when the request genuinely benefits from deeper reasoning. Include prompt_expansion only when the user explicitly asks to expand, enrich, improve, or add detail to a prompt."
                 },
                 "delivery": {
@@ -574,7 +617,7 @@ impl OpenRouter {
                     "type": "array",
                     "items": {
                         "type": "string",
-                        "enum": ["compose_text", "search", "web_fetch", "transcription", "image_understanding", "video_understanding", "image_generation", "speech_generation", "music_generation", "video_generation", "file_delivery"]
+                        "enum": ["compose_text", "search", "web_fetch", "transcription", "image_understanding", "video_understanding", "image_generation", "speech_generation", "music_generation", "video_generation", "three_d_generation", "vector_generation", "file_delivery"]
                     },
                     "description": "Ordered operations for an explicit compound request whose earlier result must feed a later operation. Use [] for single-stage requests. Example: writing original lyrics and then generating a song is [compose_text, music_generation]."
                 }
@@ -948,6 +991,10 @@ impl OpenRouter {
                         .iter()
                         .any(|item| matches!(item, MediaInput::Audio { .. })),
                     openrouter_server_tools: model_provider == ModelProvider::Openrouter,
+                    three_d_ready: !tool_models.three_d_generation.model.is_empty()
+                        && !tool_models.three_d_generation.api_key.is_empty(),
+                    vector_ready: !tool_models.vector_generation.model.is_empty()
+                        && !tool_models.vector_generation.api_key.is_empty(),
                 },
             );
             report_progress(&progress, "Waiting for the selected AI model");
@@ -1018,6 +1065,8 @@ impl OpenRouter {
                         | "generate_audio"
                         | "generate_music"
                         | "generate_video"
+                        | "generate_3d"
+                        | "generate_vector"
                 ) {
                     if generation_prompt.allow_composed_output {
                         report_progress(&progress, "Preparing the next workflow step");
@@ -1187,6 +1236,68 @@ impl OpenRouter {
                                     prompt: prompt.to_owned(),
                                 });
                                 json!({"status":"completed","videos":1}).to_string()
+                            }
+                            Err(error) => json!({"error":error.to_string()}).to_string(),
+                        }
+                    }
+                    "generate_3d" if capabilities.image => {
+                        let prompt = media_prompt
+                            .as_deref()
+                            .unwrap_or(generation_prompt.current_request);
+                        report_generation_progress(
+                            &progress,
+                            "3d",
+                            tool_models.three_d_generation.model,
+                            prompt,
+                        );
+                        match self
+                            .generate_fal_artifact(
+                                prompt,
+                                media,
+                                tool_models.three_d_generation.model,
+                                if generation_prompt.has_image {
+                                    "image_to_3d"
+                                } else {
+                                    "text_to_3d"
+                                },
+                                tool_models.three_d_generation.api_key,
+                            )
+                            .await
+                        {
+                            Ok(value) => {
+                                generated_files.push(value);
+                                json!({"status":"completed","files":1}).to_string()
+                            }
+                            Err(error) => json!({"error":error.to_string()}).to_string(),
+                        }
+                    }
+                    "generate_vector" if capabilities.image => {
+                        let prompt = media_prompt
+                            .as_deref()
+                            .unwrap_or(generation_prompt.current_request);
+                        report_generation_progress(
+                            &progress,
+                            "vector",
+                            tool_models.vector_generation.model,
+                            prompt,
+                        );
+                        match self
+                            .generate_fal_artifact(
+                                prompt,
+                                media,
+                                tool_models.vector_generation.model,
+                                if generation_prompt.has_image {
+                                    "image_to_image_vector"
+                                } else {
+                                    "text_to_image_vector"
+                                },
+                                tool_models.vector_generation.api_key,
+                            )
+                            .await
+                        {
+                            Ok(value) => {
+                                generated_files.push(value);
+                                json!({"status":"completed","files":1,"format":"html"}).to_string()
                             }
                             Err(error) => json!({"error":error.to_string()}).to_string(),
                         }
@@ -1411,6 +1522,71 @@ impl OpenRouter {
         .await
     }
 
+    /// Runs a schema-configured fal.ai 3D or vector endpoint and materializes
+    /// the result as a Telegram document. Vector artifacts are always wrapped
+    /// in a standalone HTML document, as Telegram has no native SVG message.
+    pub async fn generate_fal_artifact(
+        &self,
+        prompt: &str,
+        media: &[MediaInput],
+        model: &str,
+        capability: &str,
+        api_key: &str,
+    ) -> Result<GeneratedFile> {
+        let specialized = match capability {
+            "speech_generation" => "text_to_speech",
+            "music_generation"
+                if media
+                    .iter()
+                    .any(|item| matches!(item, MediaInput::Video { .. })) =>
+            {
+                "video_to_audio"
+            }
+            "music_generation" => "text_to_audio",
+            _ => capability,
+        };
+        let endpoint = self
+            .fal
+            .endpoint(model, specialized)
+            .or_else(|_| self.fal.endpoint(model, capability))?;
+        let input = fal_input(endpoint, prompt, media, None)?;
+        let result = self.fal.run(endpoint, input, api_key).await?;
+        let url = self
+            .fal
+            .media_urls(endpoint, &result)
+            .into_iter()
+            .next()
+            .context("Fal artifact endpoint returned no output URL")?;
+        let (bytes, media_type) = self.fal.download(&url).await?;
+        if capability.ends_with("_vector") {
+            let svg = String::from_utf8(bytes).context("Fal vector output is not UTF-8 SVG")?;
+            if !svg.trim_start().starts_with("<svg") && media_type != "image/svg+xml" {
+                bail!("Fal vector endpoint did not return SVG output");
+            }
+            // Keep provider-controlled SVG out of the HTML DOM. Rendering it
+            // as an image under a restrictive CSP preserves vector quality
+            // without allowing embedded scripts or external resource loads.
+            let encoded = STANDARD.encode(svg.as_bytes());
+            let html = format!(
+                "<!doctype html><html><head><meta charset=\"utf-8\"><meta http-equiv=\"Content-Security-Policy\" content=\"default-src 'none'; img-src data:; style-src 'unsafe-inline'\"><meta name=\"viewport\" content=\"width=device-width,initial-scale=1\"><title>Generated vector</title><style>html,body{{margin:0;min-height:100%;display:grid;place-items:center;background:#fff}}img{{max-width:100%;height:auto}}</style></head><body><img alt=\"Generated vector\" src=\"data:image/svg+xml;base64,{encoded}\"></body></html>"
+            );
+            return Ok(GeneratedFile {
+                filename: "generated-vector.html".into(),
+                bytes: html.into_bytes(),
+            });
+        }
+        let extension = match media_type.as_str() {
+            "model/gltf-binary" => "glb",
+            "model/gltf+json" => "gltf",
+            "application/zip" => "zip",
+            _ => "bin",
+        };
+        Ok(GeneratedFile {
+            filename: format!("generated-3d.{extension}"),
+            bytes,
+        })
+    }
+
     pub async fn generate_image_with_references(
         &self,
         prompt: &str,
@@ -1423,7 +1599,18 @@ impl OpenRouter {
             bail!("Image generation model is not configured");
         }
         if routing.model_provider == ModelProvider::Fal {
-            let endpoint = self.fal.endpoint(model, "image_generation")?;
+            let capability = if media
+                .iter()
+                .any(|item| matches!(item, MediaInput::Image { .. }))
+            {
+                "image_to_image"
+            } else {
+                "text_to_image"
+            };
+            let endpoint = self
+                .fal
+                .endpoint(model, capability)
+                .or_else(|_| self.fal.endpoint(model, "image_generation"))?;
             let input = fal_input(endpoint, prompt, media, None)?;
             let result = self.fal.run(endpoint, input, api_key).await?;
             let mut images = Vec::new();
@@ -1444,9 +1631,6 @@ impl OpenRouter {
             return Ok(images);
         }
         let mut body = self.config.image.extra.clone();
-        if !self.config.image.size.is_empty() {
-            body.insert("size".into(), json!(self.config.image.size));
-        }
         if let Some(choice) = self
             .config
             .image
@@ -1455,6 +1639,15 @@ impl OpenRouter {
             .find(|choice| choice.id == model)
         {
             body.extend(choice.extra.clone());
+        }
+        body.remove("size");
+        body.remove("aspect_ratio");
+        body.remove("resolution");
+        let geometry = requested_geometry(prompt, media);
+        if let (Some(width), Some(height)) = (geometry.width, geometry.height) {
+            body.insert("size".into(), json!(format!("{width}x{height}")));
+        } else if let Some(aspect_ratio) = geometry.aspect_ratio {
+            body.insert("aspect_ratio".into(), json!(aspect_ratio));
         }
         let routed_model = if routing.model_provider == ModelProvider::Openrouter {
             apply_routing(&mut body, model, routing, false)
@@ -1466,7 +1659,7 @@ impl OpenRouter {
         let references = media
             .iter()
             .filter_map(|item| match item {
-                MediaInput::Image { url } => Some(reference("image_url", url)),
+                MediaInput::Image { url, .. } => Some(reference("image_url", url)),
                 _ => None,
             })
             .collect::<Vec<_>>();
@@ -1776,7 +1969,22 @@ impl OpenRouter {
         capability: &str,
         api_key: &str,
     ) -> Result<GeneratedImage> {
-        let endpoint = self.fal.endpoint(model, capability)?;
+        let specialized = match capability {
+            "speech_generation" => "text_to_speech",
+            "music_generation"
+                if media
+                    .iter()
+                    .any(|item| matches!(item, MediaInput::Video { .. })) =>
+            {
+                "video_to_audio"
+            }
+            "music_generation" => "text_to_audio",
+            _ => capability,
+        };
+        let endpoint = self
+            .fal
+            .endpoint(model, specialized)
+            .or_else(|_| self.fal.endpoint(model, capability))?;
         let input = fal_input(endpoint, prompt, media, None)?;
         let result = self.fal.run(endpoint, input, api_key).await?;
         let url = self
@@ -1920,7 +2128,23 @@ impl OpenRouter {
         api_key: &str,
     ) -> Result<String> {
         if routing.model_provider == ModelProvider::Fal {
-            let endpoint = self.fal.endpoint(model, "video_generation")?;
+            let capability = if media
+                .iter()
+                .any(|item| matches!(item, MediaInput::Video { .. }))
+            {
+                "video_to_video"
+            } else if media
+                .iter()
+                .any(|item| matches!(item, MediaInput::Image { .. }))
+            {
+                "image_to_video"
+            } else {
+                "text_to_video"
+            };
+            let endpoint = self
+                .fal
+                .endpoint(model, capability)
+                .or_else(|_| self.fal.endpoint(model, "video_generation"))?;
             let input = fal_input(endpoint, prompt, media, None)?;
             let result = self.fal.run(endpoint, input, api_key).await?;
             return self
@@ -1938,8 +2162,6 @@ impl OpenRouter {
         }
         let mut body = self.config.video.extra.clone();
         body.insert("duration".into(), json!(self.config.video.duration));
-        body.insert("aspect_ratio".into(), json!(self.config.video.aspect_ratio));
-        body.insert("resolution".into(), json!(self.config.video.resolution));
         body.insert(
             "generate_audio".into(),
             json!(self.config.video.generate_audio),
@@ -1952,6 +2174,12 @@ impl OpenRouter {
             .find(|choice| choice.id == model)
         {
             body.extend(choice.extra.clone());
+        }
+        body.remove("size");
+        body.remove("aspect_ratio");
+        body.remove("resolution");
+        if let Some(aspect_ratio) = requested_geometry(prompt, media).aspect_ratio {
+            body.insert("aspect_ratio".into(), json!(aspect_ratio));
         }
         let routed_model = apply_routing(&mut body, model, routing, false);
         body.insert("model".into(), json!(routed_model));
@@ -2199,6 +2427,8 @@ struct ToolContext<'a> {
     web_fetch: &'a crate::config::OpenRouterWebFetchConfig,
     audio_attached: bool,
     openrouter_server_tools: bool,
+    three_d_ready: bool,
+    vector_ready: bool,
 }
 
 fn add_tools(body: &mut Map<String, Value>, capabilities: &Capabilities, context: ToolContext<'_>) {
@@ -2250,6 +2480,20 @@ fn add_tools(body: &mut Map<String, Value>, capabilities: &Capabilities, context
         additions.push(function_tool(
             "generate_video",
             "Generate a video and deliver it to Telegram.",
+            "prompt",
+        ));
+    }
+    if capabilities.image && context.three_d_ready {
+        additions.push(function_tool(
+            "generate_3d",
+            "Generate a 3D artifact from text and an optional attached image, then deliver it as a Telegram file.",
+            "prompt",
+        ));
+    }
+    if capabilities.image && context.vector_ready {
+        additions.push(function_tool(
+            "generate_vector",
+            "Generate vector artwork from text and an optional attached image, then deliver it as a safe HTML file.",
             "prompt",
         ));
     }
@@ -2441,7 +2685,8 @@ fn report_generation_progress(
 fn composed_generation_input(tool: &str, arguments: &Value) -> Option<String> {
     let field = match tool {
         "generate_speech" | "generate_audio" => "text",
-        "generate_image" | "generate_music" | "generate_video" => "prompt",
+        "generate_image" | "generate_music" | "generate_video" | "generate_3d"
+        | "generate_vector" => "prompt",
         _ => return None,
     };
     let mut value = arguments.get(field)?.as_str()?.trim().to_owned();
@@ -2463,6 +2708,8 @@ fn enabled_planner_skills(capabilities: &Capabilities) -> SmallVec<[&'static str
         (capabilities.audio, "audio_generation"),
         (capabilities.music, "music_generation"),
         (capabilities.video, "video_generation"),
+        (capabilities.image, "three_d_generation"),
+        (capabilities.image, "vector_generation"),
         (capabilities.media, "image_understanding"),
         (capabilities.media, "video_understanding"),
         (capabilities.transcription, "transcription"),
@@ -2481,6 +2728,7 @@ fn planned_action_enabled(action: PlannedAction, capabilities: &Capabilities) ->
         PlannedAction::GenerateSpeech | PlannedAction::GenerateAudio => capabilities.audio,
         PlannedAction::GenerateMusic => capabilities.music,
         PlannedAction::GenerateVideo => capabilities.video,
+        PlannedAction::Generate3d | PlannedAction::GenerateVector => capabilities.image,
         PlannedAction::Transcribe => capabilities.transcription,
         PlannedAction::Chat | PlannedAction::GenerateCode | PlannedAction::Refuse => true,
     }
@@ -2497,6 +2745,7 @@ fn workflow_step_enabled(step: WorkflowStep, capabilities: &Capabilities) -> boo
         WorkflowStep::SpeechGeneration => capabilities.audio,
         WorkflowStep::MusicGeneration => capabilities.music,
         WorkflowStep::VideoGeneration => capabilities.video,
+        WorkflowStep::ThreeDGeneration | WorkflowStep::VectorGeneration => capabilities.image,
         WorkflowStep::FileDelivery => capabilities.file,
     }
 }
@@ -2757,10 +3006,10 @@ fn user_content(text: &str, media: &[MediaInput], media_enabled: bool) -> Value 
     let mut content = vec![json!({"type":"text","text":text})];
     for item in media {
         match item {
-            MediaInput::Image { url } if media_enabled => {
+            MediaInput::Image { url, .. } if media_enabled => {
                 content.push(json!({"type":"image_url","image_url":{"url":url}}));
             }
-            MediaInput::Video { url } if media_enabled => {
+            MediaInput::Video { url, .. } if media_enabled => {
                 content.push(json!({"type":"video_url","video_url":{"url":url}}));
             }
             MediaInput::Audio { .. } => content.push(json!({
@@ -2782,7 +3031,7 @@ fn planner_user_content(request: &PlanningRequest<'_>) -> Value {
     .unwrap_or_default();
     let mut content = vec![json!({"type":"text", "text":context})];
     for media in request.media {
-        if let MediaInput::Image { url } = media {
+        if let MediaInput::Image { url, .. } = media {
             content.push(json!({"type":"image_url", "image_url":{"url":url}}));
         }
     }
@@ -2796,10 +3045,10 @@ fn generation_user_content(text: &str, media: &[MediaInput]) -> Value {
     let mut content = vec![json!({"type":"text", "text":text})];
     for item in media {
         match item {
-            MediaInput::Image { url } => {
+            MediaInput::Image { url, .. } => {
                 content.push(json!({"type":"image_url", "image_url":{"url":url}}));
             }
-            MediaInput::Video { url } => {
+            MediaInput::Video { url, .. } => {
                 content.push(json!({"type":"video_url", "video_url":{"url":url}}));
             }
             MediaInput::Audio { data, format } => {
@@ -2826,14 +3075,14 @@ fn fal_input(
     let images = media
         .iter()
         .filter_map(|item| match item {
-            MediaInput::Image { url } => Some(url.clone()),
+            MediaInput::Image { url, .. } => Some(url.clone()),
             _ => None,
         })
         .collect::<Vec<_>>();
     let videos = media
         .iter()
         .filter_map(|item| match item {
-            MediaInput::Video { url } => Some(url.clone()),
+            MediaInput::Video { url, .. } => Some(url.clone()),
             _ => None,
         })
         .collect::<Vec<_>>();
@@ -2860,6 +3109,17 @@ fn fal_input(
     {
         input.insert(field.clone(), json!(language));
     }
+    let geometry = requested_geometry(prompt, media);
+    if let (Some(field), Some(width)) = (&endpoint.width_field, geometry.width) {
+        input.insert(field.clone(), json!(width));
+    }
+    if let (Some(field), Some(height)) = (&endpoint.height_field, geometry.height) {
+        input.insert(field.clone(), json!(height));
+    }
+    if let (Some(field), Some(aspect_ratio)) = (&endpoint.aspect_ratio_field, geometry.aspect_ratio)
+    {
+        input.insert(field.clone(), json!(aspect_ratio));
+    }
     if endpoint
         .capabilities
         .iter()
@@ -2872,6 +3132,68 @@ fn fal_input(
         );
     }
     Ok(input)
+}
+
+#[derive(Default)]
+struct RequestedGeometry {
+    width: Option<u32>,
+    height: Option<u32>,
+    aspect_ratio: Option<String>,
+}
+
+/// Extracts explicit `WIDTHxHEIGHT`/`W:H` requests, otherwise inherits the
+/// first visual reference's dimensions. No default resolution is invented.
+fn requested_geometry(prompt: &str, media: &[MediaInput]) -> RequestedGeometry {
+    let explicit_size = prompt.split_whitespace().find_map(|token| {
+        let clean = token
+            .trim_matches(|character: char| !character.is_ascii_alphanumeric() && character != '×');
+        let (left, right) = clean
+            .split_once('x')
+            .or_else(|| clean.split_once('X'))
+            .or_else(|| clean.split_once('×'))?;
+        let width = left.parse::<u32>().ok()?;
+        let height = right.parse::<u32>().ok()?;
+        (width > 0 && height > 0).then_some((width, height))
+    });
+    let reference_size = media.iter().find_map(|item| match item {
+        MediaInput::Image {
+            width: Some(width),
+            height: Some(height),
+            ..
+        }
+        | MediaInput::Video {
+            width: Some(width),
+            height: Some(height),
+            ..
+        } => Some((*width, *height)),
+        _ => None,
+    });
+    let size = explicit_size.or(reference_size);
+    let explicit_ratio = prompt.split_whitespace().find_map(|token| {
+        let clean =
+            token.trim_matches(|character: char| !character.is_ascii_digit() && character != ':');
+        let (left, right) = clean.split_once(':')?;
+        let width = left.parse::<u32>().ok()?;
+        let height = right.parse::<u32>().ok()?;
+        (width > 0 && height > 0).then(|| format!("{width}:{height}"))
+    });
+    RequestedGeometry {
+        width: size.map(|value| value.0),
+        height: size.map(|value| value.1),
+        aspect_ratio: explicit_ratio
+            .or_else(|| size.map(|(width, height)| reduced_ratio(width, height))),
+    }
+}
+
+fn reduced_ratio(width: u32, height: u32) -> String {
+    fn gcd(mut left: u32, mut right: u32) -> u32 {
+        while right != 0 {
+            (left, right) = (right, left % right);
+        }
+        left.max(1)
+    }
+    let divisor = gcd(width, height);
+    format!("{}:{}", width / divisor, height / divisor)
 }
 
 fn insert_fal_references(input: &mut Map<String, Value>, field: &str, values: Vec<String>) {
@@ -2898,8 +3220,8 @@ fn video_input_references(media: &[MediaInput]) -> Vec<Value> {
     media
         .iter()
         .map(|item| match item {
-            MediaInput::Image { url } => reference("image_url", url),
-            MediaInput::Video { url } => reference("video_url", url),
+            MediaInput::Image { url, .. } => reference("image_url", url),
+            MediaInput::Video { url, .. } => reference("video_url", url),
             MediaInput::Audio { data, format } => reference(
                 "audio_url",
                 &format!("data:{};base64,{data}", audio_media_type(format)),
@@ -3304,6 +3626,8 @@ mod tests {
                 web_fetch: &crate::config::OpenRouterWebFetchConfig::default(),
                 audio_attached: true,
                 openrouter_server_tools: true,
+                three_d_ready: false,
+                vector_ready: false,
             },
         );
         let names = body["tools"]
@@ -3340,6 +3664,8 @@ mod tests {
                 web_fetch: &crate::config::OpenRouterWebFetchConfig::default(),
                 audio_attached: false,
                 openrouter_server_tools: false,
+                three_d_ready: false,
+                vector_ready: false,
             },
         );
         assert!(body["tools"].as_array().unwrap().iter().all(|tool| {
@@ -3355,6 +3681,8 @@ mod tests {
             "Describe this",
             &[MediaInput::Image {
                 url: "data:image/png;base64,AA==".into(),
+                width: None,
+                height: None,
             }],
             true,
         );
@@ -3367,9 +3695,13 @@ mod tests {
         let media = vec![
             MediaInput::Image {
                 url: "data:image/png;base64,aW1hZ2U=".into(),
+                width: None,
+                height: None,
             },
             MediaInput::Video {
                 url: "data:video/mp4;base64,dmlkZW8=".into(),
+                width: None,
+                height: None,
             },
             MediaInput::Audio {
                 data: "YXVkaW8=".into(),
@@ -3702,9 +4034,13 @@ mod tests {
         let media = vec![
             MediaInput::Image {
                 url: "data:image/png;base64,AA==".into(),
+                width: None,
+                height: None,
             },
             MediaInput::Video {
                 url: "data:video/mp4;base64,AA==".into(),
+                width: None,
+                height: None,
             },
             MediaInput::Audio {
                 data: "AA==".into(),
@@ -3725,6 +4061,32 @@ mod tests {
             references[2]["audio_url"]["url"],
             "data:audio/mpeg;base64,AA=="
         );
+    }
+
+    #[test]
+    fn geometry_prefers_explicit_size_and_otherwise_preserves_reference_ratio() {
+        let media = [MediaInput::Image {
+            url: "data:image/png;base64,AA==".into(),
+            width: Some(1920),
+            height: Some(1080),
+        }];
+        let inherited = requested_geometry("animate this", &media);
+        assert_eq!(inherited.width, Some(1920));
+        assert_eq!(inherited.height, Some(1080));
+        assert_eq!(inherited.aspect_ratio.as_deref(), Some("16:9"));
+
+        let explicit = requested_geometry("render at 1024x1536 using 2:3", &media);
+        assert_eq!(explicit.width, Some(1024));
+        assert_eq!(explicit.height, Some(1536));
+        assert_eq!(explicit.aspect_ratio.as_deref(), Some("2:3"));
+    }
+
+    #[test]
+    fn geometry_has_no_backend_default_without_user_or_media_input() {
+        let geometry = requested_geometry("draw a fox", &[]);
+        assert_eq!(geometry.width, None);
+        assert_eq!(geometry.height, None);
+        assert_eq!(geometry.aspect_ratio, None);
     }
 
     #[test]

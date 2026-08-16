@@ -27,8 +27,12 @@ const capabilityNames = {
   chat: 'General chat', model_upgrade: 'Advanced model', image_understanding: 'Image understanding', video_understanding: 'Video understanding',
   intent_planning: 'Intent processing', intent_planning_fallback: 'Intent processing fallback',
   output_processing: 'Text output processing', error_processing: 'Error explanation',
-  image_generation: 'Image generation', audio_generation: 'Speech generation', speech_generation: 'Speech generation', music_generation: 'Music generation', transcription: 'Transcription',
-  video_generation: 'Video generation'
+  transcription: 'Transcription',
+  text_to_image: 'Text → image', image_to_image: 'Image → image',
+  text_to_video: 'Text → video', image_to_video: 'Image → video', video_to_video: 'Video → video',
+  text_to_audio: 'Text → audio', video_to_audio: 'Video → audio', text_to_speech: 'Text → speech',
+  image_to_3d: 'Image → 3D', text_to_3d: 'Text → 3D',
+  text_to_image_vector: 'Text → image (vector HTML)', image_to_image_vector: 'Image → image (vector HTML)'
 };
 
 document.addEventListener('htmx:configRequest', event => {
@@ -43,6 +47,17 @@ const text = (tag, value, className) => {
 };
 
 const supports = (model, cap) => {
+  const declared = model.supported_capabilities || [];
+  if (declared.length) {
+    if (declared.includes(cap)) return true;
+    const aliases = {
+      text_to_image: 'image_generation', image_to_image: 'image_generation',
+      text_to_video: 'video_generation', image_to_video: 'video_generation', video_to_video: 'video_generation',
+      text_to_audio: 'music_generation', video_to_audio: 'music_generation',
+      text_to_speech: declared.includes('speech_generation') ? 'speech_generation' : 'audio_generation'
+    };
+    return aliases[cap] ? declared.includes(aliases[cap]) : false;
+  }
   const input = model.input_modalities || [];
   const output = model.output_modalities || [];
   if (['chat', 'model_upgrade', 'output_processing', 'error_processing'].includes(cap)) {
@@ -55,11 +70,20 @@ const supports = (model, cap) => {
   }
   if (cap === 'image_understanding') return input.includes('image') && output.includes('text');
   if (cap === 'video_understanding') return input.includes('video') && output.includes('text');
-  if (cap === 'image_generation') return output.includes('image');
+  if (cap === 'text_to_image') return input.includes('text') && output.includes('image');
+  if (cap === 'image_to_image') return input.includes('image') && output.includes('image');
   if (cap === 'audio_generation' || cap === 'speech_generation') return output.includes('speech') || output.includes('audio');
-  if (cap === 'music_generation') return output.includes('audio');
+  if (cap === 'text_to_audio') return input.includes('text') && output.includes('audio');
+  if (cap === 'video_to_audio') return input.includes('video') && output.includes('audio');
+  if (cap === 'text_to_speech') return input.includes('text') && (output.includes('speech') || output.includes('audio'));
   if (cap === 'transcription') return output.includes('transcription') || (input.includes('audio') && output.includes('text'));
-  if (cap === 'video_generation') return output.includes('video');
+  if (cap === 'text_to_video') return input.includes('text') && output.includes('video');
+  if (cap === 'image_to_video') return input.includes('image') && output.includes('video');
+  if (cap === 'video_to_video') return input.includes('video') && output.includes('video');
+  if (cap === 'text_to_3d') return input.includes('text') && output.includes('3d');
+  if (cap === 'image_to_3d') return input.includes('image') && output.includes('3d');
+  if (cap === 'text_to_image_vector') return input.includes('text') && (output.includes('svg') || output.includes('vector'));
+  if (cap === 'image_to_image_vector') return input.includes('image') && (output.includes('svg') || output.includes('vector'));
   return false;
 };
 
@@ -90,7 +114,7 @@ const price = value => {
 };
 const date = value => value ? new Date(value * 1000).toLocaleDateString() : 'Not published';
 const unitPrice = (key, value) => {
-  const mediaEndpoint = ['image_generation', 'audio_generation', 'speech_generation', 'music_generation', 'transcription', 'video_generation'].includes(capability);
+  const mediaEndpoint = ['text_to_image', 'image_to_image', 'text_to_video', 'image_to_video', 'video_to_video', 'text_to_audio', 'video_to_audio', 'text_to_speech', 'image_to_3d', 'text_to_3d', 'text_to_image_vector', 'image_to_image_vector', 'transcription'].includes(capability);
   if (['prompt', 'completion'].includes(key) && mediaEndpoint) {
     const numeric = Number(value);
     if (numeric === 0) return `${key}: not billed on this field`;
@@ -111,7 +135,7 @@ const meaningfulTokenPrice = value => {
 const primaryRate = value => {
   if (value === undefined || value === null || value === '') return 'Not published';
   if (Number(value) === 0) return 'Not billed on this field';
-  if (['image_generation', 'audio_generation', 'speech_generation', 'music_generation', 'transcription', 'video_generation'].includes(capability)) {
+  if (['text_to_image', 'image_to_image', 'text_to_video', 'image_to_video', 'video_to_video', 'text_to_audio', 'video_to_audio', 'text_to_speech', 'image_to_3d', 'text_to_3d', 'text_to_image_vector', 'image_to_image_vector', 'transcription'].includes(capability)) {
     return `$${Number(value).toLocaleString(undefined, { maximumFractionDigits: 6 })} / published unit`;
   }
   return meaningfulTokenPrice(value);
