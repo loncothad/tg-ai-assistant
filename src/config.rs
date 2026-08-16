@@ -666,9 +666,29 @@ impl Config {
         expand_yaml_env(&mut document)?;
         let mut config: Self = serde_yaml::from_value(document)
             .wrap_err_with(|| format!("Invalid configuration in {}", path.display()))?;
+        config.apply_bootstrap_environment();
         config.assign_telegram_tokens()?;
         config.validate()?;
         Ok(config)
+    }
+
+    /// Uses conventional process environment variables when an older or
+    /// hand-written YAML file leaves a provider bootstrap credential empty.
+    /// Explicit YAML values always win. Secrets are subsequently encrypted
+    /// into each bot's isolated redb namespace by `Store::seed_bot`.
+    fn apply_bootstrap_environment(&mut self) {
+        fill_from_environment(&mut self.openrouter.bootstrap_api_key, "OPENROUTER_API_KEY");
+        fill_from_environment(&mut self.aihub.bootstrap_api_key, "AIHUB_API_KEY");
+        fill_from_environment(&mut self.fal.bootstrap_api_key, "FAL_KEY");
+        fill_from_environment(
+            &mut self.search.brave.bootstrap_api_key,
+            "BRAVE_SEARCH_API_KEY",
+        );
+        fill_from_environment(&mut self.search.exa.bootstrap_api_key, "EXA_API_KEY");
+        fill_from_environment(
+            &mut self.search.serpapi.bootstrap_api_key,
+            "SERPAPI_API_KEY",
+        );
     }
     fn assign_telegram_tokens(&mut self) -> Result<()> {
         let tokens = self
@@ -1051,6 +1071,23 @@ impl Config {
     }
 }
 
+fn fill_from_environment(target: &mut String, variable: &str) {
+    fill_from_lookup(target, variable, |name| std::env::var(name).ok());
+}
+
+fn fill_from_lookup(
+    target: &mut String,
+    variable: &str,
+    lookup: impl FnOnce(&str) -> Option<String>,
+) {
+    if target.trim().is_empty()
+        && let Some(value) = lookup(variable)
+        && !value.trim().is_empty()
+    {
+        *target = value;
+    }
+}
+
 fn validate_openrouter_options(name: &str, options: &OpenRouterOptions) -> Result<()> {
     if options
         .max_tool_calls
@@ -1254,6 +1291,19 @@ mod tests {
     #[test]
     fn environment_defaults_expand() {
         assert_eq!(expand_env("A=${UNSET_TELEFORGE_987:-B}").unwrap(), "A=B");
+    }
+
+    #[test]
+    fn empty_bootstrap_fields_can_use_conventional_environment_values() {
+        let mut empty = String::new();
+        fill_from_lookup(&mut empty, "FAL_KEY", |name| {
+            (name == "FAL_KEY").then(|| "fal-secret".to_owned())
+        });
+        assert_eq!(empty, "fal-secret");
+
+        let mut explicit = "yaml-secret".to_owned();
+        fill_from_lookup(&mut explicit, "FAL_KEY", |_| Some("env-secret".to_owned()));
+        assert_eq!(explicit, "yaml-secret");
     }
 
     #[test]
