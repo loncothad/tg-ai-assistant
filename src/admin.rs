@@ -5,6 +5,7 @@ use crate::{
     catalog::ModelCatalogCache,
     config::{Config, ModelProvider},
     db::{ModelRouting, Store},
+    fal::FalClient,
     http::HttpClient,
 };
 use axum::{
@@ -29,16 +30,19 @@ pub struct AdminState {
     pub store: Store,
     pub client: HttpClient,
     catalog: ModelCatalogCache,
+    fal: FalClient,
 }
 
 impl AdminState {
     /// Creates shared state for the authenticated Mini App endpoints.
     pub fn new(config: Arc<Config>, store: Store, client: HttpClient) -> Self {
+        let fal = FalClient::new(client.clone(), config.fal.clone());
         Self {
             config,
             store,
             client,
             catalog: ModelCatalogCache::default(),
+            fal,
         }
     }
 }
@@ -120,41 +124,72 @@ async fn models(
     };
     let mut models = Vec::new();
     let mut providers = Vec::new();
-    for (provider, label) in [
-        (ModelProvider::Openrouter, "OpenRouter"),
-        (ModelProvider::Aihub, "AI Hub"),
-        (ModelProvider::Fal, "fal.ai"),
-    ] {
-        if !state
-            .store
-            .credential_configured(&bot, provider.as_str())
-            .await
-            .unwrap_or(false)
-        {
+    let (openrouter, aihub, fal) = tokio::join!(
+        load_provider_catalog(&state, &bot, ModelProvider::Openrouter, "OpenRouter"),
+        load_provider_catalog(&state, &bot, ModelProvider::Aihub, "AI Hub"),
+        load_provider_catalog(&state, &bot, ModelProvider::Fal, "fal.ai"),
+    );
+    for loaded in [openrouter, aihub, fal] {
+        if !loaded.configured {
             providers.push(serde_json::json!({
-                "id": provider.as_str(), "label": label, "available": false,
+                "id": loaded.provider.as_str(), "label": loaded.label, "available": false,
                 "message": "API key is not configured"
             }));
             continue;
         }
-        match catalog_for(&state, &bot, provider).await {
+        match loaded.catalog {
             Ok(catalog) => {
                 models.extend(catalog.iter().cloned());
                 providers.push(serde_json::json!({
-                    "id": provider.as_str(), "label": label, "available": true,
+                    "id": loaded.provider.as_str(), "label": loaded.label, "available": true,
                     "models": catalog.len()
                 }));
             }
             Err(error) => {
-                tracing::warn!(bot_id = %bot, provider = provider.as_str(), error = %format!("{error:#}"), "model catalog unavailable");
+                tracing::warn!(bot_id = %bot, provider = loaded.provider.as_str(), error = %format!("{error:#}"), "model catalog unavailable");
                 providers.push(serde_json::json!({
-                    "id": provider.as_str(), "label": label, "available": false,
-                    "message": "Catalog is temporarily unavailable"
+                    "id": loaded.provider.as_str(), "label": loaded.label, "available": false,
+                    "message": if loaded.provider == ModelProvider::Fal {
+                        "Live fal.ai catalog is unavailable; verify the FAL_KEY API scope and service logs"
+                    } else {
+                        "Catalog is temporarily unavailable"
+                    }
                 }));
             }
         }
     }
     no_store(Json(serde_json::json!({ "models": models, "providers": providers })).into_response())
+}
+
+struct LoadedProviderCatalog {
+    provider: ModelProvider,
+    label: &'static str,
+    configured: bool,
+    catalog: Result<Arc<Vec<crate::catalog::CatalogModel>>>,
+}
+
+async fn load_provider_catalog(
+    state: &AdminState,
+    bot: &str,
+    provider: ModelProvider,
+    label: &'static str,
+) -> LoadedProviderCatalog {
+    let configured = state
+        .store
+        .credential_configured(bot, provider.as_str())
+        .await
+        .unwrap_or(false);
+    let catalog = if configured {
+        catalog_for(state, bot, provider).await
+    } else {
+        Err(eyre::eyre!("Provider API key is not configured"))
+    };
+    LoadedProviderCatalog {
+        provider,
+        label,
+        configured,
+        catalog,
+    }
 }
 
 #[derive(Deserialize)]
@@ -315,8 +350,11 @@ async fn catalog_for(
                 .await
         }
         ModelProvider::Fal => {
-            let _key = fal_key(state, bot).await?;
-            Ok(Arc::new(crate::catalog::fal_catalog(&state.config.fal)))
+            let key = fal_key(state, bot).await?;
+            state
+                .catalog
+                .get_fal(&state.client, &state.config.fal, bot, &key)
+                .await
         }
     }
 }
@@ -380,6 +418,22 @@ async fn set_model(
             StatusCode::BAD_REQUEST,
             "Unknown model or model does not support this capability",
         );
+    }
+    if form.model_provider == ModelProvider::Fal {
+        let key = match fal_key(&state, &bot).await {
+            Ok(key) => key,
+            Err(error) => return message(StatusCode::BAD_REQUEST, &error.to_string()),
+        };
+        if let Err(error) = state
+            .fal
+            .endpoint(&form.model, &form.capability, &key)
+            .await
+        {
+            return message(
+                StatusCode::BAD_REQUEST,
+                &format!("Fal model schema is not executable: {error}"),
+            );
+        }
     }
     if form.model_provider != ModelProvider::Openrouter
         && (form.routing != "auto"
@@ -1095,7 +1149,7 @@ async fn render_html(state: &AdminState, bot: &str) -> Result<String> {
     };
     Ok(format!(
         "<nav class=\"jump-nav\"><button type=button data-jump=\"models\">Models</button><button type=button data-jump=\"skills\">Skills</button><button type=button data-jump=\"credentials\">Credentials</button><button type=button data-jump=\"instructions\">Instructions</button><button type=button data-jump=\"access\">Access</button></nav>
-        <section id=\"models\"><div class=\"section-head\"><div><h2>Models by capability</h2><p>OpenRouter, AI Hub, and configured fal.ai endpoints are separated by provider and capability. Intent processing lists only models with text and image input, text output, and structured-output support.</p></div><span class=\"badge\">Live catalogs</span></div><div class=\"grid model-grid\">{model_forms}</div><form hx-post=\"search\" hx-target=\"#panel\" hx-swap=\"innerHTML transition:true\"><label>Web search provider<select name=provider>{}</select></label><button>Save search provider</button></form></section>
+        <section id=\"models\"><div class=\"section-head\"><div><h2>Models by capability</h2><p>OpenRouter, AI Hub, and the live fal.ai endpoint catalog are separated by provider and capability. Intent processing lists only models with text and image input, text output, and structured-output support.</p></div><span class=\"badge\">Live catalogs</span></div><div class=\"grid model-grid\">{model_forms}</div><form hx-post=\"search\" hx-target=\"#panel\" hx-swap=\"innerHTML transition:true\"><label>Web search provider<select name=provider>{}</select></label><button>Save search provider</button></form></section>
         <section id=\"skills\"><div class=\"section-head\"><div><h2>Built-in skills</h2><p>Enable only the callable APIs and instructions this bot should expose.</p></div></div><div class=grid>{caps}</div></section>
         <section id=\"credentials\"><div class=\"section-head\"><div><h2>API credentials</h2><p>Encrypted at rest and never returned to the browser.</p></div></div><div class=grid>{creds}</div></section>
         <section id=\"instructions\"><div class=\"section-head\"><div><h2>System prompt</h2><p>Override or restore the prompt compiled into this binary.</p></div></div>{}</section>
@@ -1171,14 +1225,21 @@ fn model_form(
 ) -> String {
     let selected_provider = routing.model_provider.as_str();
     let selected_available = configured.get(selected_provider).copied().unwrap_or(false);
+    let selected_configured = !selected.trim().is_empty();
+    let initial_summary = if selected_configured {
+        "Loading provider metadata…"
+    } else {
+        "Choose a model to enable this capability"
+    };
     format!(
-        "<article class=\"card model-card\" data-capability=\"{}\" data-model=\"{}\" data-model-provider=\"{}\"><h3>{}</h3><div class=model-name>{}</div><div class=model-id>{}</div><p class=model-summary>Loading provider metadata…</p><div class=\"chips model-chips\"></div><div class=route-line><span>API: {}</span><span>Routing: {}</span><span>Endpoint: {}</span></div><button type=button class=model-picker data-capability=\"{}\" data-model=\"{}\" data-model-provider=\"{}\" data-routing=\"{}\" data-provider=\"{}\" {disabled}>{button}</button><small class=\"{status_class}\">{status}</small></article>",
+        "<article class=\"card model-card\" data-capability=\"{}\" data-model=\"{}\" data-model-provider=\"{}\"><h3>{}</h3><div class=model-name>{}</div><div class=model-id>{}</div><p class=model-summary>{}</p><div class=\"chips model-chips\"></div><div class=route-line><span>API: {}</span><span>Routing: {}</span><span>Endpoint: {}</span></div><button type=button class=model-picker data-capability=\"{}\" data-model=\"{}\" data-model-provider=\"{}\" data-routing=\"{}\" data-provider=\"{}\" {disabled}>{button}</button><small class=\"{status_class}\">{status}</small></article>",
         esc(capability),
         esc(selected),
         esc(selected_provider),
         esc(label),
         esc(selected),
         esc(selected),
+        esc(initial_summary),
         esc(selected_provider),
         esc(&routing.strategy),
         esc(routing.provider.as_deref().unwrap_or("auto")),
@@ -1193,12 +1254,14 @@ fn model_form(
         } else {
             "Provider key required"
         },
-        status_class = if selected_available {
+        status_class = if selected_available && selected_configured {
             "status-ok"
         } else {
             "status-off"
         },
-        status = if selected_available {
+        status = if !selected_configured {
+            "Not configured: choose a model"
+        } else if selected_available {
             "Ready"
         } else {
             "Unavailable: selected model provider API key is not configured"

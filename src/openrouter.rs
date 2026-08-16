@@ -517,6 +517,18 @@ impl OpenRouter {
         }
     }
 
+    /// Verifies that a discovered fal.ai model can be converted into an
+    /// executable endpoint mapping before a one-shot model override is used.
+    pub async fn validate_fal_model(
+        &self,
+        model: &str,
+        capability: &str,
+        api_key: &str,
+    ) -> Result<()> {
+        self.fal.endpoint(model, capability, api_key).await?;
+        Ok(())
+    }
+
     /// Produces a faithful textual description of reference images/videos so a
     /// target endpoint that cannot accept that media type can still transform it.
     pub async fn describe_generation_media(
@@ -536,12 +548,12 @@ impl OpenRouter {
             } else {
                 "image_understanding"
             };
-            let endpoint = self.fal.endpoint(&model.id, capability)?;
-            let input = fal_input(endpoint, request, media, None)?;
-            let result = self.fal.run(endpoint, input, api_key).await?;
+            let endpoint = self.fal.endpoint(&model.id, capability, api_key).await?;
+            let input = fal_input(&endpoint, request, media, None)?;
+            let result = self.fal.run(&endpoint, input, api_key).await?;
             return self
                 .fal
-                .text(endpoint, &result)
+                .text(&endpoint, &result)
                 .context("Fal vision endpoint returned no configured text output");
         }
         let mut body = Map::new();
@@ -1522,7 +1534,7 @@ impl OpenRouter {
         .await
     }
 
-    /// Runs a schema-configured fal.ai 3D or vector endpoint and materializes
+    /// Runs a discovered or overridden fal.ai 3D/vector endpoint and materializes
     /// the result as a Telegram document. Vector artifacts are always wrapped
     /// in a standalone HTML document, as Telegram has no native SVG message.
     pub async fn generate_fal_artifact(
@@ -1547,13 +1559,13 @@ impl OpenRouter {
         };
         let endpoint = self
             .fal
-            .endpoint(model, specialized)
-            .or_else(|_| self.fal.endpoint(model, capability))?;
-        let input = fal_input(endpoint, prompt, media, None)?;
-        let result = self.fal.run(endpoint, input, api_key).await?;
+            .endpoint_any(model, &[specialized, capability], api_key)
+            .await?;
+        let input = fal_input(&endpoint, prompt, media, None)?;
+        let result = self.fal.run(&endpoint, input, api_key).await?;
         let url = self
             .fal
-            .media_urls(endpoint, &result)
+            .media_urls(&endpoint, &result)
             .into_iter()
             .next()
             .context("Fal artifact endpoint returned no output URL")?;
@@ -1609,12 +1621,12 @@ impl OpenRouter {
             };
             let endpoint = self
                 .fal
-                .endpoint(model, capability)
-                .or_else(|_| self.fal.endpoint(model, "image_generation"))?;
-            let input = fal_input(endpoint, prompt, media, None)?;
-            let result = self.fal.run(endpoint, input, api_key).await?;
+                .endpoint_any(model, &[capability, "image_generation"], api_key)
+                .await?;
+            let input = fal_input(&endpoint, prompt, media, None)?;
+            let result = self.fal.run(&endpoint, input, api_key).await?;
             let mut images = Vec::new();
-            for url in self.fal.media_urls(endpoint, &result) {
+            for url in self.fal.media_urls(&endpoint, &result) {
                 let (bytes, media_type) = self.fal.download(&url).await?;
                 if media_type.starts_with("image/") || media_type == "application/octet-stream" {
                     images.push(GeneratedImage {
@@ -1983,13 +1995,13 @@ impl OpenRouter {
         };
         let endpoint = self
             .fal
-            .endpoint(model, specialized)
-            .or_else(|_| self.fal.endpoint(model, capability))?;
-        let input = fal_input(endpoint, prompt, media, None)?;
-        let result = self.fal.run(endpoint, input, api_key).await?;
+            .endpoint_any(model, &[specialized, capability], api_key)
+            .await?;
+        let input = fal_input(&endpoint, prompt, media, None)?;
+        let result = self.fal.run(&endpoint, input, api_key).await?;
         let url = self
             .fal
-            .media_urls(endpoint, &result)
+            .media_urls(&endpoint, &result)
             .into_iter()
             .next()
             .context("Fal returned no generated audio URL")?;
@@ -2057,16 +2069,16 @@ impl OpenRouter {
         api_key: &str,
     ) -> Result<String> {
         if routing.model_provider == ModelProvider::Fal {
-            let endpoint = self.fal.endpoint(model, "transcription")?;
+            let endpoint = self.fal.endpoint(model, "transcription", api_key).await?;
             let media = [MediaInput::Audio {
                 data: data.to_owned(),
                 format: format.to_owned(),
             }];
-            let input = fal_input(endpoint, "", &media, language)?;
-            let result = self.fal.run(endpoint, input, api_key).await?;
+            let input = fal_input(&endpoint, "", &media, language)?;
+            let result = self.fal.run(&endpoint, input, api_key).await?;
             return self
                 .fal
-                .text(endpoint, &result)
+                .text(&endpoint, &result)
                 .context("Fal transcription returned no text");
         }
         let mut body = self.config.transcription.extra.clone();
@@ -2143,13 +2155,13 @@ impl OpenRouter {
             };
             let endpoint = self
                 .fal
-                .endpoint(model, capability)
-                .or_else(|_| self.fal.endpoint(model, "video_generation"))?;
-            let input = fal_input(endpoint, prompt, media, None)?;
-            let result = self.fal.run(endpoint, input, api_key).await?;
+                .endpoint_any(model, &[capability, "video_generation"], api_key)
+                .await?;
+            let input = fal_input(&endpoint, prompt, media, None)?;
+            let result = self.fal.run(&endpoint, input, api_key).await?;
             return self
                 .fal
-                .media_urls(endpoint, &result)
+                .media_urls(&endpoint, &result)
                 .into_iter()
                 .next()
                 .context("Fal returned no generated video URL");
@@ -3111,14 +3123,14 @@ fn fal_input(
     }
     let geometry = requested_geometry(prompt, media);
     if let (Some(field), Some(width)) = (&endpoint.width_field, geometry.width) {
-        input.insert(field.clone(), json!(width));
+        insert_fal_value(&mut input, field, json!(width));
     }
     if let (Some(field), Some(height)) = (&endpoint.height_field, geometry.height) {
-        input.insert(field.clone(), json!(height));
+        insert_fal_value(&mut input, field, json!(height));
     }
     if let (Some(field), Some(aspect_ratio)) = (&endpoint.aspect_ratio_field, geometry.aspect_ratio)
     {
-        input.insert(field.clone(), json!(aspect_ratio));
+        insert_fal_value(&mut input, field, json!(aspect_ratio));
     }
     if endpoint
         .capabilities
@@ -3132,6 +3144,22 @@ fn fal_input(
         );
     }
     Ok(input)
+}
+
+fn insert_fal_value(input: &mut Map<String, Value>, field: &str, value: Value) {
+    let Some((parent, child)) = field.split_once('.') else {
+        input.insert(field.to_owned(), value);
+        return;
+    };
+    let nested = input
+        .entry(parent.to_owned())
+        .or_insert_with(|| Value::Object(Map::new()));
+    if !nested.is_object() {
+        *nested = Value::Object(Map::new());
+    }
+    if let Some(object) = nested.as_object_mut() {
+        object.insert(child.to_owned(), value);
+    }
 }
 
 #[derive(Default)]
@@ -4087,6 +4115,18 @@ mod tests {
         assert_eq!(geometry.width, None);
         assert_eq!(geometry.height, None);
         assert_eq!(geometry.aspect_ratio, None);
+    }
+
+    #[test]
+    fn fal_nested_geometry_replaces_provider_default_with_exact_dimensions() {
+        let mut input = Map::from_iter([(
+            "image_size".to_owned(),
+            Value::String("landscape_4_3".to_owned()),
+        )]);
+        insert_fal_value(&mut input, "image_size.width", json!(1024));
+        insert_fal_value(&mut input, "image_size.height", json!(1536));
+        assert_eq!(input["image_size"]["width"], 1024);
+        assert_eq!(input["image_size"]["height"], 1536);
     }
 
     #[test]

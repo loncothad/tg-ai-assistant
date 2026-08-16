@@ -33,26 +33,28 @@ aihub:
     tools: []
     extra: {}
 
-# fal.ai uses model-specific JSON schemas. Add any fal endpoint here and map
-# its common input/output fields; arbitrary endpoint parameters belong in
-# `defaults`. The queue client handles submission, polling, retries, and result
-# downloads uniformly. The API key remains encrypted per bot after bootstrap.
+# fal.ai models, capability categories, pricing, and OpenAPI schemas are
+# discovered from the Platform API. Entries below are optional overrides for
+# private or unusual endpoints whose schema needs an explicit mapping.
 fal:
   bootstrap_api_key: "${FAL_KEY:-}"
+  catalog_url: "${FAL_CATALOG_URL:-https://api.fal.ai/v1}"
   base_url: "https://queue.fal.run"
   poll_interval_seconds: 2
   timeout_seconds: 900
   endpoints:
+    # This override demonstrates the complete mapping format. It takes
+    # precedence over the live OpenAPI schema for the same endpoint ID.
     - id: "fal-ai/flux/schnell"
       # Override with https://fal.run for a direct call; queue.fal.run is recommended.
       base_url: null
       name: "FLUX Schnell (fal.ai)"
       description: "Fast text-to-image generation through fal.ai."
-      capabilities: ["text_to_image", "image_to_image"]
+      capabilities: ["text_to_image"]
       prompt_field: "prompt"
-      image_field: "image_url"
-      width_field: "width"
-      height_field: "height"
+      image_field: null
+      width_field: "image_size.width"
+      height_field: "image_size.height"
       aspect_ratio_field: null
       output_url_paths: ["/images/0/url"]
       output_text_paths: []
@@ -90,6 +92,30 @@ fal:
     # text_to_audio, video_to_audio, text_to_speech, text_to_3d, image_to_3d,
     # text_to_image_vector, and image_to_image_vector. Vector endpoints must
     # return SVG; Teleforge wraps it in a standalone HTML document.
+    # Optional Hunyuan3D v3 overrides. These are normally discovered
+    # automatically; uncomment only to pin explicit field/output mappings:
+    # - id: "fal-ai/hunyuan3d-v3/text-to-3d"
+    #   base_url: null
+    #   name: "Hunyuan3D v3 · Text to 3D"
+    #   description: "Official fal.ai text-to-3D endpoint."
+    #   capabilities: ["text_to_3d"]
+    #   prompt_field: "prompt"
+    #   image_field: null
+    #   output_url_paths: ["/model_glb/url", "/model_urls/glb/url"]
+    #   output_text_paths: []
+    #   defaults: {}
+    #   created: null
+    # - id: "fal-ai/hunyuan3d-v3/image-to-3d"
+    #   base_url: null
+    #   name: "Hunyuan3D v3 · Image to 3D"
+    #   description: "Official fal.ai image-to-3D endpoint."
+    #   capabilities: ["image_to_3d"]
+    #   prompt_field: ""
+    #   image_field: "input_image_url"
+    #   output_url_paths: ["/model_glb/url", "/model_urls/glb/url"]
+    #   output_text_paths: []
+    #   defaults: {}
+    #   created: null
     # - id: "fal-ai/your-transcription-endpoint"
     #   base_url: null
     #   name: "Configured transcription endpoint"

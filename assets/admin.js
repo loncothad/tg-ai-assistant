@@ -87,6 +87,25 @@ const supports = (model, cap) => {
   return false;
 };
 
+// Provider totals are deliberately capability-aware. fal.ai publishes many
+// operational endpoints (training, JSON utilities, and so on) that do not
+// belong in an assistant generation selector.
+const compatibleModelsFor = (providerId, cap) => catalog
+  .filter(model => model.model_provider === providerId)
+  .filter(model => supports(model, cap));
+
+const compatibleModels = providerId => compatibleModelsFor(providerId, capability);
+
+const noCompatibleModelsMessage = provider => {
+  if (!provider || !provider.available) {
+    return provider?.message || 'This provider is unavailable because its API key is not configured.';
+  }
+  if (provider.id === 'fal') {
+    return 'The live fal.ai catalog currently has no active models mapped to this capability.';
+  }
+  return 'No models in this provider catalog support this capability.';
+};
+
 const fuzzyScore = (model, rawQuery) => {
   const query = rawQuery.trim().toLowerCase();
   if (!query) return 1;
@@ -246,6 +265,11 @@ const showDetail = model => {
   const isOpenRouter = model.model_provider === 'openrouter';
   openrouterControls.hidden = !isOpenRouter;
   directNote.hidden = isOpenRouter;
+  if (!isOpenRouter) {
+    directNote.textContent = model.model_provider === 'fal'
+      ? 'fal.ai models use their live OpenAPI endpoint schema; OpenRouter routing controls do not apply.'
+      : 'AI Hub models are sent directly to AI Hub; OpenRouter routing controls do not apply.';
+  }
   routing.value = isOpenRouter ? selectedRouting : 'auto';
   if (!['chat', 'image_understanding', 'video_understanding'].includes(capability)) routing.querySelector('[value=exacto]')?.remove();
   const saveButton = detail.querySelector('[data-save-model]');
@@ -279,23 +303,33 @@ const renderResults = () => {
     button.addEventListener('click', () => showDetail(model));
     results.append(button);
   });
-  if (!filtered.length) results.append(text('div', 'No models match this search.', 'muted'));
+  if (!filtered.length) {
+    const provider = catalogProviders.find(item => item.id === activeModelProvider);
+    results.append(text('div', query.trim()
+      ? 'No compatible models match this search.'
+      : noCompatibleModelsMessage(provider), 'muted'));
+  }
 };
 
 const renderProviderTabs = () => {
   providerTabs.replaceChildren();
   catalogProviders.forEach(provider => {
-    const button = text('button', `${provider.label}${provider.available ? ` · ${provider.models || 0}` : ' · unavailable'}`);
+    const compatibleCount = provider.available ? compatibleModels(provider.id).length : 0;
+    const countLabel = provider.available ? ` · ${compatibleCount} compatible` : ' · unavailable';
+    const button = text('button', `${provider.label}${countLabel}`);
     button.type = 'button';
     button.role = 'tab';
     button.disabled = !provider.available;
+    if (provider.message) button.title = provider.message;
     button.classList.toggle('selected', provider.id === activeModelProvider);
     button.addEventListener('click', () => {
       activeModelProvider = provider.id;
       chosen = null;
       renderProviderTabs();
       renderResults();
-      detail.replaceChildren(text('div', `Choose a ${provider.label} model to inspect it.`, 'muted'));
+      detail.replaceChildren(text('div', compatibleModels(provider.id).length
+        ? `Choose a ${provider.label} model to inspect it.`
+        : noCompatibleModelsMessage(provider), 'muted'));
       pickerSubtitle.textContent = `${capabilityNames[capability] || capability} · ${provider.label}`;
     });
     providerTabs.append(button);
@@ -320,7 +354,20 @@ const loadCatalog = () => {
 const enrichCards = () => {
   document.querySelectorAll('.model-card').forEach(card => {
     const model = catalog.find(item => item.id === card.dataset.model && item.model_provider === card.dataset.modelProvider);
-    if (!model) return;
+    if (!model) {
+      const provider = catalogProviders.find(item => item.id === card.dataset.modelProvider);
+      const noCompatible = !card.dataset.model && provider?.available &&
+        compatibleModelsFor(provider.id, card.dataset.capability).length === 0;
+      card.querySelector('.model-name').textContent = card.dataset.model
+        ? 'Saved model is not in the current catalog'
+        : 'No model selected';
+      card.querySelector('.model-summary').textContent = card.dataset.model
+        ? 'Choose a compatible model to replace the saved selection.'
+        : noCompatible
+          ? noCompatibleModelsMessage(provider)
+        : 'Choose a model to enable this capability.';
+      return;
+    }
     card.querySelector('.model-name').textContent = model.name;
     const summary = card.querySelector('.model-summary');
     summary.textContent = model.description ? `${model.description.slice(0, 155)}${model.description.length > 155 ? '…' : ''}` : 'Provider metadata is not available.';
@@ -349,11 +396,23 @@ const openPicker = async button => {
     if (!catalogProviders.some(provider => provider.id === activeModelProvider && provider.available)) {
       activeModelProvider = catalogProviders.find(provider => provider.available)?.id || activeModelProvider;
     }
+    // A stale provider selection should not strand the administrator on an
+    // empty tab when another configured provider has compatible models.
+    if (compatibleModels(activeModelProvider).length === 0) {
+      const replacement = catalogProviders.find(provider => provider.available && compatibleModels(provider.id).length > 0);
+      if (replacement) activeModelProvider = replacement.id;
+    }
     renderProviderTabs();
     renderResults();
-    const selected = catalog.find(model => model.id === button.dataset.model && model.model_provider === button.dataset.modelProvider && supports(model, capability));
-    if (selected) showDetail(selected);
-    else detail.replaceChildren(text('div', 'The saved model is no longer in its current provider catalog. Choose a replacement.', 'catalog-error'));
+    const savedModel = button.dataset.model.trim();
+    const selected = savedModel && catalog.find(model => model.id === savedModel && model.model_provider === button.dataset.modelProvider && supports(model, capability));
+    if (selected) {
+      showDetail(selected);
+    } else if (savedModel) {
+      detail.replaceChildren(text('div', 'The saved model is no longer compatible with this capability in its current provider catalog. Choose a replacement.', 'catalog-error'));
+    } else {
+      detail.replaceChildren(text('div', `No model is selected for ${capabilityNames[capability] || capability}. Choose a compatible model.`, 'catalog-error'));
+    }
     search.focus();
   } catch (error) {
     detail.replaceChildren(text('div', `Could not load model catalogs: ${error.message}`, 'catalog-error'));

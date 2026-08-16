@@ -1,8 +1,9 @@
-//! Cached OpenRouter model discovery and capability-aware catalog metadata.
+//! Cached provider model discovery and capability-aware catalog metadata.
 //!
-//! OpenRouter's authenticated, user-scoped catalog is the source of truth for
-//! selectable models. It reflects each bot API key's preferences, guardrails,
-//! privacy policy, and eligibility without maintaining a hard-coded allowlist.
+//! OpenRouter and AI Hub publish their native catalogs, while fal.ai publishes
+//! a paginated endpoint index, account pricing, and on-demand OpenAPI schemas.
+//! Provider data is the source of truth; local fal.ai entries are explicit
+//! overrides for private or irregular endpoint contracts.
 
 use crate::{
     Result,
@@ -12,6 +13,7 @@ use crate::{
 use eyre::{Context, ContextCompat, bail};
 use serde::{Deserialize, Serialize};
 use serde_json::{Map, Value};
+use sha2::{Digest, Sha256};
 use std::{
     collections::{BTreeMap, btree_map::Entry},
     sync::Arc,
@@ -174,6 +176,27 @@ impl ModelCatalogCache {
             .await
     }
 
+    /// Returns fal.ai's live endpoint catalogue merged with administrator
+    /// schema overrides. The live list is account-scoped and paginated.
+    pub async fn get_fal(
+        &self,
+        client: &HttpClient,
+        config: &FalConfig,
+        bot_id: &str,
+        api_key: &str,
+    ) -> Result<Arc<Vec<CatalogModel>>> {
+        let discovered = self
+            .get(
+                client,
+                &config.catalog_url,
+                bot_id,
+                api_key,
+                ModelProvider::Fal,
+            )
+            .await?;
+        Ok(Arc::new(merge_fal_overrides(discovered.as_ref(), config)))
+    }
+
     async fn get(
         &self,
         client: &HttpClient,
@@ -182,7 +205,12 @@ impl ModelCatalogCache {
         api_key: &str,
         model_provider: ModelProvider,
     ) -> Result<Arc<Vec<CatalogModel>>> {
-        let cache_key = format!("{}:{bot_id}", model_provider.as_str());
+        let credential_fingerprint = Sha256::digest(api_key.as_bytes());
+        let cache_key = format!(
+            "{}:{bot_id}:{}",
+            model_provider.as_str(),
+            hex::encode(&credential_fingerprint[..8])
+        );
         {
             let guard = self.inner.read().await;
             if let Some(cached) = guard.get(&cache_key)
@@ -202,7 +230,17 @@ impl ModelCatalogCache {
         let fetched = match model_provider {
             ModelProvider::Openrouter => fetch_openrouter_catalog(client, base_url, api_key).await,
             ModelProvider::Aihub => fetch_aihub_catalog(client, base_url, api_key).await,
-            ModelProvider::Fal => bail!("Fal catalogs are built from configured endpoints"),
+            ModelProvider::Fal => {
+                match tokio::time::timeout(
+                    Duration::from_secs(45),
+                    fetch_fal_catalog(client, base_url, api_key),
+                )
+                .await
+                {
+                    Ok(result) => result,
+                    Err(_) => bail!("Fal model discovery timed out"),
+                }
+            }
         };
         match fetched {
             Ok(models) => {
@@ -229,7 +267,7 @@ impl ModelCatalogCache {
     }
 }
 
-/// Converts configured fal.ai endpoints into the common admin catalog shape.
+/// Converts fal.ai endpoint overrides into the common admin catalog shape.
 pub fn fal_catalog(config: &FalConfig) -> Vec<CatalogModel> {
     let mut models = config
         .endpoints
@@ -294,6 +332,303 @@ pub fn fal_catalog(config: &FalConfig) -> Vec<CatalogModel> {
             .then_with(|| left.name.cmp(&right.name))
     });
     models
+}
+
+fn merge_fal_overrides(discovered: &[CatalogModel], config: &FalConfig) -> Vec<CatalogModel> {
+    let mut models = discovered
+        .iter()
+        .cloned()
+        .map(|model| (model.id.clone(), model))
+        .collect::<BTreeMap<_, _>>();
+    for endpoint in &config.endpoints {
+        let mut configured = fal_catalog(&FalConfig {
+            endpoints: vec![endpoint.clone()],
+            ..config.clone()
+        })
+        .into_iter()
+        .next()
+        .expect("one configured endpoint produces one catalog entry");
+        if let Some(live) = models.get(&endpoint.id) {
+            if endpoint.name.is_empty() {
+                configured.name.clone_from(&live.name);
+            }
+            if endpoint.description.is_empty() {
+                configured.description.clone_from(&live.description);
+            }
+            configured.created = endpoint.created.or(live.created);
+            configured.pricing.clone_from(&live.pricing);
+        }
+        models.insert(endpoint.id.clone(), configured);
+    }
+    let mut models = models.into_values().collect::<Vec<_>>();
+    sort_catalog(&mut models);
+    models
+}
+
+async fn fetch_fal_catalog(
+    client: &HttpClient,
+    base_url: &str,
+    api_key: &str,
+) -> Result<Vec<CatalogModel>> {
+    let base = base_url.trim_end_matches('/');
+    let mut cursor = None::<String>;
+    let mut models = BTreeMap::<String, CatalogModel>::new();
+    // The cursor is server-issued, and the hard page bound prevents a faulty
+    // upstream from keeping an administration request alive indefinitely.
+    for _ in 0..100 {
+        let mut request = client
+            .get(format!("{base}/models"))
+            .header(reqwest::header::AUTHORIZATION, format!("Key {api_key}"))
+            .query(&[("limit", "100"), ("status", "active")])
+            .timeout(Duration::from_secs(20));
+        if let Some(value) = cursor.as_deref() {
+            request = request.query(&[("cursor", value)]);
+        }
+        let response = request
+            .send()
+            .await
+            .context("Failed to fetch fal.ai model catalog")?;
+        if !response.status().is_success() {
+            bail!("Fal model catalog returned HTTP {}", response.status());
+        }
+        let body: Value = response
+            .json()
+            .await
+            .context("Fal returned an invalid model catalog")?;
+        let values = body
+            .get("models")
+            .and_then(Value::as_array)
+            .context("Fal model catalog has no models array")?;
+        for value in values {
+            if let Some(model) = parse_fal_model(value) {
+                models.insert(model.id.clone(), model);
+            }
+        }
+        let next_cursor = body
+            .get("next_cursor")
+            .and_then(Value::as_str)
+            .filter(|value| !value.is_empty())
+            .map(str::to_owned);
+        if next_cursor.is_some() && next_cursor == cursor {
+            bail!("Fal model catalog repeated its pagination cursor");
+        }
+        cursor = next_cursor;
+        if cursor.is_none() || body.get("has_more").and_then(Value::as_bool) == Some(false) {
+            break;
+        }
+    }
+    if models.is_empty() {
+        bail!("Fal returned an empty compatible model catalog");
+    }
+    // Pricing is useful metadata, not a prerequisite for choosing a model.
+    // Keep a slow/rate-limited billing endpoint from holding the catalog UI.
+    let _ = tokio::time::timeout(
+        Duration::from_secs(8),
+        enrich_fal_pricing(client, base, api_key, &mut models),
+    )
+    .await;
+    let mut models = models.into_values().collect::<Vec<_>>();
+    sort_catalog(&mut models);
+    Ok(models)
+}
+
+async fn enrich_fal_pricing(
+    client: &HttpClient,
+    base_url: &str,
+    api_key: &str,
+    models: &mut BTreeMap<String, CatalogModel>,
+) {
+    let ids = models.keys().cloned().collect::<Vec<_>>();
+    for chunk in ids.chunks(50) {
+        let joined = chunk.join(",");
+        let Ok(response) = client
+            .get(format!("{base_url}/models/pricing"))
+            .header(reqwest::header::AUTHORIZATION, format!("Key {api_key}"))
+            .query(&[("endpoint_id", joined.as_str())])
+            .timeout(Duration::from_secs(5))
+            .send()
+            .await
+        else {
+            continue;
+        };
+        if !response.status().is_success() {
+            continue;
+        }
+        let Ok(body) = response.json::<Value>().await else {
+            continue;
+        };
+        for price in body
+            .get("prices")
+            .and_then(Value::as_array)
+            .into_iter()
+            .flatten()
+        {
+            let Some(id) = price.get("endpoint_id").and_then(Value::as_str) else {
+                continue;
+            };
+            let Some(model) = models.get_mut(id) else {
+                continue;
+            };
+            let unit = price
+                .get("unit")
+                .and_then(Value::as_str)
+                .unwrap_or("billing unit");
+            let currency = price
+                .get("currency")
+                .and_then(Value::as_str)
+                .unwrap_or("USD");
+            if let Some(value) = price.get("unit_price").and_then(scalar) {
+                model
+                    .pricing
+                    .insert(format!("fal · {currency} per {unit}"), value);
+            }
+        }
+    }
+}
+
+fn parse_fal_model(value: &Value) -> Option<CatalogModel> {
+    let object = value.as_object()?;
+    let id = string(object, "endpoint_id")?;
+    let metadata = object.get("metadata")?.as_object()?;
+    let category = string(metadata, "category")?;
+    let capabilities = fal_model_capabilities(
+        &category,
+        &id,
+        metadata
+            .get("display_name")
+            .and_then(Value::as_str)
+            .unwrap_or_default(),
+        metadata
+            .get("description")
+            .and_then(Value::as_str)
+            .unwrap_or_default(),
+    );
+    if capabilities.is_empty() {
+        return None;
+    }
+    let (input_modalities, output_modalities) = fal_modalities(&capabilities);
+    let created = ["date", "updated_at"]
+        .into_iter()
+        .filter_map(|key| string(metadata, key))
+        .find_map(|value| {
+            chrono::DateTime::parse_from_rfc3339(&value)
+                .ok()
+                .map(|date| date.timestamp())
+        });
+    Some(CatalogModel {
+        model_provider: ModelProvider::Fal,
+        name: string(metadata, "display_name").unwrap_or_else(|| id.clone()),
+        description: string(metadata, "description").unwrap_or_default(),
+        created,
+        input_modalities,
+        output_modalities,
+        supported_capabilities: capabilities,
+        id,
+        ..CatalogModel::default()
+    })
+}
+
+/// Maps fal.ai's public model categories to Teleforge's input/output-specific
+/// capability names. Unknown operational categories such as training are
+/// intentionally omitted from the assistant model picker.
+pub(crate) fn fal_category_capabilities(category: &str) -> Vec<String> {
+    let normalized = category
+        .trim()
+        .to_ascii_lowercase()
+        .replace(['_', ' '], "-");
+    let capabilities: &[&str] = match normalized.as_str() {
+        "text-to-image" => &["text_to_image"],
+        "image-to-image" => &["image_to_image"],
+        "text-to-video" => &["text_to_video"],
+        "image-to-video" => &["image_to_video"],
+        "video-to-video" => &["video_to_video"],
+        "text-to-audio" | "text-to-music" => &["text_to_audio"],
+        "video-to-audio" => &["video_to_audio"],
+        "text-to-speech" => &["text_to_speech"],
+        "speech-to-text" | "audio-to-text" | "transcription" => &["transcription"],
+        "text-to-3d" => &["text_to_3d"],
+        "image-to-3d" => &["image_to_3d"],
+        "text-to-vector" | "text-to-svg" => &["text_to_image_vector"],
+        "image-to-vector" | "image-to-svg" => &["image_to_image_vector"],
+        "image-to-text" => &["image_understanding"],
+        "video-to-text" => &["video_understanding"],
+        // fal.ai currently groups narrow classifiers and general visual
+        // understanding endpoints together. Schema validation at selection
+        // time determines which input kind a particular endpoint accepts.
+        "vision" => &["image_understanding", "video_understanding"],
+        _ => &[],
+    };
+    capabilities
+        .iter()
+        .map(|value| (*value).to_owned())
+        .collect()
+}
+
+pub(crate) fn fal_model_capabilities(
+    category: &str,
+    id: &str,
+    name: &str,
+    description: &str,
+) -> Vec<String> {
+    let mut capabilities = fal_category_capabilities(category);
+    let identity = format!("{id} {name} {description}").to_ascii_lowercase();
+    if identity
+        .split(|character: char| !character.is_ascii_alphanumeric())
+        .any(|token| token == "svg")
+    {
+        for capability in &mut capabilities {
+            *capability = match capability.as_str() {
+                "text_to_image" => "text_to_image_vector".to_owned(),
+                "image_to_image" => "image_to_image_vector".to_owned(),
+                _ => capability.clone(),
+            };
+        }
+    }
+    capabilities
+}
+
+fn fal_modalities(capabilities: &[String]) -> (Vec<String>, Vec<String>) {
+    let mut input = Vec::new();
+    let mut output = Vec::new();
+    for capability in capabilities {
+        let (inputs, result): (&[&str], &str) = match capability.as_str() {
+            "text_to_image" => (&["text"], "image"),
+            "image_to_image" => (&["text", "image"], "image"),
+            "text_to_video" => (&["text"], "video"),
+            "image_to_video" => (&["text", "image"], "video"),
+            "video_to_video" => (&["text", "video"], "video"),
+            "text_to_audio" => (&["text"], "audio"),
+            "video_to_audio" => (&["text", "video"], "audio"),
+            "text_to_speech" => (&["text"], "speech"),
+            "transcription" => (&["audio"], "transcription"),
+            "text_to_3d" => (&["text"], "3d"),
+            "image_to_3d" => (&["text", "image"], "3d"),
+            "text_to_image_vector" => (&["text"], "vector"),
+            "image_to_image_vector" => (&["text", "image"], "vector"),
+            "image_understanding" => (&["text", "image"], "text"),
+            "video_understanding" => (&["text", "video"], "text"),
+            _ => continue,
+        };
+        append_unique(
+            &mut input,
+            inputs.iter().map(|value| (*value).to_owned()).collect(),
+        );
+        if !output.iter().any(|value| value == result) {
+            output.push(result.to_owned());
+        }
+    }
+    (input, output)
+}
+
+fn sort_catalog(models: &mut [CatalogModel]) {
+    models.sort_by(|left, right| {
+        right
+            .created
+            .unwrap_or_default()
+            .cmp(&left.created.unwrap_or_default())
+            .then_with(|| left.name.cmp(&right.name))
+            .then_with(|| left.id.cmp(&right.id))
+    });
 }
 
 async fn fetch_openrouter_catalog(
@@ -701,6 +1036,44 @@ mod tests {
         assert!(model.supports("image_understanding"));
         assert!(!model.supports("chat"));
         assert!(!model.supports("image_to_image"));
+    }
+
+    #[test]
+    fn fal_live_categories_map_to_exact_selector_capabilities() {
+        let model = parse_fal_model(&serde_json::json!({
+            "endpoint_id": "fal-ai/example/image-to-3d",
+            "metadata": {
+                "display_name": "Example 3D",
+                "description": "Makes a mesh",
+                "category": "image-to-3d",
+                "date": "2026-02-03T04:05:06Z"
+            }
+        }))
+        .unwrap();
+        assert_eq!(model.model_provider, ModelProvider::Fal);
+        assert!(model.supports("image_to_3d"));
+        assert!(!model.supports("text_to_3d"));
+        assert_eq!(model.input_modalities, ["text", "image"]);
+        assert_eq!(model.output_modalities, ["3d"]);
+        assert!(model.created.is_some());
+        assert!(
+            parse_fal_model(&serde_json::json!({
+                "endpoint_id": "fal-ai/example/trainer",
+                "metadata": {"category": "training"}
+            }))
+            .is_none()
+        );
+        let vector = parse_fal_model(&serde_json::json!({
+            "endpoint_id": "fal-ai/image2svg",
+            "metadata": {
+                "display_name": "Image2SVG",
+                "description": "Produces an SVG file",
+                "category": "image-to-image"
+            }
+        }))
+        .unwrap();
+        assert!(vector.supports("image_to_image_vector"));
+        assert!(!vector.supports("image_to_image"));
     }
 
     #[test]

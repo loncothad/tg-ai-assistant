@@ -1145,7 +1145,11 @@ impl BotRunner {
                     )
                     .await?
             }
-            ModelProvider::Fal => Arc::new(crate::catalog::fal_catalog(&self.config.fal)),
+            ModelProvider::Fal => {
+                self.catalog
+                    .get_fal(&self.client, &self.config.fal, &self.bot.id, &key)
+                    .await?
+            }
         };
         let model = models
             .iter()
@@ -1263,7 +1267,11 @@ impl BotRunner {
                     )
                     .await?
             }
-            ModelProvider::Fal => Arc::new(crate::catalog::fal_catalog(&self.config.fal)),
+            ModelProvider::Fal => {
+                self.catalog
+                    .get_fal(&self.client, &self.config.fal, &self.bot.id, &key)
+                    .await?
+            }
         };
         let model = models
             .iter()
@@ -1276,6 +1284,11 @@ impl BotRunner {
             })?;
         if !model.supports(capability) {
             bail!("Model {} does not support {capability}", override_.model);
+        }
+        if override_.model_provider == ModelProvider::Fal {
+            self.openrouter
+                .validate_fal_model(&override_.model, capability, &key)
+                .await?;
         }
         Ok(())
     }
@@ -1870,9 +1883,7 @@ impl BotRunner {
                     },
                 );
                 if routing.model_provider != ModelProvider::Fal {
-                    bail!(
-                        "3D and vector generation currently require a configured fal.ai endpoint"
-                    );
+                    bail!("3D and vector generation currently require a fal.ai endpoint");
                 }
                 let guest_inline_id = if mode == MessageMode::Guest {
                     Some(match guest_pending_id {

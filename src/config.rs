@@ -89,12 +89,16 @@ impl std::str::FromStr for ModelProvider {
     }
 }
 
-/// fal.ai queue API and explicitly configured model endpoints.
+/// fal.ai discovery, queue execution, and optional endpoint-schema overrides.
 #[derive(Clone, Debug, Deserialize, Serialize)]
 #[serde(deny_unknown_fields)]
 pub struct FalConfig {
     #[serde(default)]
     pub bootstrap_api_key: String,
+    /// fal.ai Platform API origin used for live model discovery, pricing, and
+    /// OpenAPI schema lookup.
+    #[serde(default = "default_fal_catalog_url")]
+    pub catalog_url: String,
     #[serde(default = "default_fal_url")]
     pub base_url: String,
     #[serde(default = "default_fal_poll")]
@@ -109,6 +113,7 @@ impl Default for FalConfig {
     fn default() -> Self {
         Self {
             bootstrap_api_key: String::new(),
+            catalog_url: default_fal_catalog_url(),
             base_url: default_fal_url(),
             poll_interval_seconds: default_fal_poll(),
             timeout_seconds: default_fal_timeout(),
@@ -117,10 +122,11 @@ impl Default for FalConfig {
     }
 }
 
-/// One fal.ai endpoint and its schema mapping.
+/// One fal.ai endpoint schema override.
 ///
-/// fal endpoint schemas are model-specific. These mappings keep every endpoint
-/// usable without hard-coding a small vendor model allowlist.
+/// Teleforge normally discovers these mappings from fal.ai's live OpenAPI
+/// catalogue. An entry here overrides discovery for an unusual or private
+/// endpoint without hard-coding a vendor model allowlist into the binary.
 #[derive(Clone, Debug, Deserialize, Serialize)]
 #[serde(deny_unknown_fields)]
 pub struct FalEndpointConfig {
@@ -743,11 +749,14 @@ impl Config {
         if !self.aihub.base_url.starts_with("https://") {
             bail!("AI Hub base_url must use HTTPS");
         }
-        if !self.fal.base_url.starts_with("https://")
+        if !self.fal.catalog_url.starts_with("https://")
+            || !self.fal.base_url.starts_with("https://")
             || self.fal.poll_interval_seconds == 0
             || self.fal.timeout_seconds == 0
         {
-            bail!("Fal base_url must use HTTPS and its polling limits must be non-zero");
+            bail!(
+                "Fal catalog_url and base_url must use HTTPS and its polling limits must be non-zero"
+            );
         }
         let mut fal_ids = HashSet::new();
         for endpoint in &self.fal.endpoints {
@@ -1210,6 +1219,9 @@ fn default_aihub_url() -> String {
 }
 fn default_fal_url() -> String {
     "https://queue.fal.run".into()
+}
+fn default_fal_catalog_url() -> String {
+    "https://api.fal.ai/v1".into()
 }
 fn default_fal_poll() -> u64 {
     2

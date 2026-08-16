@@ -1,6 +1,6 @@
 [package]
 name = "teleforge"
-version = "0.11.0"
+version = "0.12.0"
 edition = "2024"
 rust-version = "1.85"
 description = "Production multi-tenant Telegram AI assistant for OpenRouter, AI Hub, and fal.ai"
