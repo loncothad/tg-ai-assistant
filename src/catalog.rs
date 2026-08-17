@@ -10,18 +10,19 @@ use crate::{
     config::{FalConfig, ModelProvider},
     http::HttpClient,
 };
+use compact_str::CompactString;
 use eyre::{Context, ContextCompat, bail};
 use serde::{Deserialize, Serialize};
 use serde_json::{Map, Value};
 use sha2::{Digest, Sha256};
 use std::{
     collections::{BTreeMap, btree_map::Entry},
-    sync::Arc,
+    sync::{Arc, OnceLock},
     time::{Duration, Instant},
 };
-use tokio::sync::RwLock;
+use tokio::sync::Mutex;
 
-const CATALOG_TTL: Duration = Duration::from_secs(10 * 60);
+const CATALOG_TTL: Duration = Duration::from_secs(60 * 60);
 
 /// Browser-safe model metadata used by the administration model picker.
 #[derive(Clone, Debug, Default, Deserialize, Serialize)]
@@ -172,10 +173,40 @@ struct CachedCatalog {
     models: Arc<Vec<CatalogModel>>,
 }
 
-/// Shared time-bounded cache that avoids blocking each HTMX panel refresh on OpenRouter.
-#[derive(Clone, Default)]
+struct CatalogCacheInner {
+    entries: scc::HashMap<CompactString, CachedCatalog>,
+    refresh_locks: scc::HashMap<CompactString, Arc<Mutex<()>>>,
+}
+
+impl Default for CatalogCacheInner {
+    fn default() -> Self {
+        Self {
+            entries: scc::HashMap::new(),
+            refresh_locks: scc::HashMap::new(),
+        }
+    }
+}
+
+static GLOBAL_CATALOG_CACHE: OnceLock<Arc<CatalogCacheInner>> = OnceLock::new();
+
+/// Process-wide, time-bounded provider catalog cache.
+///
+/// All bot runners and administration states share these entries. Per-key
+/// async mutexes provide single-flight refreshes without serializing unrelated
+/// providers or bot credentials.
+#[derive(Clone)]
 pub struct ModelCatalogCache {
-    inner: Arc<RwLock<BTreeMap<String, CachedCatalog>>>,
+    inner: Arc<CatalogCacheInner>,
+}
+
+impl Default for ModelCatalogCache {
+    fn default() -> Self {
+        Self {
+            inner: GLOBAL_CATALOG_CACHE
+                .get_or_init(|| Arc::new(CatalogCacheInner::default()))
+                .clone(),
+        }
+    }
 }
 
 impl ModelCatalogCache {
@@ -233,26 +264,44 @@ impl ModelCatalogCache {
         model_provider: ModelProvider,
     ) -> Result<Arc<Vec<CatalogModel>>> {
         let credential_fingerprint = Sha256::digest(api_key.as_bytes());
-        let cache_key = format!(
+        let cache_key = CompactString::new(format!(
             "{}:{bot_id}:{}",
             model_provider.as_str(),
             hex::encode(&credential_fingerprint[..8])
-        );
-        {
-            let guard = self.inner.read().await;
-            if let Some(cached) = guard.get(&cache_key)
-                && cached.loaded.elapsed() < CATALOG_TTL
-            {
-                return Ok(cached.models.clone());
-            }
+        ));
+        if let Some(models) = self.fresh(&cache_key).await {
+            return Ok(models);
         }
 
-        let mut guard = self.inner.write().await;
-        if let Some(cached) = guard.get(&cache_key)
-            && cached.loaded.elapsed() < CATALOG_TTL
+        let refresh_lock = if let Some(lock) = self
+            .inner
+            .refresh_locks
+            .read_async(&cache_key, |_, lock| lock.clone())
+            .await
         {
-            return Ok(cached.models.clone());
+            lock
+        } else {
+            let candidate = Arc::new(Mutex::new(()));
+            let _ = self
+                .inner
+                .refresh_locks
+                .insert_async(cache_key.clone(), candidate.clone())
+                .await;
+            self.inner
+                .refresh_locks
+                .read_async(&cache_key, |_, lock| lock.clone())
+                .await
+                .unwrap_or(candidate)
+        };
+        let _refresh_guard = refresh_lock.lock().await;
+        if let Some(models) = self.fresh(&cache_key).await {
+            return Ok(models);
         }
+        let stale = self
+            .inner
+            .entries
+            .read_async(&cache_key, |_, cached| cached.models.clone())
+            .await;
 
         let fetched = match model_provider {
             ModelProvider::Openrouter => fetch_openrouter_catalog(client, base_url, api_key).await,
@@ -272,25 +321,40 @@ impl ModelCatalogCache {
         match fetched {
             Ok(models) => {
                 let models = Arc::new(models);
-                guard.insert(
-                    cache_key.clone(),
-                    CachedCatalog {
-                        loaded: Instant::now(),
-                        models: models.clone(),
-                    },
-                );
+                self.inner.entries.remove_async(&cache_key).await;
+                let _ = self
+                    .inner
+                    .entries
+                    .insert_async(
+                        cache_key.clone(),
+                        CachedCatalog {
+                            loaded: Instant::now(),
+                            models: models.clone(),
+                        },
+                    )
+                    .await;
                 Ok(models)
             }
             Err(error) => {
                 // A stale catalog is preferable to making model administration
                 // unavailable during a transient OpenRouter outage.
-                if let Some(cached) = guard.get(&cache_key) {
-                    Ok(cached.models.clone())
+                if let Some(cached) = stale {
+                    Ok(cached)
                 } else {
                     Err(error)
                 }
             }
         }
+    }
+
+    async fn fresh(&self, cache_key: &CompactString) -> Option<Arc<Vec<CatalogModel>>> {
+        self.inner
+            .entries
+            .read_async(cache_key, |_, cached| {
+                (cached.loaded.elapsed() < CATALOG_TTL).then(|| cached.models.clone())
+            })
+            .await
+            .flatten()
     }
 }
 
@@ -1040,6 +1104,13 @@ fn scalar(value: &Value) -> Option<String> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn default_catalog_handles_share_the_process_cache() {
+        let first = ModelCatalogCache::default();
+        let second = ModelCatalogCache::default();
+        assert!(Arc::ptr_eq(&first.inner, &second.inner));
+    }
 
     fn model(input: &[&str], output: &[&str]) -> CatalogModel {
         CatalogModel {

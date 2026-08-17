@@ -7,9 +7,11 @@ use std::{
     collections::{HashMap, HashSet},
     fs,
     path::Path,
+    sync::Arc,
     time::Duration,
 };
 
+use compact_str::CompactString;
 use eyre::{Context, bail};
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
@@ -30,6 +32,19 @@ pub struct Config {
     pub fal: FalConfig,
     pub search: SearchConfig,
     pub bots: Vec<BotConfig>,
+    #[serde(skip, default = "default_config_cache")]
+    cache: Arc<ConfigCache>,
+}
+
+#[derive(Debug, Default)]
+struct ConfigCache {
+    bots: scc::HashMap<CompactString, Arc<BotConfig>>,
+    models: scc::HashMap<CompactString, Arc<ModelConfig>>,
+    understanding_models: scc::HashMap<CompactString, Arc<ModelConfig>>,
+}
+
+fn default_config_cache() -> Arc<ConfigCache> {
+    Arc::new(ConfigCache::default())
 }
 
 /// Deployment defaults for the AI Hub OpenAI-compatible API.
@@ -675,6 +690,7 @@ impl Config {
         config.apply_bootstrap_environment();
         config.assign_telegram_tokens()?;
         config.validate()?;
+        config.rebuild_cache();
         Ok(config)
     }
 
@@ -1028,16 +1044,81 @@ impl Config {
         }
         Ok(())
     }
-    pub fn model(&self, id: &str) -> Option<&ModelConfig> {
-        self.openrouter.models.iter().find(|model| model.id == id)
+    fn rebuild_cache(&self) {
+        self.cache.bots.clear_sync();
+        self.cache.models.clear_sync();
+        self.cache.understanding_models.clear_sync();
+        for bot in self.bots.iter().filter(|bot| bot.enabled) {
+            let bot = Arc::new(bot.clone());
+            let _ = self
+                .cache
+                .bots
+                .insert_sync(CompactString::new(&bot.id), bot.clone());
+            if let Some(id) = bot.telegram_bot_id() {
+                let _ = self
+                    .cache
+                    .bots
+                    .insert_sync(CompactString::new(id.to_string()), bot.clone());
+            }
+        }
+        for model in &self.openrouter.models {
+            let _ = self
+                .cache
+                .models
+                .insert_sync(CompactString::new(&model.id), Arc::new(model.clone()));
+        }
+        for (capability, models) in [
+            (
+                "image_understanding",
+                &self.openrouter.understanding.image.models,
+            ),
+            (
+                "video_understanding",
+                &self.openrouter.understanding.video.models,
+            ),
+        ] {
+            for model in models {
+                let key = CompactString::new(format!("{capability}\0{}", model.id));
+                let _ = self
+                    .cache
+                    .understanding_models
+                    .insert_sync(key, Arc::new(model.clone()));
+            }
+        }
     }
-    pub fn understanding_model(&self, capability: &str, id: &str) -> Option<&ModelConfig> {
+
+    pub fn model(&self, id: &str) -> Option<ModelConfig> {
+        let key = CompactString::new(id);
+        self.cache
+            .models
+            .read_sync(&key, |_, model| model.as_ref().clone())
+            .or_else(|| {
+                let model = self.openrouter.models.iter().find(|model| model.id == id)?;
+                let model = Arc::new(model.clone());
+                let _ = self.cache.models.insert_sync(key, model.clone());
+                Some(model.as_ref().clone())
+            })
+    }
+    pub fn understanding_model(&self, capability: &str, id: &str) -> Option<ModelConfig> {
+        let key = CompactString::new(format!("{capability}\0{id}"));
+        if let Some(model) = self
+            .cache
+            .understanding_models
+            .read_sync(&key, |_, model| model.as_ref().clone())
+        {
+            return Some(model);
+        }
         let models = match capability {
             "image_understanding" => &self.openrouter.understanding.image.models,
             "video_understanding" => &self.openrouter.understanding.video.models,
             _ => return None,
         };
-        models.iter().find(|model| model.id == id)
+        let model = Arc::new(models.iter().find(|model| model.id == id)?.clone());
+        let _ = self
+            .cache
+            .understanding_models
+            .insert_sync(key, model.clone());
+        Some(model.as_ref().clone())
     }
     /// Resolves a runtime-selected chat-style model while retaining any curated
     /// per-model overrides for entries present in the deployment configuration.
@@ -1050,7 +1131,7 @@ impl Config {
         } else {
             self.understanding_model(capability, id)
         };
-        configured.cloned().unwrap_or_else(|| ModelConfig {
+        configured.unwrap_or_else(|| ModelConfig {
             id: id.to_owned(),
             label: None,
             options: OpenRouterOptions::default(),
@@ -1066,14 +1147,21 @@ impl Config {
     }
     /// Resolves either the deployment's internal bot key or Telegram's numeric
     /// bot ID to the corresponding enabled bot configuration.
-    pub fn bot(&self, reference: &str) -> Option<&BotConfig> {
-        self.bots.iter().find(|bot| {
+    pub fn bot(&self, reference: &str) -> Option<Arc<BotConfig>> {
+        let key = CompactString::new(reference);
+        if let Some(bot) = self.cache.bots.read_sync(&key, |_, bot| bot.clone()) {
+            return Some(bot);
+        }
+        let bot = self.bots.iter().find(|bot| {
             bot.enabled
                 && (bot.id == reference
                     || bot
                         .telegram_bot_id()
                         .is_some_and(|id| id.to_string() == reference))
-        })
+        })?;
+        let bot = Arc::new(bot.clone());
+        let _ = self.cache.bots.insert_sync(key, bot.clone());
+        Some(bot)
     }
     pub fn timeout(&self) -> Duration {
         Duration::from_secs(self.server.request_timeout_seconds)

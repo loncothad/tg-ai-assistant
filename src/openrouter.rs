@@ -977,6 +977,7 @@ impl OpenRouter {
         let mut generated_videos = Vec::new();
         let mut generated_files = Vec::new();
         let mut trusted_generation_prompt = None;
+        let mut completed_media_tools = SmallVec::<[CompactString; 6]>::new();
         for _ in 0..MAX_TOOL_ROUNDS {
             let mut body = Map::new();
             body.insert("messages".into(), Value::Array(messages.clone()));
@@ -1007,6 +1008,7 @@ impl OpenRouter {
                         && !tool_models.three_d_generation.api_key.is_empty(),
                     vector_ready: !tool_models.vector_generation.model.is_empty()
                         && !tool_models.vector_generation.api_key.is_empty(),
+                    completed_media_tools: &completed_media_tools,
                 },
             );
             report_progress(&progress, "Waiting for the selected AI model");
@@ -1070,6 +1072,22 @@ impl OpenRouter {
                     .and_then(Value::as_str)
                     .and_then(|s| serde_json::from_str::<Value>(s).ok())
                     .unwrap_or(Value::Null);
+                let media_tool = is_media_generation_tool(name);
+                if media_tool
+                    && completed_media_tools
+                        .iter()
+                        .any(|completed| completed == name)
+                {
+                    messages.push(json!({
+                        "role": "tool",
+                        "tool_call_id": call_id,
+                        "content": json!({
+                            "status": "already_completed",
+                            "instruction": "Do not call this generation tool again for the same request"
+                        }).to_string()
+                    }));
+                    continue;
+                }
                 let media_prompt = if matches!(
                     name,
                     "generate_image"
@@ -1094,6 +1112,10 @@ impl OpenRouter {
                 } else {
                     None
                 };
+                let media_count_before = generated_images.len()
+                    + generated_audio.len()
+                    + generated_videos.len()
+                    + generated_files.len();
                 let output = match name {
                     "web_search" => {
                         report_progress(&progress, "Searching the web");
@@ -1361,8 +1383,30 @@ impl OpenRouter {
                         json!({ "error": format!("Unknown or disabled tool: {name}") }).to_string()
                     }
                 };
+                let media_count_after = generated_images.len()
+                    + generated_audio.len()
+                    + generated_videos.len()
+                    + generated_files.len();
+                if media_tool && media_count_after > media_count_before {
+                    completed_media_tools.push(CompactString::new(name));
+                }
                 messages
                     .push(json!({ "role": "tool", "tool_call_id": call_id, "content": output }));
+            }
+            // A single-stage media request is complete as soon as the backend
+            // has a real artifact. Asking the chat model for another round can
+            // make it call the same expensive generator again.
+            if !generation_prompt.allow_composed_output && !completed_media_tools.is_empty() {
+                return Ok(AssistantResponse {
+                    text: String::new(),
+                    media_urls: Vec::new(),
+                    generation_id: value.get("id").and_then(Value::as_str).map(str::to_owned),
+                    usage: value.get("usage").cloned(),
+                    generated_images,
+                    generated_audio,
+                    generated_videos,
+                    generated_files,
+                });
             }
         }
         bail!(
@@ -1656,7 +1700,9 @@ impl OpenRouter {
         body.remove("aspect_ratio");
         body.remove("resolution");
         let geometry = requested_geometry(prompt, media);
-        if let (Some(width), Some(height)) = (geometry.width, geometry.height) {
+        if geometry.explicit_size
+            && let (Some(width), Some(height)) = (geometry.width, geometry.height)
+        {
             body.insert("size".into(), json!(format!("{width}x{height}")));
         } else if let Some(aspect_ratio) = geometry.aspect_ratio {
             body.insert("aspect_ratio".into(), json!(aspect_ratio));
@@ -2441,10 +2487,17 @@ struct ToolContext<'a> {
     openrouter_server_tools: bool,
     three_d_ready: bool,
     vector_ready: bool,
+    completed_media_tools: &'a [CompactString],
 }
 
 fn add_tools(body: &mut Map<String, Value>, capabilities: &Capabilities, context: ToolContext<'_>) {
     let mut additions = Vec::new();
+    let completed = |name: &str| {
+        context
+            .completed_media_tools
+            .iter()
+            .any(|completed| completed == name)
+    };
     if capabilities.search && context.search_ready {
         if context.search_provider == SearchProvider::Openrouter && context.openrouter_server_tools
         {
@@ -2467,42 +2520,42 @@ fn add_tools(body: &mut Map<String, Value>, capabilities: &Capabilities, context
     if capabilities.web_fetch && context.openrouter_server_tools {
         additions.push(openrouter_web_fetch_tool(context.web_fetch));
     }
-    if capabilities.image {
+    if capabilities.image && !completed("generate_image") {
         additions.push(function_tool(
             "generate_image",
             "Generate an image and deliver it to Telegram.",
             "prompt",
         ));
     }
-    if capabilities.audio {
+    if capabilities.audio && !completed("generate_speech") && !completed("generate_audio") {
         additions.push(function_tool(
             "generate_speech",
             "Generate spoken audio and deliver it to Telegram.",
             "text",
         ));
     }
-    if capabilities.music {
+    if capabilities.music && !completed("generate_music") {
         additions.push(function_tool(
             "generate_music",
             "Generate music or other non-speech audio and deliver it to Telegram.",
             "prompt",
         ));
     }
-    if capabilities.video {
+    if capabilities.video && !completed("generate_video") {
         additions.push(function_tool(
             "generate_video",
             "Generate a video and deliver it to Telegram.",
             "prompt",
         ));
     }
-    if capabilities.three_d && context.three_d_ready {
+    if capabilities.three_d && context.three_d_ready && !completed("generate_3d") {
         additions.push(function_tool(
             "generate_3d",
             "Generate a 3D artifact from text and an optional attached image, then deliver it as a Telegram file.",
             "prompt",
         ));
     }
-    if capabilities.vector && context.vector_ready {
+    if capabilities.vector && context.vector_ready && !completed("generate_vector") {
         additions.push(function_tool(
             "generate_vector",
             "Generate vector artwork from text and an optional attached image, then deliver it as a safe HTML file.",
@@ -2707,6 +2760,19 @@ fn composed_generation_input(tool: &str, arguments: &Value) -> Option<String> {
     }
     truncate_utf8(&mut value, 16_000);
     Some(value)
+}
+
+fn is_media_generation_tool(name: &str) -> bool {
+    matches!(
+        name,
+        "generate_image"
+            | "generate_speech"
+            | "generate_audio"
+            | "generate_music"
+            | "generate_video"
+            | "generate_3d"
+            | "generate_vector"
+    )
 }
 
 fn enabled_planner_skills(capabilities: &Capabilities) -> SmallVec<[&'static str; 16]> {
@@ -3124,10 +3190,14 @@ fn fal_input(
         input.insert(field.clone(), json!(language));
     }
     let geometry = requested_geometry(prompt, media);
-    if let (Some(field), Some(width)) = (&endpoint.width_field, geometry.width) {
+    if geometry.explicit_size
+        && let (Some(field), Some(width)) = (&endpoint.width_field, geometry.width)
+    {
         insert_fal_value(&mut input, field, json!(width));
     }
-    if let (Some(field), Some(height)) = (&endpoint.height_field, geometry.height) {
+    if geometry.explicit_size
+        && let (Some(field), Some(height)) = (&endpoint.height_field, geometry.height)
+    {
         insert_fal_value(&mut input, field, json!(height));
     }
     if let (Some(field), Some(aspect_ratio)) = (&endpoint.aspect_ratio_field, geometry.aspect_ratio)
@@ -3169,6 +3239,8 @@ struct RequestedGeometry {
     width: Option<u32>,
     height: Option<u32>,
     aspect_ratio: Option<String>,
+    /// Exact pixels came from the user's prompt rather than reference media.
+    explicit_size: bool,
 }
 
 /// Extracts explicit `WIDTHxHEIGHT`/`W:H` requests, otherwise inherits the
@@ -3211,8 +3283,49 @@ fn requested_geometry(prompt: &str, media: &[MediaInput]) -> RequestedGeometry {
         width: size.map(|value| value.0),
         height: size.map(|value| value.1),
         aspect_ratio: explicit_ratio
-            .or_else(|| size.map(|(width, height)| reduced_ratio(width, height))),
+            .or_else(|| {
+                reference_size.map(|(width, height)| nearest_supported_ratio(width, height))
+            })
+            .or_else(|| explicit_size.map(|(width, height)| reduced_ratio(width, height))),
+        explicit_size: explicit_size.is_some(),
     }
+}
+
+/// Chooses the closest normalized ratio accepted across current media
+/// providers. This avoids passing camera-specific ratios such as `239:320`
+/// while preserving the source composition to within a small fraction.
+fn nearest_supported_ratio(width: u32, height: u32) -> String {
+    const RATIOS: &[(u32, u32)] = &[
+        (1, 1),
+        (16, 9),
+        (9, 16),
+        (4, 3),
+        (3, 4),
+        (3, 2),
+        (2, 3),
+        (4, 5),
+        (5, 4),
+        (1, 2),
+        (2, 1),
+        (1, 4),
+        (4, 1),
+        (9, 21),
+        (21, 9),
+    ];
+    let source = f64::from(width) / f64::from(height.max(1));
+    let &(left, right) = RATIOS
+        .iter()
+        .min_by(|(left_width, left_height), (right_width, right_height)| {
+            let left_error = (source / (f64::from(*left_width) / f64::from(*left_height)))
+                .ln()
+                .abs();
+            let right_error = (source / (f64::from(*right_width) / f64::from(*right_height)))
+                .ln()
+                .abs();
+            left_error.total_cmp(&right_error)
+        })
+        .expect("normalized ratio list is non-empty");
+    format!("{left}:{right}")
 }
 
 fn reduced_ratio(width: u32, height: u32) -> String {
@@ -3658,6 +3771,7 @@ mod tests {
                 openrouter_server_tools: true,
                 three_d_ready: false,
                 vector_ready: false,
+                completed_media_tools: &[],
             },
         );
         let names = body["tools"]
@@ -3696,6 +3810,7 @@ mod tests {
                 openrouter_server_tools: false,
                 three_d_ready: false,
                 vector_ready: false,
+                completed_media_tools: &[],
             },
         );
         assert!(body["tools"].as_array().unwrap().iter().all(|tool| {
@@ -4104,11 +4219,24 @@ mod tests {
         assert_eq!(inherited.width, Some(1920));
         assert_eq!(inherited.height, Some(1080));
         assert_eq!(inherited.aspect_ratio.as_deref(), Some("16:9"));
+        assert!(!inherited.explicit_size);
 
         let explicit = requested_geometry("render at 1024x1536 using 2:3", &media);
         assert_eq!(explicit.width, Some(1024));
         assert_eq!(explicit.height, Some(1536));
         assert_eq!(explicit.aspect_ratio.as_deref(), Some("2:3"));
+        assert!(explicit.explicit_size);
+
+        let telegram_photo = requested_geometry(
+            "replace the menu headings",
+            &[MediaInput::Image {
+                url: "data:image/jpeg;base64,AA==".into(),
+                width: Some(717),
+                height: Some(960),
+            }],
+        );
+        assert_eq!(telegram_photo.aspect_ratio.as_deref(), Some("3:4"));
+        assert!(!telegram_photo.explicit_size);
     }
 
     #[test]
@@ -4117,6 +4245,7 @@ mod tests {
         assert_eq!(geometry.width, None);
         assert_eq!(geometry.height, None);
         assert_eq!(geometry.aspect_ratio, None);
+        assert!(!geometry.explicit_size);
     }
 
     #[test]

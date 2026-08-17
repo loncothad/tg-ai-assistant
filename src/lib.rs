@@ -12,5 +12,6 @@ pub mod openrouter;
 pub mod rich;
 pub mod search;
 pub mod telegram;
+pub mod youtube;
 
 pub type Result<T> = eyre::Result<T>;

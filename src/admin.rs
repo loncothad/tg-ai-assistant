@@ -611,6 +611,7 @@ async fn set_capability(
         let required_provider = if form.capability == "search" {
             settings
                 .search_provider
+                .clone()
                 .unwrap_or_else(|| state.config.search.default_provider.as_str().to_owned())
         } else if form.capability == "web_fetch" {
             "openrouter".to_owned()
@@ -749,9 +750,9 @@ async fn set_content(
                             &bot,
                             &kind,
                             if kind == "prompt" {
-                                s.custom_system_prompt
+                                s.custom_system_prompt.clone()
                             } else {
-                                s.custom_skills
+                                s.custom_skills.clone()
                             },
                             false,
                         )
@@ -816,7 +817,7 @@ async fn import_skill_bundle(store: &Store, bot: &str, content: &str) -> Result<
     if bundle.version != 1 {
         bail!("Unsupported skill bundle version")
     }
-    let mut settings = store.settings(bot).await?;
+    let mut settings = (*store.settings(bot).await?).clone();
     for skill in bundle.builtins {
         let _metadata = (skill.description, skill.instructions);
         settings
@@ -842,7 +843,7 @@ async fn export_skills(
         Err(e) => return internal(e),
     };
     let enabled = |id: &str| settings.capabilities.enabled(id);
-    let skills=crate::defaults::BUILTIN_SKILLS.iter().map(|s|serde_json::json!({"id":s.id,"description":s.description,"enabled":enabled(s.id),"instructions":s.instructions})).collect::<Vec<_>>();
+    let skills=crate::defaults::BUILTIN_SKILLS.iter().map(|s|serde_json::json!({"id":s.id,"name":s.package_name,"description":s.description(),"enabled":enabled(s.id),"instructions":s.instructions()})).collect::<Vec<_>>();
     let bundle = serde_json::json!({"version":1,"builtins":skills,"custom":settings.custom_skills,"custom_enabled":settings.custom_skills_enabled});
     no_store(
         Html(format!(
@@ -1108,13 +1109,10 @@ async fn render_html(state: &AdminState, bot: &str) -> Result<String> {
                     model_provider_for_capability(&settings, "chat") == ModelProvider::Openrouter
                         && openrouter_ready
                 }
-                "youtube" => {
-                    settings.capabilities.enabled("video_understanding")
-                        && configured
-                            .get(model_provider_for_capability(&settings, "video_understanding").as_str())
-                            .copied()
-                            .unwrap_or(false)
-                }
+                "youtube_cc" => configured
+                    .get(model_provider_for_capability(&settings, "chat").as_str())
+                    .copied()
+                    .unwrap_or(false),
                 "prompt_expansion" => openrouter_ready,
                 _ => configured
                     .get(selected_model_provider.as_str())
@@ -1127,8 +1125,8 @@ async fn render_html(state: &AdminState, bot: &str) -> Result<String> {
                 "Unavailable: the selected search provider has no configured API key"
             } else if skill.id == "web_fetch" {
                 "Unavailable: Web Fetch requires an OpenRouter chat model and API key"
-            } else if skill.id == "youtube" {
-                "Unavailable: YouTube description requires media understanding and a video-understanding provider key"
+            } else if skill.id == "youtube_cc" {
+                "Unavailable: YouTube caption answers require the selected chat provider API key"
             } else if skill.id == "prompt_expansion" {
                 "Unavailable: prompt expansion requires the OpenRouter intent processor key"
             } else {
@@ -1141,7 +1139,7 @@ async fn render_html(state: &AdminState, bot: &str) -> Result<String> {
                 if available { "" } else { "disabled" },
                 esc(skill.id),
                 if on { "enabled" } else { "disabled" },
-                esc(skill.description),
+                esc(skill.description()),
                 availability
             )
         })
@@ -1324,7 +1322,7 @@ fn model_provider_for_skill(settings: &crate::db::BotSettings, skill: &str) -> M
         "transcription" => "transcription",
         "file" => "chat",
         "model_upgrade" => "model_upgrade",
-        "youtube" => "video_understanding",
+        "youtube_cc" | "youtube" => "chat",
         "prompt_expansion" => "intent_planning",
         _ => "chat",
     };
@@ -1410,7 +1408,7 @@ fn authorize(state: &AdminState, bot_id: &str, headers: &HeaderMap) -> Result<(u
         .get("x-telegram-init-data")
         .and_then(|v| v.to_str().ok())
         .context("Missing Telegram authentication")?;
-    let user = authenticate_init_data(bot, state.config.server.admin_init_data_ttl_seconds, raw)?;
+    let user = authenticate_init_data(&bot, state.config.server.admin_init_data_ttl_seconds, raw)?;
     Ok((user, bot.id.clone()))
 }
 

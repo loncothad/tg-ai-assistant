@@ -1,3 +1,8 @@
+---
+name: prompt-expansion
+description: Expand a prompt only after the user explicitly asks and the intent processor authorizes it.
+---
+
 # Explicit prompt expansion
 
 Expand a prompt only when `prompt_expansion_authorized=true` appears in the

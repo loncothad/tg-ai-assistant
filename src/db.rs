@@ -98,6 +98,11 @@ pub struct Store {
     cipher: Arc<ChaCha20Poly1305>,
     history_limit: usize,
     mutation_lock: Arc<tokio::sync::Mutex<()>>,
+    settings_cache: Arc<scc::HashMap<CompactString, Arc<BotSettings>>>,
+    history_cache: Arc<scc::HashMap<CompactString, Arc<Vec<ChatMessage>>>>,
+    credential_cache: Arc<scc::HashMap<CompactString, Option<Arc<str>>>>,
+    access_cache: Arc<scc::HashMap<CompactString, Option<bool>>>,
+    offset_cache: Arc<scc::HashMap<CompactString, Option<i64>>>,
 }
 
 #[derive(Clone, Debug, Deserialize, Serialize, PartialEq, Eq)]
@@ -125,9 +130,9 @@ pub struct Capabilities {
     pub file: bool,
     #[serde(default = "enabled_by_default")]
     pub model_upgrade: bool,
-    /// Allows public YouTube URLs to be supplied as video-model inputs.
-    #[serde(default = "enabled_by_default")]
-    pub youtube: bool,
+    /// Allows public YouTube URLs to be understood from their caption tracks.
+    #[serde(default = "enabled_by_default", alias = "youtube")]
+    pub youtube_cc: bool,
     /// Allows explicitly requested prompt expansion after planner approval.
     #[serde(default = "enabled_by_default")]
     pub prompt_expansion: bool,
@@ -180,7 +185,7 @@ impl Default for Capabilities {
             transcription: true,
             file: true,
             model_upgrade: true,
-            youtube: true,
+            youtube_cc: true,
             prompt_expansion: true,
             text_to_image: None,
             image_to_image: None,
@@ -226,7 +231,7 @@ impl Capabilities {
             "transcription" => self.transcription,
             "file" => self.file,
             "model_upgrade" => self.model_upgrade,
-            "youtube" => self.youtube,
+            "youtube_cc" | "youtube" => self.youtube_cc,
             "prompt_expansion" => self.prompt_expansion,
             _ => false,
         }
@@ -348,7 +353,7 @@ impl Capabilities {
             "transcription" => self.transcription = enabled,
             "file" => self.file = enabled,
             "model_upgrade" => self.model_upgrade = enabled,
-            "youtube" => self.youtube = enabled,
+            "youtube_cc" | "youtube" => self.youtube_cc = enabled,
             "prompt_expansion" => self.prompt_expansion = enabled,
             _ => bail!("Unknown capability: {capability}"),
         }
@@ -428,20 +433,35 @@ impl Store {
                 .await
                 .wrap_err("Failed to create database directory")?;
         }
-        let db = Database::create(&config.path).wrap_err("Failed to open local redb database")?;
+        let path = config.path.clone();
+        let db = tokio::task::spawn_blocking(move || Database::create(path))
+            .await
+            .wrap_err("Database open task failed")?
+            .wrap_err("Failed to open local redb database")?;
         let store = Self {
             db: Arc::new(db),
             cipher: Arc::new(ChaCha20Poly1305::new_from_slice(&key).expect("validated key")),
             history_limit: config.history_limit,
             mutation_lock: Arc::new(tokio::sync::Mutex::new(())),
+            settings_cache: Arc::new(scc::HashMap::new()),
+            history_cache: Arc::new(scc::HashMap::new()),
+            credential_cache: Arc::new(scc::HashMap::new()),
+            access_cache: Arc::new(scc::HashMap::new()),
+            offset_cache: Arc::new(scc::HashMap::new()),
         };
-        let write = store.db.begin_write()?;
-        {
-            write.open_table(STATE)?;
-            write.open_table(ACCESS)?;
-            write.open_table(SECRETS)?;
-        }
-        write.commit()?;
+        let db = store.db.clone();
+        tokio::task::spawn_blocking(move || -> Result<()> {
+            let write = db.begin_write()?;
+            {
+                write.open_table(STATE)?;
+                write.open_table(ACCESS)?;
+                write.open_table(SECRETS)?;
+            }
+            write.commit()?;
+            Ok(())
+        })
+        .await
+        .wrap_err("Database initialization task failed")??;
         Ok(store)
     }
 
@@ -489,7 +509,7 @@ impl Store {
             )
             .await?;
         }
-        let mut settings = self.settings(&bot.id).await?;
+        let mut settings = (*self.settings(&bot.id).await?).clone();
         let mut changed = false;
         for (value, fallback) in [
             (
@@ -593,23 +613,46 @@ impl Store {
         Ok(())
     }
 
-    pub async fn settings(&self, bot_id: &str) -> Result<BotSettings> {
+    pub async fn settings(&self, bot_id: &str) -> Result<Arc<BotSettings>> {
         self.get_settings(bot_id)
             .await?
             .ok_or_else(|| eyre::eyre!("Bot settings are not initialized"))
     }
-    async fn get_settings(&self, bot_id: &str) -> Result<Option<BotSettings>> {
-        self.get_json(&settings_key(bot_id)).await
+    async fn get_settings(&self, bot_id: &str) -> Result<Option<Arc<BotSettings>>> {
+        let cache_key = CompactString::new(bot_id);
+        if let Some(settings) = self
+            .settings_cache
+            .read_async(&cache_key, |_, value| value.clone())
+            .await
+        {
+            return Ok(Some(settings));
+        }
+        let Some(settings) = self.get_json::<BotSettings>(&settings_key(bot_id)).await? else {
+            return Ok(None);
+        };
+        let settings = Arc::new(settings);
+        let _ = self
+            .settings_cache
+            .insert_async(cache_key, settings.clone())
+            .await;
+        Ok(Some(settings))
     }
     pub async fn save_settings(&self, bot_id: &str, settings: &BotSettings) -> Result<()> {
         let _guard = self.mutation_lock.lock().await;
         self.save_settings_unlocked(bot_id, settings).await
     }
     async fn save_settings_unlocked(&self, bot_id: &str, settings: &BotSettings) -> Result<()> {
-        self.put_json(&settings_key(bot_id), settings).await
+        self.put_json(&settings_key(bot_id), settings).await?;
+        let key = CompactString::new(bot_id);
+        self.settings_cache.remove_async(&key).await;
+        let _ = self
+            .settings_cache
+            .insert_async(key, Arc::new(settings.clone()))
+            .await;
+        Ok(())
     }
     pub async fn selected_model(&self, bot_id: &str) -> Result<String> {
-        Ok(self.settings(bot_id).await?.selected_model)
+        Ok(self.settings(bot_id).await?.selected_model.clone())
     }
     pub async fn set_model(
         &self,
@@ -620,7 +663,7 @@ impl Store {
         actor: u64,
     ) -> Result<()> {
         let _guard = self.mutation_lock.lock().await;
-        let mut settings = self.settings(bot_id).await?;
+        let mut settings = (*self.settings(bot_id).await?).clone();
         match capability {
             "chat" => settings.selected_model = model.into(),
             "output_processing" => settings.selected_output_processing_model = model.into(),
@@ -650,7 +693,7 @@ impl Store {
             .await
     }
     pub async fn selected_search_provider(&self, bot_id: &str) -> Result<Option<String>> {
-        Ok(self.settings(bot_id).await?.search_provider)
+        Ok(self.settings(bot_id).await?.search_provider.clone())
     }
     pub async fn set_search_provider(
         &self,
@@ -659,7 +702,7 @@ impl Store {
         actor: u64,
     ) -> Result<()> {
         let _guard = self.mutation_lock.lock().await;
-        let mut settings = self.settings(bot_id).await?;
+        let mut settings = (*self.settings(bot_id).await?).clone();
         settings.search_provider = Some(provider.into());
         self.save_settings_unlocked(bot_id, &settings).await?;
         self.audit(bot_id, Some(actor), "search_provider.set", Some(provider))
@@ -673,7 +716,7 @@ impl Store {
         enabled: bool,
     ) -> Result<()> {
         let _guard = self.mutation_lock.lock().await;
-        let mut settings = self.settings(bot_id).await?;
+        let mut settings = (*self.settings(bot_id).await?).clone();
         settings.capabilities.set(capability, enabled)?;
         self.save_settings_unlocked(bot_id, &settings).await
     }
@@ -686,7 +729,7 @@ impl Store {
         enabled: bool,
     ) -> Result<()> {
         let _guard = self.mutation_lock.lock().await;
-        let mut settings = self.settings(bot_id).await?;
+        let mut settings = (*self.settings(bot_id).await?).clone();
         match kind {
             "prompt" => {
                 settings.custom_system_prompt = content;
@@ -715,7 +758,7 @@ impl Store {
         let mut skills = crate::defaults::BUILTIN_SKILLS
             .iter()
             .filter(|skill| enabled(skill.id))
-            .map(|skill| skill.instructions)
+            .map(|skill| skill.instructions())
             .collect::<Vec<_>>()
             .join("\n\n");
         if settings.custom_skills_enabled {
@@ -728,31 +771,69 @@ impl Store {
     }
 
     pub async fn credential_configured(&self, bot_id: &str, provider: &str) -> Result<bool> {
-        Ok(self
-            .get_raw(SECRETS, &secret_key(bot_id, provider))?
-            .is_some())
+        Ok(self.credential(bot_id, provider).await?.is_some())
     }
     pub async fn set_credential(&self, bot_id: &str, provider: &str, secret: &str) -> Result<()> {
         validate_provider(provider)?;
         let encrypted = self.encrypt(secret.as_bytes())?;
-        self.put_raw(SECRETS, &secret_key(bot_id, provider), &encrypted)
+        let key = secret_key(bot_id, provider);
+        self.put_raw(SECRETS, &key, &encrypted).await?;
+        let cache_key = CompactString::new(&key);
+        self.credential_cache.remove_async(&cache_key).await;
+        let _ = self
+            .credential_cache
+            .insert_async(cache_key, Some(Arc::from(secret)))
+            .await;
+        Ok(())
     }
     pub async fn remove_credential(&self, bot_id: &str, provider: &str) -> Result<()> {
         validate_provider(provider)?;
-        self.remove_raw(SECRETS, &secret_key(bot_id, provider))
+        let key = secret_key(bot_id, provider);
+        self.remove_raw(SECRETS, &key).await?;
+        let cache_key = CompactString::new(&key);
+        self.credential_cache.remove_async(&cache_key).await;
+        let _ = self.credential_cache.insert_async(cache_key, None).await;
+        Ok(())
     }
     pub async fn credential(&self, bot_id: &str, provider: &str) -> Result<Option<String>> {
         validate_provider(provider)?;
-        self.get_raw(SECRETS, &secret_key(bot_id, provider))?
+        let key = secret_key(bot_id, provider);
+        let cache_key = CompactString::new(&key);
+        if let Some(value) = self
+            .credential_cache
+            .read_async(&cache_key, |_, value| value.clone())
+            .await
+        {
+            return Ok(value.map(|value| value.to_string()));
+        }
+        let value = self
+            .get_raw(SECRETS, &key)
+            .await?
             .map(|value| {
                 String::from_utf8(self.decrypt(&value)?)
                     .wrap_err("Decrypted credential is invalid UTF-8")
             })
-            .transpose()
+            .transpose()?;
+        let _ = self
+            .credential_cache
+            .insert_async(cache_key, value.as_deref().map(Arc::from))
+            .await;
+        Ok(value)
     }
 
     pub async fn user_allowed(&self, bot_id: &str, user_id: u64) -> Result<Option<bool>> {
-        Ok(self.get_u8(&access_key(bot_id, user_id))?.map(|v| v != 0))
+        let key = access_key(bot_id, user_id);
+        let cache_key = CompactString::new(&key);
+        if let Some(value) = self
+            .access_cache
+            .read_async(&cache_key, |_, value| *value)
+            .await
+        {
+            return Ok(value);
+        }
+        let value = self.get_u8(&key).await?.map(|value| value != 0);
+        let _ = self.access_cache.insert_async(cache_key, value).await;
+        Ok(value)
     }
     pub async fn set_user_allowed(
         &self,
@@ -761,7 +842,14 @@ impl Store {
         allowed: bool,
         actor: u64,
     ) -> Result<()> {
-        self.put_u8(&access_key(bot_id, user_id), u8::from(allowed))?;
+        let key = access_key(bot_id, user_id);
+        self.put_u8(&key, u8::from(allowed)).await?;
+        let cache_key = CompactString::new(&key);
+        self.access_cache.remove_async(&cache_key).await;
+        let _ = self
+            .access_cache
+            .insert_async(cache_key, Some(allowed))
+            .await;
         self.audit(
             bot_id,
             Some(actor),
@@ -786,10 +874,13 @@ impl Store {
     ) -> Result<bool> {
         let _guard = self.mutation_lock.lock().await;
         let key = access_key(bot_id, user_id);
-        if self.get_u8(&key)?.is_none() {
+        if self.get_u8(&key).await?.is_none() {
             return Ok(false);
         }
-        self.remove_u8(&key)?;
+        self.remove_u8(&key).await?;
+        let cache_key = CompactString::new(&key);
+        self.access_cache.remove_async(&cache_key).await;
+        let _ = self.access_cache.insert_async(cache_key, None).await;
         self.audit(
             bot_id,
             Some(actor),
@@ -802,26 +893,44 @@ impl Store {
 
     pub async fn list_allowed_users(&self, bot_id: &str) -> Result<Vec<u64>> {
         let prefix = format!("{bot_id}|");
-        let read = self.db.begin_read()?;
-        let table = read.open_table(ACCESS)?;
-        let mut users = Vec::new();
-        for entry in table.iter()? {
-            let (key, value) = entry?;
-            if value.value() != 0 && key.value().starts_with(&prefix) {
-                if let Ok(id) = key.value()[prefix.len()..].parse() {
+        let db = self.db.clone();
+        tokio::task::spawn_blocking(move || -> Result<Vec<u64>> {
+            let read = db.begin_read()?;
+            let table = read.open_table(ACCESS)?;
+            let mut users = Vec::new();
+            for entry in table.iter()? {
+                let (key, value) = entry?;
+                if value.value() != 0
+                    && key.value().starts_with(&prefix)
+                    && let Ok(id) = key.value()[prefix.len()..].parse()
+                {
                     users.push(id);
                 }
             }
-        }
-        users.sort_unstable();
-        Ok(users)
+            users.sort_unstable();
+            Ok(users)
+        })
+        .await
+        .wrap_err("Allowlist scan task failed")?
     }
 
-    pub async fn history(&self, bot_id: &str, scope: &str) -> Result<Vec<ChatMessage>> {
-        Ok(self
-            .get_json(&history_key(bot_id, scope))
-            .await?
-            .unwrap_or_default())
+    pub async fn history(&self, bot_id: &str, scope: &str) -> Result<Arc<Vec<ChatMessage>>> {
+        let key = history_key(bot_id, scope);
+        let cache_key = CompactString::new(&key);
+        if let Some(history) = self
+            .history_cache
+            .read_async(&cache_key, |_, value| value.clone())
+            .await
+        {
+            return Ok(history);
+        }
+        let history: Arc<Vec<ChatMessage>> =
+            Arc::new(self.get_json(&key).await?.unwrap_or_default());
+        let _ = self
+            .history_cache
+            .insert_async(cache_key, history.clone())
+            .await;
+        Ok(history)
     }
     pub async fn append_message(
         &self,
@@ -831,7 +940,8 @@ impl Store {
         content: &str,
     ) -> Result<()> {
         let _guard = self.mutation_lock.lock().await;
-        let mut values: Vec<ChatMessage> = self.history(bot_id, scope).await?;
+        let key = history_key(bot_id, scope);
+        let mut values = (*self.history(bot_id, scope).await?).clone();
         values.push(ChatMessage {
             role: role.into(),
             content: content.into(),
@@ -839,16 +949,38 @@ impl Store {
         if values.len() > self.history_limit {
             values.drain(..values.len() - self.history_limit);
         }
-        self.put_json(&history_key(bot_id, scope), &values).await
+        self.put_json(&key, &values).await?;
+        let cache_key = CompactString::new(&key);
+        self.history_cache.remove_async(&cache_key).await;
+        let _ = self
+            .history_cache
+            .insert_async(cache_key, Arc::new(values))
+            .await;
+        Ok(())
     }
     pub async fn clear_history(&self, bot_id: &str, scope: &str) -> Result<()> {
-        self.remove_raw(STATE, &history_key(bot_id, scope))
+        let key = history_key(bot_id, scope);
+        self.remove_raw(STATE, &key).await?;
+        self.history_cache
+            .remove_async(&CompactString::new(&key))
+            .await;
+        Ok(())
     }
     pub async fn offset(&self, bot_id: &str) -> Result<Option<i64>> {
-        self.get_json(&format!("offset|{bot_id}")).await
+        let key = CompactString::new(bot_id);
+        if let Some(offset) = self.offset_cache.read_async(&key, |_, value| *value).await {
+            return Ok(offset);
+        }
+        let offset = self.get_json(&format!("offset|{bot_id}")).await?;
+        let _ = self.offset_cache.insert_async(key, offset).await;
+        Ok(offset)
     }
     pub async fn set_offset(&self, bot_id: &str, offset: i64) -> Result<()> {
-        self.put_json(&format!("offset|{bot_id}"), &offset).await
+        self.put_json(&format!("offset|{bot_id}"), &offset).await?;
+        let key = CompactString::new(bot_id);
+        self.offset_cache.remove_async(&key).await;
+        let _ = self.offset_cache.insert_async(key, Some(offset)).await;
+        Ok(())
     }
     pub async fn audit(
         &self,
@@ -866,65 +998,107 @@ impl Store {
     }
 
     async fn get_json<T: DeserializeOwned>(&self, key: &str) -> Result<Option<T>> {
-        self.get_raw(STATE, key)?
+        self.get_raw(STATE, key)
+            .await?
             .map(|v| serde_json::from_slice(&v).wrap_err("Stored JSON is invalid"))
             .transpose()
     }
     async fn put_json<T: Serialize>(&self, key: &str, value: &T) -> Result<()> {
-        self.put_raw(STATE, key, &serde_json::to_vec(value)?)
+        self.put_raw(STATE, key, &serde_json::to_vec(value)?).await
     }
-    fn get_raw(
+    async fn get_raw(
         &self,
-        definition: TableDefinition<&str, &[u8]>,
+        definition: TableDefinition<'static, &str, &[u8]>,
         key: &str,
     ) -> Result<Option<Vec<u8>>> {
-        let read = self.db.begin_read()?;
-        let table = read.open_table(definition)?;
-        Ok(table.get(key)?.map(|v| v.value().to_vec()))
+        let db = self.db.clone();
+        let key = key.to_owned();
+        tokio::task::spawn_blocking(move || -> Result<Option<Vec<u8>>> {
+            let read = db.begin_read()?;
+            let table = read.open_table(definition)?;
+            Ok(table.get(key.as_str())?.map(|value| value.value().to_vec()))
+        })
+        .await
+        .wrap_err("Database read task failed")?
     }
-    fn put_raw(
+    async fn put_raw(
         &self,
-        definition: TableDefinition<&str, &[u8]>,
+        definition: TableDefinition<'static, &str, &[u8]>,
         key: &str,
         value: &[u8],
     ) -> Result<()> {
-        let write = self.db.begin_write()?;
-        {
-            let mut table = write.open_table(definition)?;
-            table.insert(key, value)?;
-        }
-        write.commit()?;
-        Ok(())
+        let db = self.db.clone();
+        let key = key.to_owned();
+        let value = value.to_vec();
+        tokio::task::spawn_blocking(move || -> Result<()> {
+            let write = db.begin_write()?;
+            {
+                let mut table = write.open_table(definition)?;
+                table.insert(key.as_str(), value.as_slice())?;
+            }
+            write.commit()?;
+            Ok(())
+        })
+        .await
+        .wrap_err("Database write task failed")?
     }
-    fn remove_raw(&self, definition: TableDefinition<&str, &[u8]>, key: &str) -> Result<()> {
-        let write = self.db.begin_write()?;
-        {
-            let mut table = write.open_table(definition)?;
-            table.remove(key)?;
-        }
-        write.commit()?;
-        Ok(())
+    async fn remove_raw(
+        &self,
+        definition: TableDefinition<'static, &str, &[u8]>,
+        key: &str,
+    ) -> Result<()> {
+        let db = self.db.clone();
+        let key = key.to_owned();
+        tokio::task::spawn_blocking(move || -> Result<()> {
+            let write = db.begin_write()?;
+            {
+                let mut table = write.open_table(definition)?;
+                table.remove(key.as_str())?;
+            }
+            write.commit()?;
+            Ok(())
+        })
+        .await
+        .wrap_err("Database removal task failed")?
     }
-    fn get_u8(&self, key: &str) -> Result<Option<u8>> {
-        let read = self.db.begin_read()?;
-        let table = read.open_table(ACCESS)?;
-        Ok(table.get(key)?.map(|v| v.value()))
+    async fn get_u8(&self, key: &str) -> Result<Option<u8>> {
+        let db = self.db.clone();
+        let key = key.to_owned();
+        tokio::task::spawn_blocking(move || -> Result<Option<u8>> {
+            let read = db.begin_read()?;
+            let table = read.open_table(ACCESS)?;
+            Ok(table.get(key.as_str())?.map(|value| value.value()))
+        })
+        .await
+        .wrap_err("Access read task failed")?
     }
-    fn put_u8(&self, key: &str, value: u8) -> Result<()> {
-        let write = self.db.begin_write()?;
-        {
-            write.open_table(ACCESS)?.insert(key, value)?;
-        }
-        write.commit()?;
-        Ok(())
+    async fn put_u8(&self, key: &str, value: u8) -> Result<()> {
+        let db = self.db.clone();
+        let key = key.to_owned();
+        tokio::task::spawn_blocking(move || -> Result<()> {
+            let write = db.begin_write()?;
+            {
+                write.open_table(ACCESS)?.insert(key.as_str(), value)?;
+            }
+            write.commit()?;
+            Ok(())
+        })
+        .await
+        .wrap_err("Access write task failed")?
     }
-    fn remove_u8(&self, key: &str) -> Result<()> {
-        let write = self.db.begin_write()?;
-        {
-            write.open_table(ACCESS)?.remove(key)?;
-        }
-        write.commit()?;
-        Ok(())
+    async fn remove_u8(&self, key: &str) -> Result<()> {
+        let db = self.db.clone();
+        let key = key.to_owned();
+        tokio::task::spawn_blocking(move || -> Result<()> {
+            let write = db.begin_write()?;
+            {
+                write.open_table(ACCESS)?.remove(key.as_str())?;
+            }
+            write.commit()?;
+            Ok(())
+        })
+        .await
+        .wrap_err("Access removal task failed")?
     }
     fn encrypt(&self, plaintext: &[u8]) -> Result<Vec<u8>> {
         let mut nonce = [0u8; 12];
@@ -1049,6 +1223,7 @@ mod tests {
         assert!(store.credential("b", "openrouter").await.unwrap().is_none());
         let ciphertext = store
             .get_raw(SECRETS, &secret_key("a", "openrouter"))
+            .await
             .unwrap()
             .unwrap();
         assert!(

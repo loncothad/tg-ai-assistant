@@ -23,7 +23,7 @@ Teleforge is a production-oriented, multi-bot Telegram AI assistant written in R
 
 ## Build-time defaults and runtime customization
 
-The normal repository files [`defaults/system.md`](defaults/system.md) and [`defaults/skills/`](defaults/skills/) are embedded into the binary with `include_str!`. Each built-in skill has its own file and a Rust-side description. Edit those files and rebuild to change the shipped defaults.
+The normal repository file [`defaults/system.md`](defaults/system.md) and Claude Code-style packages under [`defaults/skills/`](defaults/skills/) are embedded into the binary with `include_str!`. Every capability has its own `<kebab-case-name>/SKILL.md` with YAML `name` and `description` frontmatter plus an instruction body. Names accept only lowercase ASCII letters, numbers, and hyphens. Edit a package and rebuild to change the shipped defaults.
 
 Built-in skills are enabled by default. Media skills have independent switches for text-to-image, image-to-image, text-to-video, image-to-video, video-to-video, text-to-audio, video-to-audio, text-to-speech, text-to-3D, image-to-3D, text-to-vector, image-to-vector, image understanding, video understanding, and transcription. Disabling one removes only that route's embedded instructions and callable operation from subsequent AI requests. Existing redb records with the older broad media switches remain compatible and use those values as group defaults. Runtime custom prompts and skill instructions live only in redb, can be enabled/disabled/reset independently, and never alter the embedded defaults. Imported custom skills may direct the model to the enabled built-in tool names; importing arbitrary executable code or arbitrary HTTP endpoints is deliberately unsupported.
 
@@ -155,7 +155,7 @@ most three short sentences and one small diagnostic excerpt. If it is unavailabl
 Teleforge deterministically extracts a short provider message instead of exposing a
 raw JSON response or internal routing metadata.
 
-Photos, videos, video notes, voice notes, audio files, and matching Telegram documents can be supplied directly or by replying to the media message. Private Telegram media is size-checked and encoded only for the current provider request. Images and videos can guide image/video generation where the selected provider endpoint supports references. YouTube URLs are sent as video inputs only while the independent YouTube skill toggle is enabled. Prompt expansion is also independently toggleable and is authorized only when the user explicitly asks for it and the intent processor selects that skill; media-generation prompts are then expanded before the generation call.
+Photos, videos, video notes, voice notes, audio files, and matching Telegram documents can be supplied directly or by replying to the media message. Private Telegram media is size-checked and encoded only for the current provider request. Images and videos can guide image/video generation where the selected provider endpoint supports references. The independent `youtube_cc` skill retrieves a public YouTube video's accessible caption track and answers solely from that bounded, untrusted text; it never downloads or sends the video to a video-understanding model, and the final answer always discloses that limitation. Prompt expansion is also independently toggleable and is authorized only when the user explicitly asks for it and the intent processor selects that skill; media-generation prompts are then expanded before the generation call.
 
 ## Local persistence and secrets
 
