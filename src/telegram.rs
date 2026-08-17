@@ -46,7 +46,7 @@ use crate::{
     openrouter::{
         AssistantResponse, ChatRequest, GeneratedFile, GenerationPromptContext, MediaInput,
         OpenRouter, OutputProcessingRequest, PlannedAction, PlannedSkill, PlanningRequest,
-        ProgressUpdate, RequestPlan, ToolModel, ToolModels,
+        ProgressUpdate, RequestPlan, ToolModel, ToolModels, normalize_direct_generation_prompt,
     },
     rich,
     search::SearchService,
@@ -654,6 +654,14 @@ impl BotRunner {
             let mut generation_prompt = plan.as_ref().map_or_else(
                 || text.trim().to_owned(),
                 |plan| plan.effective_generation_prompt(&text, replied_text, telegram_quote),
+            );
+            generation_prompt = normalize_direct_generation_prompt(
+                command,
+                &generation_prompt,
+                &text,
+                attachment_flags.0,
+                attachment_flags.1,
+                attachment_flags.2,
             );
             if plan.as_ref().is_some_and(|plan| {
                 plan.skills

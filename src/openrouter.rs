@@ -432,6 +432,40 @@ pub struct GenerationPromptContext<'a> {
     pub allow_composed_output: bool,
 }
 
+/// Removes command-envelope wording from a direct media prompt while retaining
+/// style cues and reference-media transformation instructions.
+pub fn normalize_direct_generation_prompt(
+    kind: &str,
+    prompt: &str,
+    original_request: &str,
+    has_image: bool,
+    has_video: bool,
+    has_audio: bool,
+) -> String {
+    let tool = match kind {
+        "image" => "generate_image",
+        "video" => "generate_video",
+        "speech" => "generate_speech",
+        "music" => "generate_music",
+        "3d" => "generate_3d",
+        "vector" => "generate_vector",
+        _ => return prompt.trim().to_owned(),
+    };
+    let context = GenerationPromptContext {
+        current_request: original_request,
+        replied_message: None,
+        telegram_quote: None,
+        model: "",
+        fallback_model: "",
+        api_key: None,
+        has_image,
+        has_video,
+        has_audio,
+        allow_composed_output: false,
+    };
+    strip_creation_directive(tool, prompt, &context)
+}
+
 /// Private media downloaded from Telegram or a public video URL supplied by a user.
 #[derive(Clone, Debug)]
 pub enum MediaInput {
@@ -1104,8 +1138,14 @@ impl OpenRouter {
                     } else {
                         if trusted_generation_prompt.is_none() {
                             report_progress(&progress, "Extracting exact generation prompt");
-                            trusted_generation_prompt =
-                                Some(self.trusted_generation_prompt(&generation_prompt).await);
+                            trusted_generation_prompt = Some(
+                                self.trusted_generation_prompt(
+                                    &generation_prompt,
+                                    name,
+                                    &arguments,
+                                )
+                                .await,
+                            );
                         }
                         trusted_generation_prompt.clone()
                     }
@@ -1415,8 +1455,16 @@ impl OpenRouter {
         )
     }
 
-    async fn trusted_generation_prompt(&self, request: &GenerationPromptContext<'_>) -> String {
-        let fallback = request.current_request.trim().to_owned();
+    async fn trusted_generation_prompt(
+        &self,
+        request: &GenerationPromptContext<'_>,
+        tool: &str,
+        arguments: &Value,
+    ) -> String {
+        let fallback = trusted_tool_excerpt(arguments, request)
+            .unwrap_or_else(|| request.current_request.trim())
+            .to_owned();
+        let fallback = strip_creation_directive(tool, &fallback, request);
         let Ok(selection) = self.plan_generation_prompt(request).await else {
             return fallback;
         };
@@ -1431,11 +1479,12 @@ impl OpenRouter {
             prompt_sources: selection.prompt_sources,
             workflow_steps: SmallVec::new(),
         };
-        plan.effective_generation_prompt(
+        let prompt = plan.effective_generation_prompt(
             request.current_request,
             request.replied_message,
             request.telegram_quote,
-        )
+        );
+        strip_creation_directive(tool, &prompt, request)
     }
 
     /// Rewrites an assistant answer into clean Telegram-facing Markdown while
@@ -2773,6 +2822,239 @@ fn is_media_generation_tool(name: &str) -> bool {
             | "generate_3d"
             | "generate_vector"
     )
+}
+
+/// Accepts a model-proposed tool argument only when it is an exact excerpt of
+/// user-controlled text. This gives the chat model a language-agnostic way to
+/// remove command boilerplate without allowing it to rewrite the prompt.
+fn trusted_tool_excerpt<'a>(
+    arguments: &'a Value,
+    request: &GenerationPromptContext<'_>,
+) -> Option<&'a str> {
+    ["prompt", "text", "input"]
+        .into_iter()
+        .filter_map(|key| arguments.get(key).and_then(Value::as_str))
+        .find_map(|candidate| {
+            exact_excerpt(
+                candidate,
+                [
+                    Some(request.current_request),
+                    request.telegram_quote,
+                    request.replied_message,
+                ],
+            )
+        })
+}
+
+/// Removes only the leading creation envelope for text-origin generation.
+/// Transformation requests with reference media retain verbs such as
+/// "replace", "remove", or "restyle", because those are substantive edits.
+fn strip_creation_directive(
+    tool: &str,
+    prompt: &str,
+    request: &GenerationPromptContext<'_>,
+) -> String {
+    if request.has_image || request.has_video || request.has_audio {
+        return prompt.trim().to_owned();
+    }
+    let words = prompt.split_whitespace().collect::<SmallVec<[&str; 24]>>();
+    if words.len() < 2 {
+        return apply_request_visual_style(tool, prompt.trim(), request);
+    }
+    let normalized = |word: &str| {
+        word.trim_matches(|character: char| !character.is_alphanumeric())
+            .to_lowercase()
+    };
+    let polite = |word: &str| {
+        matches!(
+            word,
+            "please" | "pls" | "пожалуйста" | "пж" | "будь" | "ласка"
+        )
+    };
+    let directive = |word: &str| {
+        matches!(
+            word,
+            "draw"
+                | "create"
+                | "generate"
+                | "make"
+                | "render"
+                | "paint"
+                | "illustrate"
+                | "photograph"
+                | "sketch"
+                | "say"
+                | "speak"
+                | "narrate"
+                | "sing"
+                | "compose"
+                | "нарисуй"
+                | "нарисуйте"
+                | "сгенерируй"
+                | "сгенерируйте"
+                | "создай"
+                | "создайте"
+                | "сделай"
+                | "сделайте"
+                | "озвучь"
+                | "озвучьте"
+                | "спой"
+                | "напиши"
+                | "изобрази"
+                | "изобразите"
+                | "сфотографируй"
+                | "сфотографируйте"
+                | "намалюй"
+                | "намалюйте"
+                | "згенеруй"
+                | "згенеруйте"
+                | "створи"
+                | "створіть"
+        )
+    };
+    let generic_medium = |word: &str| match tool {
+        "generate_image" | "generate_vector" => matches!(
+            word,
+            "image"
+                | "picture"
+                | "illustration"
+                | "картинку"
+                | "картинка"
+                | "изображение"
+                | "изображения"
+                | "малюнок"
+                | "зображення"
+        ),
+        "generate_video" => matches!(word, "video" | "clip" | "видео" | "ролик" | "відео"),
+        "generate_speech" | "generate_audio" => {
+            matches!(
+                word,
+                "speech" | "audio" | "voice" | "аудио" | "озвучку" | "аудіо"
+            )
+        }
+        "generate_music" => matches!(
+            word,
+            "music" | "song" | "track" | "музыку" | "песню" | "трек" | "музику" | "пісню"
+        ),
+        "generate_3d" => matches!(word, "3d" | "model" | "модель"),
+        _ => false,
+    };
+
+    let mut index = 0;
+    while index < words.len() && polite(&normalized(words[index])) {
+        index += 1;
+    }
+    if index >= words.len() || !directive(&normalized(words[index])) {
+        return apply_request_visual_style(tool, prompt.trim(), request);
+    }
+    let directive_word = normalized(words[index]);
+    index += 1;
+    while index < words.len() {
+        let word = normalized(words[index]);
+        if polite(&word)
+            || matches!(word.as_str(), "a" | "an" | "the" | "of")
+            || generic_medium(&word)
+        {
+            index += 1;
+        } else {
+            break;
+        }
+    }
+    if index >= words.len() {
+        return prompt.trim().to_owned();
+    }
+    let mut result = words[index..].join(" ");
+    if tool == "generate_image"
+        && !contains_explicit_visual_style(&result)
+        && let Some(style) = inferred_visual_style(&directive_word)
+    {
+        result.push_str("\nStyle: ");
+        result.push_str(style);
+    }
+    result
+}
+
+fn apply_request_visual_style(
+    tool: &str,
+    prompt: &str,
+    request: &GenerationPromptContext<'_>,
+) -> String {
+    if tool != "generate_image"
+        || contains_explicit_visual_style(prompt)
+        || exact_excerpt(prompt, [Some(request.current_request)]).is_none()
+    {
+        return prompt.to_owned();
+    }
+    let direction = request
+        .current_request
+        .split_whitespace()
+        .map(|word| {
+            word.trim_matches(|character: char| !character.is_alphanumeric())
+                .to_lowercase()
+        })
+        .find(|word| {
+            !matches!(
+                word.as_str(),
+                "please" | "pls" | "пожалуйста" | "пж" | "будь" | "ласка"
+            )
+        });
+    let Some(style) = direction.as_deref().and_then(inferred_visual_style) else {
+        return prompt.to_owned();
+    };
+    format!("{prompt}\nStyle: {style}")
+}
+
+fn inferred_visual_style(directive: &str) -> Option<&'static str> {
+    match directive {
+        "draw"
+        | "illustrate"
+        | "нарисуй"
+        | "нарисуйте"
+        | "изобрази"
+        | "изобразите"
+        | "намалюй"
+        | "намалюйте" => Some("illustration"),
+        "paint" => Some("painted artwork"),
+        "sketch" => Some("sketch"),
+        "render" => Some("rendered artwork"),
+        "photograph" | "сфотографируй" | "сфотографируйте" => {
+            Some("photography")
+        }
+        _ => None,
+    }
+}
+
+fn contains_explicit_visual_style(prompt: &str) -> bool {
+    let normalized = prompt.to_lowercase();
+    [
+        "photo",
+        "photoreal",
+        "illustration",
+        "painting",
+        "painted",
+        "watercolor",
+        "oil paint",
+        "sketch",
+        "anime",
+        "manga",
+        "cartoon",
+        "pixel art",
+        "3d",
+        "vector",
+        "фото",
+        "фотореал",
+        "иллюстрац",
+        "акварел",
+        "маслом",
+        "эскиз",
+        "скетч",
+        "аниме",
+        "манга",
+        "мульт",
+        "пиксель",
+    ]
+    .iter()
+    .any(|marker| normalized.contains(marker))
 }
 
 fn enabled_planner_skills(capabilities: &Capabilities) -> SmallVec<[&'static str; 16]> {
@@ -4309,6 +4591,68 @@ mod tests {
                 Some("бить компик электрошокером"),
             ),
             "белочки\nбить компик электрошокером"
+        );
+    }
+
+    #[test]
+    fn generation_envelope_is_removed_but_its_visual_style_is_preserved() {
+        let request = GenerationPromptContext {
+            current_request: "нарисуй котёнка",
+            replied_message: None,
+            telegram_quote: None,
+            model: "planner",
+            fallback_model: "fallback",
+            api_key: None,
+            has_image: false,
+            has_video: false,
+            has_audio: false,
+            allow_composed_output: false,
+        };
+        let arguments = json!({"prompt":"котёнка"});
+        assert_eq!(trusted_tool_excerpt(&arguments, &request), Some("котёнка"));
+        assert_eq!(
+            strip_creation_directive("generate_image", request.current_request, &request),
+            "котёнка\nStyle: illustration"
+        );
+        assert_eq!(
+            normalize_direct_generation_prompt(
+                "image",
+                "котёнка",
+                request.current_request,
+                false,
+                false,
+                false,
+            ),
+            "котёнка\nStyle: illustration"
+        );
+
+        let explicit = GenerationPromptContext {
+            current_request: "нарисуй акварелью котёнка",
+            ..request
+        };
+        assert_eq!(
+            strip_creation_directive("generate_image", explicit.current_request, &explicit),
+            "акварелью котёнка"
+        );
+    }
+
+    #[test]
+    fn reference_media_edits_keep_their_transformation_directive() {
+        let request = GenerationPromptContext {
+            current_request: "замени слова на главных надписях",
+            replied_message: None,
+            telegram_quote: None,
+            model: "planner",
+            fallback_model: "fallback",
+            api_key: None,
+            has_image: true,
+            has_video: false,
+            has_audio: false,
+            allow_composed_output: false,
+        };
+        assert_eq!(
+            strip_creation_directive("generate_image", request.current_request, &request),
+            request.current_request
         );
     }
 
