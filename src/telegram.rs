@@ -46,7 +46,8 @@ use crate::{
     openrouter::{
         AssistantResponse, ChatRequest, GeneratedFile, GenerationPromptContext, MediaInput,
         OpenRouter, OutputProcessingRequest, PlannedAction, PlannedSkill, PlanningRequest,
-        ProgressUpdate, RequestPlan, ToolModel, ToolModels, normalize_direct_generation_prompt,
+        ProgressUpdate, RequestPlan, ToolModel, ToolModels, WorkflowStep,
+        normalize_direct_generation_prompt,
     },
     rich,
     search::SearchService,
@@ -602,18 +603,23 @@ impl BotRunner {
             None
         };
         let explicit_upgrade = force_upgrade || explicit_model_upgrade_requested(&text);
-        let _ = sender.send(ProgressUpdate::step(if explicit_upgrade {
-            "Classifier decision: explicit advanced-model override".to_owned()
+        if explicit_upgrade {
+            let _ = sender.send(ProgressUpdate::step(
+                "Classifier decision: explicit advanced-model override",
+            ));
         } else if let Some(plan) = plan.as_ref() {
-            format!(
-                "Classifier decision: action={:?} · skills={:?} · workflow={:?}",
-                plan.action, plan.skills, plan.workflow_steps
-            )
+            for status in classifier_progress_steps(plan) {
+                let _ = sender.send(ProgressUpdate::step(status));
+            }
         } else if planner_failed {
-            "Classifier failed or unavailable → general chat fallback".to_owned()
+            let _ = sender.send(ProgressUpdate::step(
+                "Classifier failed or unavailable → general chat fallback",
+            ));
         } else {
-            "Classifier returned no plan → general chat fallback".to_owned()
-        }));
+            let _ = sender.send(ProgressUpdate::step(
+                "Classifier returned no plan → general chat fallback",
+            ));
+        }
         if let Some(plan) = plan.as_ref().filter(|plan| plan.is_composed_workflow()) {
             let stages = plan
                 .workflow_steps
@@ -3963,9 +3969,9 @@ fn progress_rich_message(steps: &[ProgressUpdate]) -> InputRichMessage {
                     .collect::<String>();
                 markdown.push_str(&format!(
                     "- **{marker}:** Tool `{}`\n  - **Path:** `{}` → `{}`\n  - **Prompt:** *{}*\n",
-                    rich::escape_text(tool),
-                    rich::escape_text(provider),
-                    rich::escape_text(model),
+                    progress_code_span(tool),
+                    progress_code_span(provider),
+                    progress_code_span(model),
                     rich::escape_text(&prompt)
                 ));
             }
@@ -3974,6 +3980,96 @@ fn progress_rich_message(steps: &[ProgressUpdate]) -> InputRichMessage {
     InputRichMessage::builder()
         .markdown(rich::to_telegram_markdown(&markdown))
         .build()
+}
+
+fn progress_code_span(value: &str) -> String {
+    value
+        .chars()
+        .map(|character| match character {
+            '`' => '\'',
+            '\n' | '\r' => ' ',
+            character => character,
+        })
+        .collect()
+}
+
+fn classifier_progress_steps(plan: &RequestPlan) -> SmallVec<[String; 3]> {
+    let skills = if plan.skills.is_empty() {
+        "none".to_owned()
+    } else {
+        plan.skills
+            .iter()
+            .map(|skill| planned_skill_label(*skill))
+            .collect::<SmallVec<[_; 4]>>()
+            .join(", ")
+    };
+    let workflow = if plan.workflow_steps.is_empty() {
+        "direct tool call".to_owned()
+    } else {
+        plan.workflow_steps
+            .iter()
+            .map(|step| workflow_step_label(*step))
+            .collect::<SmallVec<[_; 4]>>()
+            .join(" → ")
+    };
+    SmallVec::from_buf([
+        format!("Classifier action: {}", planned_action_label(plan.action)),
+        format!("Classifier skills: {skills}"),
+        format!("Classifier workflow: {workflow}"),
+    ])
+}
+
+fn planned_action_label(action: PlannedAction) -> &'static str {
+    match action {
+        PlannedAction::Chat => "general chat",
+        PlannedAction::GenerateCode => "generate code",
+        PlannedAction::Transcribe => "transcribe",
+        PlannedAction::GenerateImage => "generate image",
+        PlannedAction::GenerateSpeech | PlannedAction::GenerateAudio => "generate speech",
+        PlannedAction::GenerateMusic => "generate music",
+        PlannedAction::GenerateVideo => "generate video",
+        PlannedAction::Generate3d => "generate 3D",
+        PlannedAction::GenerateVector => "generate vector image",
+        PlannedAction::Refuse => "refuse",
+    }
+}
+
+fn planned_skill_label(skill: PlannedSkill) -> &'static str {
+    match skill {
+        PlannedSkill::GenerateCode => "code generation",
+        PlannedSkill::Search => "web search",
+        PlannedSkill::WebFetch => "web fetch",
+        PlannedSkill::ImageGeneration => "image generation",
+        PlannedSkill::SpeechGeneration | PlannedSkill::AudioGeneration => "speech generation",
+        PlannedSkill::MusicGeneration => "music generation",
+        PlannedSkill::VideoGeneration => "video generation",
+        PlannedSkill::ThreeDGeneration => "3D generation",
+        PlannedSkill::VectorGeneration => "vector generation",
+        PlannedSkill::ImageUnderstanding => "image understanding",
+        PlannedSkill::VideoUnderstanding => "video understanding",
+        PlannedSkill::Transcription => "transcription",
+        PlannedSkill::FileDelivery => "file delivery",
+        PlannedSkill::ModelUpgrade => "model upgrade",
+        PlannedSkill::PromptExpansion => "prompt expansion",
+    }
+}
+
+fn workflow_step_label(step: WorkflowStep) -> &'static str {
+    match step {
+        WorkflowStep::ComposeText => "compose text",
+        WorkflowStep::Search => "web search",
+        WorkflowStep::WebFetch => "web fetch",
+        WorkflowStep::Transcription => "transcription",
+        WorkflowStep::ImageUnderstanding => "image understanding",
+        WorkflowStep::VideoUnderstanding => "video understanding",
+        WorkflowStep::ImageGeneration => "image generation",
+        WorkflowStep::SpeechGeneration => "speech generation",
+        WorkflowStep::MusicGeneration => "music generation",
+        WorkflowStep::VideoGeneration => "video generation",
+        WorkflowStep::ThreeDGeneration => "3D generation",
+        WorkflowStep::VectorGeneration => "vector generation",
+        WorkflowStep::FileDelivery => "file delivery",
+    }
 }
 
 fn parse_user_id(value: &str) -> Result<u64> {
@@ -4537,6 +4633,38 @@ mod tests {
         assert_eq!(
             parse_command("-SEARCH current news"),
             Some(("search".to_owned(), "current news"))
+        );
+    }
+
+    #[test]
+    fn progress_code_spans_keep_identifier_underscores_literal() {
+        assert_eq!(progress_code_span("generate_image"), "generate_image");
+        assert_eq!(
+            progress_code_span("unsafe`model\nname"),
+            "unsafe'model name"
+        );
+    }
+
+    #[test]
+    fn classifier_progress_uses_plain_labels_instead_of_debug_arrays() {
+        let plan = RequestPlan {
+            action: PlannedAction::GenerateImage,
+            skills: SmallVec::from_slice(&[PlannedSkill::ImageGeneration, PlannedSkill::Search]),
+            delivery: crate::openrouter::PlannedDelivery::Inline,
+            filename: String::new(),
+            refusal_message: String::new(),
+            core_prompt: String::new(),
+            reply_excerpt: String::new(),
+            prompt_sources: SmallVec::new(),
+            workflow_steps: SmallVec::new(),
+        };
+        assert_eq!(
+            classifier_progress_steps(&plan).as_slice(),
+            [
+                "Classifier action: generate image",
+                "Classifier skills: image generation, web search",
+                "Classifier workflow: direct tool call",
+            ]
         );
     }
 
