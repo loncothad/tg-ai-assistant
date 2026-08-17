@@ -554,6 +554,24 @@ impl BotRunner {
             settings.capabilities.enabled("image_understanding")
                 || settings.capabilities.enabled("video_understanding")
         };
+        let provider = self.search_provider().await?;
+        let search_key = if capabilities.search {
+            if provider == SearchProvider::Openrouter {
+                self.store.credential(&self.bot.id, "openrouter").await?
+            } else {
+                self.store
+                    .credential(&self.bot.id, provider.as_str())
+                    .await?
+            }
+        } else {
+            None
+        };
+        capabilities.search &= search_key.is_some();
+        let _ = sender.send(ProgressUpdate::step(format!(
+            "Classifier: OpenRouter → {} → fallback: {}",
+            settings.selected_planner_model, settings.selected_planner_fallback_model
+        )));
+        let mut planner_failed = false;
         let plan = if let Some(key) = planner_key.as_deref() {
             match self
                 .openrouter
@@ -574,20 +592,27 @@ impl BotRunner {
             {
                 Ok(plan) => Some(plan),
                 Err(error) => {
+                    planner_failed = true;
                     warn!(bot_id = %self.bot.id, user_id, error = %format!("{error:#}"), "request planner failed; continuing with normal chat");
                     None
                 }
             }
         } else {
+            planner_failed = true;
             None
         };
         let explicit_upgrade = force_upgrade || explicit_model_upgrade_requested(&text);
         let _ = sender.send(ProgressUpdate::step(if explicit_upgrade {
-            "Explicit advanced-model request detected"
-        } else if plan.is_some() {
-            "Classified request"
+            "Classifier decision: explicit advanced-model override".to_owned()
+        } else if let Some(plan) = plan.as_ref() {
+            format!(
+                "Classifier decision: action={:?} · skills={:?} · workflow={:?}",
+                plan.action, plan.skills, plan.workflow_steps
+            )
+        } else if planner_failed {
+            "Classifier failed or unavailable → general chat fallback".to_owned()
         } else {
-            "Applied standard routing"
+            "Classifier returned no plan → general chat fallback".to_owned()
         }));
         if let Some(plan) = plan.as_ref().filter(|plan| plan.is_composed_workflow()) {
             let stages = plan
@@ -663,6 +688,82 @@ impl BotRunner {
                 attachment_flags.1,
                 attachment_flags.2,
             );
+            let needs_visual_grounding = matches!(command, "image" | "video" | "3d" | "vector")
+                && plan.as_ref().is_some_and(|plan| {
+                    plan.skills
+                        .contains(&crate::openrouter::PlannedSkill::Search)
+                });
+            if needs_visual_grounding {
+                let _ = sender.send(ProgressUpdate::step(format!(
+                    "Tool: web_search → provider: {} → visual reference research",
+                    provider.as_str()
+                )));
+                let query = format!(
+                    "{} visual appearance identifying features official reference",
+                    generation_prompt
+                        .lines()
+                        .next()
+                        .unwrap_or(&generation_prompt)
+                );
+                let research = if provider == SearchProvider::Openrouter {
+                    let model = self
+                        .config
+                        .resolved_model("intent_planning", &settings.selected_planner_model);
+                    self.openrouter
+                        .search(
+                            &query,
+                            &model,
+                            &ModelRouting::default(),
+                            search_key.as_deref().unwrap_or_default(),
+                        )
+                        .await
+                } else {
+                    self.search
+                        .search(provider, &query, search_key.as_deref().unwrap_or_default())
+                        .await
+                        .and_then(|results| {
+                            if results.is_empty() {
+                                bail!("Visual web search returned no results");
+                            }
+                            serde_json::to_string(&results)
+                                .context("Failed to serialize visual search results")
+                        })
+                };
+                let grounded = match research {
+                    Ok(research) => {
+                        let _ = sender.send(ProgressUpdate::step(format!(
+                            "Tool: ground_visual_prompt → OpenRouter → {} (fallback: {})",
+                            settings.selected_planner_model,
+                            settings.selected_planner_fallback_model
+                        )));
+                        self.openrouter
+                            .ground_visual_prompt(
+                                &generation_prompt,
+                                &research,
+                                &settings.selected_planner_model,
+                                &settings.selected_planner_fallback_model,
+                                planner_key.as_deref().unwrap_or_default(),
+                            )
+                            .await
+                    }
+                    Err(error) => Err(error),
+                };
+                match grounded {
+                    Ok(prompt) => generation_prompt = prompt,
+                    Err(error) => {
+                        drop(sender);
+                        let _ = progress_task.await;
+                        error!(bot_id = %self.bot.id, user_id, error = %format!("{error:#}"), "visual prompt grounding failed");
+                        if let Some(inline_id) = guest_pending_id.as_deref() {
+                            self.edit_guest_error(&message, inline_id, &error).await;
+                        } else {
+                            let detail = self.process_error_output(&message, &error).await;
+                            self.respond(&message, mode, &detail, None).await?;
+                        }
+                        return Ok(());
+                    }
+                }
+            }
             if plan.as_ref().is_some_and(|plan| {
                 plan.skills
                     .contains(&crate::openrouter::PlannedSkill::PromptExpansion)
@@ -680,6 +781,17 @@ impl BotRunner {
                         key,
                     )
                     .await?;
+            }
+            if let Some((tool, model_provider, model)) = planned_generation_tool_path(
+                &settings,
+                command,
+                attachment_flags,
+                model_override.as_ref(),
+            ) {
+                let _ = sender.send(ProgressUpdate::step(format!(
+                    "Terminal tool call: {tool} → {} → {model}",
+                    model_provider.as_str()
+                )));
             }
             drop(sender);
             let _ = progress_task.await;
@@ -722,19 +834,6 @@ impl BotRunner {
                 return Ok(());
             }
         }
-        let provider = self.search_provider().await?;
-        let search_key = if capabilities.search {
-            if provider == SearchProvider::Openrouter {
-                self.store.credential(&self.bot.id, "openrouter").await?
-            } else {
-                self.store
-                    .credential(&self.bot.id, provider.as_str())
-                    .await?
-            }
-        } else {
-            None
-        };
-        capabilities.search &= search_key.is_some();
         let history = self.store.history(&self.bot.id, &scope).await?;
         let (mut model_capability, mut selected) = if capabilities.media
             && media
@@ -976,7 +1075,8 @@ impl BotRunner {
         let session_id = format!("{}:{scope}", self.bot.id);
         let _ = sender.send(ProgressUpdate::step("Prepared conversation context"));
         let _ = sender.send(ProgressUpdate::step(format!(
-            "Selected model: {}",
+            "General chat path: {} → {}",
+            routing.model_provider.as_str(),
             model.id
         )));
         let mut result = self
@@ -1584,7 +1684,8 @@ impl BotRunner {
                             .prepare_generation_prompt(arguments, &references, true)
                             .await?;
                         let _ = progress.send(ProgressUpdate::generation(
-                            "image",
+                            "generate_image",
+                            routing.model_provider,
                             generation_model,
                             &effective_prompt,
                         ));
@@ -1650,7 +1751,8 @@ impl BotRunner {
                     .await?;
                 let key = self.model_api_key(routing.model_provider).await?;
                 let _ = progress.send(ProgressUpdate::generation(
-                    "image",
+                    "generate_image",
+                    routing.model_provider,
                     generation_model,
                     &effective_prompt,
                 ));
@@ -1789,7 +1891,12 @@ impl BotRunner {
                             arguments.to_owned()
                         };
                         let _ = progress.send(ProgressUpdate::generation(
-                            if is_music { "music" } else { "speech" },
+                            if is_music {
+                                "generate_music"
+                            } else {
+                                "generate_speech"
+                            },
+                            routing.model_provider,
                             generation_model,
                             &effective_prompt,
                         ));
@@ -1867,7 +1974,12 @@ impl BotRunner {
                 };
                 let key = self.model_api_key(routing.model_provider).await?;
                 let _ = progress.send(ProgressUpdate::generation(
-                    if is_music { "music" } else { "speech" },
+                    if is_music {
+                        "generate_music"
+                    } else {
+                        "generate_speech"
+                    },
+                    routing.model_provider,
                     generation_model,
                     &effective_prompt,
                 ));
@@ -1991,7 +2103,12 @@ impl BotRunner {
                 let references = self.collect_media(message).await?;
                 let key = self.model_api_key(ModelProvider::Fal).await?;
                 let _ = progress.send(ProgressUpdate::generation(
-                    if command == "3d" { "3d" } else { "vector" },
+                    if command == "3d" {
+                        "generate_3d"
+                    } else {
+                        "generate_vector"
+                    },
+                    ModelProvider::Fal,
                     model,
                     arguments,
                 ));
@@ -2115,7 +2232,8 @@ impl BotRunner {
                     );
                     let result = async {
                         let _ = progress.send(ProgressUpdate::generation(
-                            "video",
+                            "generate_video",
+                            routing.model_provider,
                             generation_model,
                             arguments,
                         ));
@@ -2164,7 +2282,8 @@ impl BotRunner {
                 let references = self.collect_media(message).await?;
                 let key = self.model_api_key(routing.model_provider).await?;
                 let _ = progress.send(ProgressUpdate::generation(
-                    "video",
+                    "generate_video",
+                    routing.model_provider,
                     generation_model,
                     arguments,
                 ));
@@ -2910,7 +3029,7 @@ impl BotRunner {
         message_id: i32,
         mut updates: mpsc::UnboundedReceiver<ProgressUpdate>,
     ) {
-        let mut steps = SmallVec::<[ProgressUpdate; 12]>::new();
+        let mut steps = SmallVec::<[ProgressUpdate; 20]>::new();
         let mut dirty = false;
         let mut heartbeat_ticks = 0u8;
         let mut ticker = tokio::time::interval(Duration::from_secs(1));
@@ -2984,7 +3103,7 @@ impl BotRunner {
         inline_message_id: String,
         mut updates: mpsc::UnboundedReceiver<ProgressUpdate>,
     ) {
-        let mut steps = SmallVec::<[ProgressUpdate; 12]>::new();
+        let mut steps = SmallVec::<[ProgressUpdate; 20]>::new();
         let mut dirty = false;
         let mut heartbeat_ticks = 0u8;
         let mut ticker = tokio::time::interval(Duration::from_secs(1));
@@ -3729,12 +3848,12 @@ fn materialize_oversized_text(answer: &mut AssistantResponse) {
             .to_owned();
 }
 
-fn push_progress_step(steps: &mut SmallVec<[ProgressUpdate; 12]>, update: ProgressUpdate) {
+fn push_progress_step(steps: &mut SmallVec<[ProgressUpdate; 20]>, update: ProgressUpdate) {
     if steps.last() == Some(&update) {
         return;
     }
     steps.push(update);
-    if steps.len() > 12 {
+    if steps.len() > 20 {
         steps.remove(0);
     }
 }
@@ -3830,7 +3949,8 @@ fn progress_rich_message(steps: &[ProgressUpdate]) -> InputRichMessage {
                 markdown.push_str(&format!("- **{marker}:** {}\n", rich::escape_text(status)));
             }
             ProgressUpdate::Generation {
-                kind,
+                tool,
+                provider,
                 model,
                 prompt,
             } => {
@@ -3842,8 +3962,9 @@ fn progress_rich_message(steps: &[ProgressUpdate]) -> InputRichMessage {
                     .take(1_500)
                     .collect::<String>();
                 markdown.push_str(&format!(
-                    "- **{marker}:** Generating {}\n  - **Model:** `{}`\n  - **Prompt:** *{}*\n",
-                    rich::escape_text(kind),
+                    "- **{marker}:** Tool `{}`\n  - **Path:** `{}` → `{}`\n  - **Prompt:** *{}*\n",
+                    rich::escape_text(tool),
+                    rich::escape_text(provider),
                     rich::escape_text(model),
                     rich::escape_text(&prompt)
                 ));
@@ -4145,6 +4266,92 @@ fn specialized_model<'a>(
         .filter(|model| !model.is_empty())
         .map(String::as_str)
         .unwrap_or(legacy_fallback)
+}
+
+fn planned_generation_tool_path<'a>(
+    settings: &'a crate::db::BotSettings,
+    command: &str,
+    attachment_flags: (bool, bool, bool),
+    model_override: Option<&'a MessageModelOverride>,
+) -> Option<(&'static str, ModelProvider, &'a str)> {
+    let (tool, capability, legacy_model) = match command {
+        "image" => (
+            "generate_image",
+            if attachment_flags.0 {
+                "image_to_image"
+            } else {
+                "text_to_image"
+            },
+            settings.selected_image_generation_model.as_str(),
+        ),
+        "speech" => (
+            "generate_speech",
+            "text_to_speech",
+            settings.selected_audio_generation_model.as_str(),
+        ),
+        "music" => (
+            "generate_music",
+            if attachment_flags.1 {
+                "video_to_audio"
+            } else {
+                "text_to_audio"
+            },
+            settings.selected_music_generation_model.as_str(),
+        ),
+        "video" => (
+            "generate_video",
+            if attachment_flags.1 {
+                "video_to_video"
+            } else if attachment_flags.0 {
+                "image_to_video"
+            } else {
+                "text_to_video"
+            },
+            settings.selected_video_generation_model.as_str(),
+        ),
+        "3d" => (
+            "generate_3d",
+            if attachment_flags.0 {
+                "image_to_3d"
+            } else {
+                "text_to_3d"
+            },
+            "",
+        ),
+        "vector" => (
+            "generate_vector",
+            if attachment_flags.0 {
+                "image_to_image_vector"
+            } else {
+                "text_to_image_vector"
+            },
+            "",
+        ),
+        _ => return None,
+    };
+    if let Some(override_) = model_override {
+        return Some((tool, override_.model_provider, override_.model.as_str()));
+    }
+    let routing = settings
+        .model_routing
+        .get(capability)
+        .or_else(|| match command {
+            "image" => settings.model_routing.get("image_generation"),
+            "speech" => settings
+                .model_routing
+                .get("speech_generation")
+                .or_else(|| settings.model_routing.get("audio_generation")),
+            "music" => settings.model_routing.get("music_generation"),
+            "video" => settings.model_routing.get("video_generation"),
+            _ => None,
+        })
+        .cloned()
+        .unwrap_or_default();
+    Some((
+        tool,
+        routing.model_provider,
+        specialized_model(settings, capability, legacy_model),
+    ))
 }
 
 fn should_route_to_upgrade_model(
